@@ -227,6 +227,11 @@ def _on_new_message(bot, accid, event):
         bot.rpc.send_msg(accid, chatid, MsgData(text=engine.status_for(chatid, device_name)))
         return
     if verb in _DIRECT_VERBS:
+        # `off <clause>` is shorthand for scheduling auto-off — no immediate toggle.
+        # `on <clause>` is "on now + auto-off when clause fires" — toggles AND schedules.
+        if verb == "off" and rest:
+            _handle_off_clause(bot, accid, chatid, device_name, rest)
+            return
         ok, msg_text = engine.dispatch_command(chatid, device_name, verb, source_msgid=msg.id)
         if not ok and msg_text:
             bot.rpc.send_msg(accid, chatid, MsgData(text=msg_text))
@@ -275,8 +280,19 @@ def _on_new_message(bot, accid, event):
 
 
 def _handle_on_clause(bot, accid, chatid: int, device_name: str, clause: str) -> None:
+    """`/<dev> on <clause>` scheduled an auto-off after the immediate `on` dispatched."""
+    _schedule_auto_off_clause(bot, accid, chatid, device_name, clause)
+
+
+def _handle_off_clause(bot, accid, chatid: int, device_name: str, clause: str) -> None:
+    """`/<dev> off <clause>` — schedule auto-off without an immediate toggle."""
+    _schedule_auto_off_clause(bot, accid, chatid, device_name, clause)
+
+
+def _schedule_auto_off_clause(bot, accid, chatid: int, device_name: str, clause: str) -> None:
     device = cfg.devices.get(device_name)
     if device is None:
+        bot.rpc.send_msg(accid, chatid, MsgData(text=f"unknown device: {device_name}"))
         return
     cls = cfg.device_class(device)
     if cls.auto_off is None:
@@ -289,7 +305,7 @@ def _handle_on_clause(bot, accid, chatid: int, device_name: str, clause: str) ->
     except ValueError as ex:
         bot.rpc.send_msg(accid, chatid, MsgData(text=f"bad clause: {ex}"))
         return
-    ok, msg_text = engine.schedule(chatid, device_name, cls.auto_off.command, policy)
+    _ok, msg_text = engine.schedule(chatid, device_name, cls.auto_off.command, policy)
     if msg_text:
         bot.rpc.send_msg(accid, chatid, MsgData(text=msg_text))
 

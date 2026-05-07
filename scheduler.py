@@ -205,8 +205,13 @@ _TOD_RE = re.compile(
     r"^at\s+(\d{1,2})(?:h(\d{2})?|:(\d{2}))?\s*(daily)?$", re.IGNORECASE
 )
 _TIMER_RE = re.compile(r"^(?:for|in)\s+(\S+)$", re.IGNORECASE)
-_IDLE_RE = re.compile(r"^until\s+idle(?:\s+(\S+)\s+(\S+))?$", re.IGNORECASE)
-_CONSUMED_RE = re.compile(r"^until\s+used\s*<?\s*(\S+)\s+in\s+(\S+)$", re.IGNORECASE)
+# Unified idle clause: power threshold (W) OR rolling-window energy (Wh/kWh).
+# The unit on the value discriminates which policy fires; `if` and `until` are synonyms.
+# Optional "in" keyword between value and duration (natural with energy, accepted with power too).
+_IDLE_RE = re.compile(
+    r"^(?:if|until)\s+idle(?:\s+(\S+)\s+(?:in\s+)?(\S+))?$",
+    re.IGNORECASE,
+)
 _NUM_UNIT_RE = re.compile(r"^([0-9]*\.?[0-9]+)\s*([a-zA-Z]+)?$")
 
 
@@ -262,28 +267,47 @@ def _apply(part: str, policy: ScheduledPolicy, d: PolicyDefaults, allowed) -> No
         policy.recurring_tod = daily
         return
     if (m := _IDLE_RE.match(part)):
-        if "idle" not in allowed:
-            raise ValueError(f"idle not allowed: {part!r}")
-        if policy.idle_field is not None:
-            raise ValueError("idle policy specified twice")
-        policy.idle_field = d.idle_field
-        if m.group(1):
-            policy.idle_threshold = _parse_value(m.group(1), "W")
-            policy.idle_duration_s = durations.parse(m.group(2))
-        else:
+        # Bare "if idle" / "until idle" → power-threshold policy, defaults.
+        if m.group(1) is None:
+            if "idle" not in allowed:
+                raise ValueError(f"idle not allowed: {part!r}")
+            if policy.idle_field is not None:
+                raise ValueError("idle policy specified twice")
+            policy.idle_field = d.idle_field
             policy.idle_threshold = d.idle_threshold
             policy.idle_duration_s = d.idle_duration_s
-        return
-    if (m := _CONSUMED_RE.match(part)):
-        if "consumed" not in allowed:
-            raise ValueError(f"consumed not allowed: {part!r}")
-        if policy.consumed_field is not None:
-            raise ValueError("consumed policy specified twice")
-        policy.consumed_field = d.consumed_field
-        policy.consumed_threshold_wh = _parse_value(m.group(1), "Wh")
-        policy.consumed_window_s = durations.parse(m.group(2))
+            return
+        # With value+duration: unit on the value picks instantaneous (W) vs rolling (Wh/kWh).
+        val, unit = _value_unit_split(m.group(1))
+        duration = durations.parse(m.group(2))
+        if unit in {"", "w"}:
+            if "idle" not in allowed:
+                raise ValueError(f"idle (power) not allowed: {part!r}")
+            if policy.idle_field is not None:
+                raise ValueError("idle policy specified twice")
+            policy.idle_field = d.idle_field
+            policy.idle_threshold = val
+            policy.idle_duration_s = duration
+        elif unit in {"wh", "kwh"}:
+            if "consumed" not in allowed:
+                raise ValueError(f"idle (energy) not allowed: {part!r}")
+            if policy.consumed_field is not None:
+                raise ValueError("consumed policy specified twice")
+            policy.consumed_field = d.consumed_field
+            policy.consumed_threshold_wh = val if unit == "wh" else val * 1000.0
+            policy.consumed_window_s = duration
+        else:
+            raise ValueError(f"expected W/Wh/kWh, got {unit!r}")
         return
     raise ValueError(f"unrecognised schedule part: {part!r}")
+
+
+def _value_unit_split(s: str) -> tuple[float, str]:
+    """Return (numeric value, lowercase unit suffix or '')."""
+    m = _NUM_UNIT_RE.match(s.strip())
+    if not m:
+        raise ValueError(f"expected number with optional unit: {s!r}")
+    return float(m.group(1)), (m.group(2) or "").lower()
 
 
 def _parse_value(s: str, expected: str) -> float:

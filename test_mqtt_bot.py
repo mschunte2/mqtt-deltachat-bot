@@ -173,28 +173,48 @@ class TestParsePolicy(unittest.TestCase):
         with self.assertRaises(ValueError):
             sched.parse_policy("at 25h", self.d)
 
-    def test_idle_defaults(self):
-        p = sched.parse_policy("until idle", self.d)
+    def test_idle_defaults_if(self):
+        p = sched.parse_policy("if idle", self.d)
         self.assertEqual(p.idle_threshold, 5.0)
         self.assertEqual(p.idle_duration_s, 60)
 
-    def test_idle_overrides(self):
-        p = sched.parse_policy("until idle 10W 120s", self.d)
+    def test_idle_defaults_until_synonym(self):
+        # `until` is a synonym for `if` (preserved for older syntax)
+        p = sched.parse_policy("until idle", self.d)
+        self.assertEqual(p.idle_threshold, 5.0)
+
+    def test_idle_power_overrides(self):
+        p = sched.parse_policy("if idle 10W 120s", self.d)
         self.assertEqual(p.idle_threshold, 10.0)
         self.assertEqual(p.idle_duration_s, 120)
+        # No consumed policy on a W-unit clause.
+        self.assertIsNone(p.consumed_field)
 
-    def test_consumed(self):
-        p = sched.parse_policy("until used <5Wh in 10m", self.d)
-        self.assertEqual(p.consumed_threshold_wh, 5.0)
-        self.assertEqual(p.consumed_window_s, 600)
+    def test_idle_energy_via_wh(self):
+        # Wh unit on the value -> rolling-window energy policy ("consumed")
+        p = sched.parse_policy("if idle 10Wh in 2m", self.d)
+        self.assertEqual(p.consumed_threshold_wh, 10.0)
+        self.assertEqual(p.consumed_window_s, 120)
+        # No idle-power policy on a Wh clause.
+        self.assertIsNone(p.idle_field)
 
-    def test_consumed_kwh(self):
-        p = sched.parse_policy("until used 1.5kWh in 1h", self.d)
+    def test_idle_energy_via_kwh(self):
+        p = sched.parse_policy("if idle 1.5kWh in 1h", self.d)
         self.assertEqual(p.consumed_threshold_wh, 1500.0)
         self.assertEqual(p.consumed_window_s, 3600)
 
+    def test_idle_in_optional_for_power(self):
+        # `in` keyword is accepted on either form
+        p = sched.parse_policy("if idle 10W in 120s", self.d)
+        self.assertEqual(p.idle_threshold, 10.0)
+        self.assertEqual(p.idle_duration_s, 120)
+
+    def test_idle_unknown_unit_rejected(self):
+        with self.assertRaises(ValueError):
+            sched.parse_policy("if idle 10J 60s", self.d)
+
     def test_or_combination(self):
-        p = sched.parse_policy("for 1h or until idle", self.d)
+        p = sched.parse_policy("for 1h or if idle", self.d)
         self.assertEqual(p.timer_seconds, 3600)
         self.assertIsNotNone(p.idle_field)
 
@@ -205,7 +225,11 @@ class TestParsePolicy(unittest.TestCase):
     def test_restricted_kinds(self):
         # auto-on only allows timer + tod
         with self.assertRaises(ValueError):
-            sched.parse_policy("until idle", self.d, allowed=frozenset({"timer", "tod"}))
+            sched.parse_policy("if idle", self.d, allowed=frozenset({"timer", "tod"}))
+        # consumed (Wh form) also rejected for auto-on
+        with self.assertRaises(ValueError):
+            sched.parse_policy("if idle 5Wh in 1m", self.d,
+                               allowed=frozenset({"timer", "tod"}))
         # but tod alone is fine
         p = sched.parse_policy("at 7h", self.d, allowed=frozenset({"timer", "tod"}))
         self.assertEqual(p.time_of_day, (7, 0))
