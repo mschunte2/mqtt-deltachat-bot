@@ -44,11 +44,10 @@ CONF_FILE="/etc/mosquitto/conf.d/mqtt-bot.conf"
 #  whole point here is a self-hosted setup.)
 NEW_CONF=$(cat <<EOF
 # Managed by setup-mosquitto.sh — overwritten on re-run.
+# Persistence is left to the distro's main mosquitto.conf (defaults are fine).
 listener $MQTT_PORT 0.0.0.0
 allow_anonymous false
 password_file $PASSWD_FILE
-persistence true
-persistence_location /var/lib/mosquitto/
 EOF
 )
 
