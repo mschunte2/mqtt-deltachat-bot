@@ -619,6 +619,12 @@ class Engine:
             device_name, since_ts, until_ts, max_points=200,
         )
         energy = self.history.query_energy(device_name, since_ts, until_ts)
+        # Authoritative total — hybrid (energy_minute first, power_minute
+        # fallback). Doesn't depend on having ≥2 hourly snapshots in the
+        # window, so it's correct even for 1-hour and shorter views.
+        total_wh, _earliest = self.history.energy_consumed_in(
+            device_name, since_ts, until_ts,
+        )
 
         body = {
             "history": {
@@ -629,6 +635,7 @@ class Engine:
                 "bucket_seconds": bucket_s,
                 "power_points": points,
                 "energy_points": energy,
+                "total_wh": total_wh,
             }
         }
         self.webxdc.push_to_msgid(self.bot, self.accid, msgid, body)

@@ -335,8 +335,16 @@ function renderSparkline() {
       footText = '(loading…)';
     } else {
       pts = sh.power_points;
-      const e = sh.energy_points || [];
-      const totalWh = e.length >= 2 ? (e[e.length - 1][1] - e[0][1]) : 0;
+      // Authoritative total from the bot's hybrid energy_consumed_in
+      // (energy_minute first, power_minute fallback). Falls back to the
+      // older energy_hour delta for old responses without total_wh.
+      let totalWh;
+      if (typeof sh.total_wh === 'number') {
+        totalWh = sh.total_wh;
+      } else {
+        const e = sh.energy_points || [];
+        totalWh = e.length >= 2 ? (e[e.length - 1][1] - e[0][1]) : 0;
+      }
       const bucketLabel = fmtSecs(sh.bucket_seconds || 60);
       footText = pts.length
         ? `${pts.length} pts · bucket ${bucketLabel} · ${(totalWh / 1000).toFixed(2)} kWh in window`
