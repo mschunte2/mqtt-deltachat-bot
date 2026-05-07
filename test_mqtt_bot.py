@@ -849,6 +849,31 @@ class TestEngineOnFire(unittest.TestCase):
         sent = [t for _, t in e.bot.rpc.sent]
         self.assertTrue(any("auto-off" in (t or "").lower() for t in sent))
 
+    def test_list_rules_renders_pending_jobs(self):
+        e = _build_engine_with_class()
+        # Schedule two rules for kitchen.
+        from scheduler import ScheduledJob, ScheduledPolicy, parse_policy
+        d = sched.PolicyDefaults()
+        for clause in ("for 30m", "if idle 5W 60s"):
+            policy = parse_policy(clause, d)
+            e.scheduler.schedule(ScheduledJob.from_policy(
+                policy, "kitchen", 12, "off", int(time.time()),
+            ))
+        text = e.list_rules(12, "kitchen")
+        self.assertIn("kitchen:", text)
+        self.assertIn("off in", text)
+        self.assertIn("when apower<5W", text)
+
+    def test_list_rules_empty(self):
+        e = _build_engine_with_class()
+        text = e.list_rules(12)
+        self.assertIn("no rules", text)
+
+    def test_list_rules_unknown_device(self):
+        e = _build_engine_with_class()
+        text = e.list_rules(12, "ghost")
+        self.assertIn("unknown device", text)
+
     def test_handle_webxdc_auto_off_does_not_dispatch(self):
         # The "Add auto-off rule" button sends action="auto-off" with the
         # policy in a sibling key. Earlier engine routed this through

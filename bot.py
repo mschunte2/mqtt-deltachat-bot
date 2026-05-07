@@ -125,7 +125,7 @@ engine = engine_mod.Engine(
 
 # --- Command parser -------------------------------------------------------
 
-_GLOBAL_VERBS = {"id", "list", "apps", "help"}
+_GLOBAL_VERBS = {"id", "list", "apps", "help", "rules"}
 _DIRECT_VERBS = {"on", "off", "toggle", "status"}
 _CANCEL_VERBS = {"cancel-auto-off", "cancel-auto-on", "cancel-schedule"}
 _SCHEDULE_VERBS = {"auto-off", "auto-on"}
@@ -271,6 +271,9 @@ def _on_new_message(bot, accid, event):
         if verb == "help":
             bot.rpc.send_msg(accid, chatid, MsgData(text=engine.help_text(chatid)))
             return
+        if verb == "rules":
+            bot.rpc.send_msg(accid, chatid, MsgData(text=engine.list_rules(chatid)))
+            return
 
     # /all <verb> — apply a direct verb to every device visible to this chat.
     if head == "all" and verb in _DIRECT_VERBS and not rest:
@@ -280,6 +283,10 @@ def _on_new_message(bot, accid, event):
     device_name = head
     if verb == "status" and not rest:
         bot.rpc.send_msg(accid, chatid, MsgData(text=engine.status_for(chatid, device_name)))
+        return
+    if verb == "rules" and not rest:
+        bot.rpc.send_msg(accid, chatid,
+                         MsgData(text=engine.list_rules(chatid, device_name)))
         return
     if verb in _DIRECT_VERBS:
         # `off <clause>` is shorthand for scheduling auto-off — no immediate toggle.

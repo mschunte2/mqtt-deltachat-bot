@@ -294,6 +294,37 @@ class Engine:
             lines.append(self._format_device_line(d))
         return "\n".join(lines)
 
+    def list_rules(self, chat_id: int, device_name: str | None = None) -> str:
+        """Pretty-print pending auto-on / auto-off rules.
+
+        device_name=None  → every device visible to this chat.
+        device_name=<x>   → just that device (with permission check).
+        """
+        if device_name is not None:
+            device = self.cfg.devices.get(device_name)
+            if device is None:
+                return f"unknown device: {device_name}"
+            if not permissions.chat_can_see(chat_id, device, self.allowed_chats):
+                return "permission denied"
+            devices = [device]
+        else:
+            devices = permissions.visible_devices(chat_id, self.cfg, self.allowed_chats)
+        if not devices:
+            return "no devices visible to this chat"
+        lines: list[str] = []
+        total = 0
+        for d in devices:
+            jobs = self.scheduler.jobs_for_device(d.name)
+            if not jobs:
+                continue
+            lines.append(f"{d.name}:")
+            for j in jobs:
+                lines.append("  " + self._format_rule_summary(j))
+                total += 1
+        if not total:
+            return "no rules pending"
+        return "\n".join(lines)
+
     def status_for(self, chat_id: int, device_name: str) -> str:
         device = self.cfg.devices.get(device_name)
         if device is None:
@@ -317,6 +348,8 @@ class Engine:
             "  /<device> auto-on at 7h | at 7h daily\n"
             "  /<device> cancel-auto-off | cancel-auto-on | cancel-schedule\n"
             "  /<device> export 7d                — CSV of power + energy history\n"
+            "  /<device> rules                    — list this device's pending rules\n"
+            "  /rules               — list pending rules for every visible device\n"
             "  /list                — list devices visible to this chat\n"
             "  /apps                — (re)deliver webxdc control apps\n"
             "  /id                  — show this chat's id\n"
@@ -737,6 +770,25 @@ class Engine:
         # Suppress class line for single-class deployments? Keep it; useful when mixed.
         if len(self.cfg.classes) > 1:
             bits.append(f"[{cls.name}]")
+        return " ".join(bits)
+
+    def _format_rule_summary(self, job: sched_mod.ScheduledJob) -> str:
+        """One-line description used by /rules output."""
+        bits = [job.target_action]
+        if job.deadline_ts:
+            remaining = max(0, job.deadline_ts - int(time.time()))
+            if job._time_mode == "tod" and job.time_of_day:
+                h, m = job.time_of_day
+                suffix = " daily" if job.recurring_tod else ""
+                bits.append(f"at {h:02d}:{m:02d}{suffix} (in {_fmt_secs(remaining)})")
+            else:
+                bits.append(f"in {_fmt_secs(remaining)}")
+        if job.has_idle():
+            bits.append(f"or when {job.idle_field}<{job.idle_threshold:g}W "
+                        f"for {_fmt_secs(job.idle_duration_s)}")
+        if job.has_consumed():
+            bits.append(f"or when used<{job.consumed_threshold_wh:g}Wh "
+                        f"in {_fmt_secs(job.consumed_window_s)}")
         return " ".join(bits)
 
     def _format_schedule_ack(self, device_name: str, target_action: str,
