@@ -845,11 +845,12 @@ class Engine:
         stay inline; multi-clause (OR-combined) rules get an indented
         bullet list under the action header."""
         clauses = self._rule_clauses(job)
+        suffix = " (once)" if job.once else ""
         if not clauses:
-            return [job.target_action]
+            return [job.target_action + suffix]
         if len(clauses) == 1:
-            return [f"{job.target_action} {clauses[0]}"]
-        return [f"{job.target_action}:"] + [f"  - {c}" for c in clauses]
+            return [f"{job.target_action} {clauses[0]}{suffix}"]
+        return [f"{job.target_action}:{suffix}"] + [f"  - {c}" for c in clauses]
 
     def _format_schedule_ack(self, device_name: str, target_action: str,
                              job: sched_mod.ScheduledJob) -> str:
@@ -890,6 +891,9 @@ class Engine:
                 "threshold_wh", defaults.consumed_threshold_wh))
             policy.consumed_window_s = int(consumed.get(
                 "window_s", defaults.consumed_window_s))
+        # The "only once" checkbox arrives as `once: true` in the policy.
+        if raw.get("once") is True:
+            policy.once = True
         if policy.is_empty():
             raise ValueError("no policies supplied")
         return policy

@@ -85,6 +85,8 @@ function readRuleForm(direction) {
       window_s: parseInt(root.querySelector(`.${direction}-cons-min`).value, 10) * 60,
     };
   }
+  const onceBox = root.querySelector(`.${direction}-once`);
+  if (onceBox && onceBox.checked) policy.once = true;
   return policy;
 }
 
@@ -430,7 +432,9 @@ function describeRule(j) {
     parts.push(`when used < ${j.consumed.threshold_wh}Wh in `
              + `${fmtSecs(j.consumed.window_s)}`);
   }
-  return parts.join(' or ') || '(empty)';
+  let s = parts.join(' or ') || '(empty)';
+  if (j.once) s += ' · once';
+  return s;
 }
 
 function renderRulesList(dev) {

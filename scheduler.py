@@ -81,6 +81,11 @@ class ScheduledPolicy:
     consumed_threshold_wh: float | None = None
     consumed_window_s: int | None = None
 
+    # If True, the rule is deleted after its first fire. If False (the
+    # default since v1.5) the rule re-arms and fires every time the
+    # condition is met again, until explicitly cancelled.
+    once: bool = False
+
     def is_empty(self) -> bool:
         return (self.timer_seconds is None
                 and self.time_of_day is None
@@ -103,8 +108,14 @@ class ScheduledJob:
     # multiple rules can each have their own time-based policy)
     deadline_ts: int | None = None
     time_of_day: tuple[int, int] | None = None
-    recurring_tod: bool = False
+    recurring_tod: bool = False    # legacy flag, retained for back-compat
     _time_mode: str | None = None    # "timer" | "tod" — drives template selection
+    # The original timer duration, kept so the rule can re-arm to
+    # `now + timer_seconds` after firing (recurring timers).
+    timer_seconds: int | None = None
+
+    # If True, the rule self-deletes on first fire. Default False in v1.5+.
+    once: bool = False
 
     # idle policy
     idle_field: str | None = None
@@ -146,6 +157,8 @@ class ScheduledJob:
             time_of_day=policy.time_of_day,
             recurring_tod=policy.recurring_tod,
             _time_mode=time_mode,
+            timer_seconds=policy.timer_seconds,
+            once=policy.once,
             idle_field=policy.idle_field,
             idle_threshold=policy.idle_threshold,
             idle_duration_s=policy.idle_duration_s,
@@ -178,6 +191,8 @@ class ScheduledJob:
             "time_of_day": list(self.time_of_day) if self.time_of_day else None,
             "recurring_tod": self.recurring_tod,
             "_time_mode": self._time_mode,
+            "timer_seconds": self.timer_seconds,
+            "once": self.once,
             "idle_field": self.idle_field,
             "idle_threshold": self.idle_threshold,
             "idle_duration_s": self.idle_duration_s,
@@ -189,6 +204,14 @@ class ScheduledJob:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ScheduledJob":
         tod = d.get("time_of_day")
+        # Migration for rules persisted before v1.5 (no `once` field):
+        # preserve the previous one-shot-by-default behaviour by treating
+        # any non-recurring rule as once=True. Recurring TODs were
+        # already persistent so they stay persistent.
+        if "once" in d:
+            once = bool(d["once"])
+        else:
+            once = not bool(d.get("recurring_tod", False))
         return cls(
             device_name=str(d["device_name"]),
             chat_id_origin=int(d["chat_id_origin"]),
@@ -198,6 +221,8 @@ class ScheduledJob:
             time_of_day=(int(tod[0]), int(tod[1])) if tod else None,
             recurring_tod=bool(d.get("recurring_tod", False)),
             _time_mode=d.get("_time_mode"),
+            timer_seconds=d.get("timer_seconds"),
+            once=once,
             idle_field=d.get("idle_field"),
             idle_threshold=d.get("idle_threshold"),
             idle_duration_s=d.get("idle_duration_s"),
@@ -215,12 +240,27 @@ class ScheduledJob:
             "deadline_ts": self.deadline_ts,
             "time_of_day": list(self.time_of_day) if self.time_of_day else None,
             "recurring_tod": self.recurring_tod,
+            "timer_seconds": self.timer_seconds,
+            "once": self.once,
             "idle": ({"field": self.idle_field, "threshold": self.idle_threshold,
                       "duration_s": self.idle_duration_s} if self.has_idle() else None),
             "consumed": ({"field": self.consumed_field,
                           "threshold_wh": self.consumed_threshold_wh,
                           "window_s": self.consumed_window_s} if self.has_consumed() else None),
         }
+
+
+def _job_dormant(job: "ScheduledJob", output: Any) -> bool:
+    """A rule is dormant when the device is already in its target state.
+    Off-rule on a device that is already off → dormant. Same for on-rule
+    on an already-on device. None / unknown output → not dormant
+    (better to fire-and-suppress later than to miss a real condition).
+    """
+    if job.target_action == "off" and output is False:
+        return True
+    if job.target_action == "on" and output is True:
+        return True
+    return False
 
 
 def derive_rule_id(policy: ScheduledPolicy) -> str:
@@ -331,6 +371,21 @@ def parse_policy(
     if not parts:
         raise ValueError("empty schedule clause")
     policy = ScheduledPolicy()
+    # Strip a "once" keyword from anywhere in any part. If any was
+    # present, mark the policy as one-shot; otherwise the default
+    # (recurring) applies.
+    cleaned_parts: list[str] = []
+    for part in parts:
+        tokens = part.split()
+        filtered = [t for t in tokens if t.lower() != "once"]
+        if len(filtered) != len(tokens):
+            policy.once = True
+        joined = " ".join(filtered).strip()
+        if joined:
+            cleaned_parts.append(joined)
+    parts = cleaned_parts
+    if not parts:
+        raise ValueError("only 'once' specified — needs an actual condition")
     for part in parts:
         _apply(part, policy, defaults, allowed)
     if policy.is_empty():
@@ -442,6 +497,14 @@ class Scheduler:
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._persist_path = Path(persist_path) if persist_path else None
+        # Engine registers a callback so the timer thread can ask the
+        # current device output state — used to skip evaluating rules
+        # whose target state is already met (an off-rule when the plug
+        # is already off, an on-rule when it's already on).
+        self._state_provider: Callable[[str], dict[str, Any]] | None = None
+
+    def set_state_provider(self, provider: Callable[[str], dict[str, Any]]) -> None:
+        self._state_provider = provider
 
     # --- lifecycle --------------------------------------------------------
 
@@ -496,12 +559,23 @@ class Scheduler:
         """Evaluate idle and consumed policies for the device after a state update."""
         now = now if now is not None else int(time.time())
         fires: list[tuple[ScheduledJob, str, dict[str, Any]]] = []
+        output = state.get("output")
         with self._lock:
             for key in list(self._jobs.keys()):
                 d, _action, _rid = key
                 if d != device_name:
                     continue
                 job = self._jobs[key]
+                # State-aware dormancy: an off-rule does nothing while
+                # the device is already off; an on-rule does nothing while
+                # the device is already on. Reset transient counters so
+                # the rule starts fresh when the device flips back.
+                if _job_dormant(job, output):
+                    job._below_since = None
+                    if job._samples:
+                        job._samples.clear()
+                    job._consumed_started_at = now
+                    continue
                 fired = False
                 if job.has_idle():
                     v = state.get(job.idle_field)
@@ -510,7 +584,6 @@ class Scheduler:
                             if job._below_since is None:
                                 job._below_since = now
                             elif now - job._below_since >= job.idle_duration_s:
-                                del self._jobs[key]
                                 duration = now - job._below_since
                                 fires.append((job, "idle",
                                               {"value": float(v),
@@ -519,6 +592,12 @@ class Scheduler:
                                                "duration_human": durations.format(duration),
                                                "field": job.idle_field}))
                                 fired = True
+                                if job.once:
+                                    del self._jobs[key]
+                                else:
+                                    # Re-arm: clear so a fresh below-since
+                                    # tracking begins next time we evaluate.
+                                    job._below_since = None
                         else:
                             job._below_since = None
                 if not fired and job.has_consumed():
@@ -531,13 +610,19 @@ class Scheduler:
                     if now - job._consumed_started_at >= job.consumed_window_s:
                         wh = integrate_wh(job._samples, cutoff, now)
                         if wh < job.consumed_threshold_wh:
-                            del self._jobs[key]
                             fires.append((job, "consumed",
                                           {"value": float(wh),
                                            "threshold": float(job.consumed_threshold_wh),
                                            "seconds": job.consumed_window_s,
                                            "window_human": durations.format(job.consumed_window_s),
                                            "field": job.consumed_field}))
+                            if job.once:
+                                del self._jobs[key]
+                            else:
+                                # Re-arm: clear samples; a new window
+                                # begins at the next non-dormant tick.
+                                job._samples.clear()
+                                job._consumed_started_at = now
         for j, mode, ctx in fires:
             self._safe_fire(j, mode, ctx)
         if fires:
@@ -551,11 +636,20 @@ class Scheduler:
             fires: list[tuple[ScheduledJob, str, dict[str, Any]]] = []
             next_deadline: int | None = None
             with self._lock:
-                # Pass 1: detect fires + re-arm recurring TODs.
+                # Pass 1: detect fires + re-arm.
                 for key in list(self._jobs.keys()):
                     job = self._jobs[key]
                     if not job.has_time() or job.deadline_ts > now:
                         continue
+                    # State-aware skip: if the device is already in the
+                    # rule's target state, re-arm without firing — no
+                    # publish, no chat post.
+                    output = None
+                    if self._state_provider is not None:
+                        st = self._state_provider(job.device_name) or {}
+                        output = st.get("output")
+                    dormant = _job_dormant(job, output)
+
                     mode = job._time_mode or "timer"
                     elapsed = max(0, now - (job.deadline_ts or now))
                     ctx: dict[str, Any] = {
@@ -566,13 +660,21 @@ class Scheduler:
                         h, m = job.time_of_day
                         ctx["hh"] = f"{h:02d}"
                         ctx["mm"] = f"{m:02d}"
-                    if job.recurring_tod and job.time_of_day:
+
+                    # Re-arm decision (TOD vs timer vs once).
+                    if job.once:
+                        del self._jobs[key]
+                    elif job.time_of_day:
                         h, m = job.time_of_day
                         job.deadline_ts = next_tod_deadline(h, m, now)
-                        # keep in _jobs; do not delete
+                    elif job.timer_seconds:
+                        job.deadline_ts = now + job.timer_seconds
                     else:
+                        # No re-arm value (legacy data); drop defensively.
                         del self._jobs[key]
-                    fires.append((job, mode, ctx))
+
+                    if not dormant:
+                        fires.append((job, mode, ctx))
                 # Pass 2: collect next deadline from surviving jobs.
                 for j in self._jobs.values():
                     if j.has_time() and (next_deadline is None or j.deadline_ts < next_deadline):

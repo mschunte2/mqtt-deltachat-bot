@@ -544,6 +544,11 @@ def _on_start(bot, _args):
     # to wait a fresh window before being able to fire.
     scheduler.load_persisted()
     engine.rehydrate_rules_from_history()
+    # Tell the scheduler thread how to peek device output state — so
+    # it can skip firing rules whose target state is already met.
+    scheduler.set_state_provider(
+        lambda dev: (engine._states.get(dev).fields if engine._states.get(dev) else {})
+    )
     mqtt.start()
     scheduler.start()
     bot.logger.info(

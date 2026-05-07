@@ -562,6 +562,96 @@ class TestSchedulerJob(unittest.TestCase):
         rules = s2.jobs_for_device("kitchen")
         self.assertTrue(any(j.recurring_tod for j in rules))
 
+    def test_parse_once_keyword(self):
+        d = sched.PolicyDefaults()
+        for clause in ("if idle once", "once if idle", "for 30m once",
+                       "once at 18h", "if idle 5W 60s once"):
+            p = sched.parse_policy(clause, d)
+            self.assertTrue(p.once, f"failed for clause {clause!r}")
+        # Without "once": default recurring (False)
+        p = sched.parse_policy("if idle 5W 60s", d)
+        self.assertFalse(p.once)
+
+    def test_recurring_idle_rule_re_arms(self):
+        # Without `once`, an idle rule re-arms after firing.
+        fires = []
+        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
+        now = int(time.time())
+        s.schedule(sched.ScheduledJob(
+            device_name="k", chat_id_origin=1, target_action="off",
+            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+            once=False,
+        ))
+        # Drive below threshold until first fire (output=True so not dormant).
+        s.tick("k", {"apower": 1.0, "output": True}, now=now)
+        s.tick("k", {"apower": 1.0, "output": True}, now=now + 65)
+        self.assertEqual(len(fires), 1)
+        # Job should still be there (recurring).
+        self.assertEqual(len(s.jobs_for_device("k")), 1)
+        # Drive again — should fire again.
+        s.tick("k", {"apower": 1.0, "output": True}, now=now + 130)
+        s.tick("k", {"apower": 1.0, "output": True}, now=now + 195)
+        self.assertEqual(len(fires), 2)
+
+    def test_once_idle_rule_self_deletes(self):
+        fires = []
+        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
+        now = int(time.time())
+        s.schedule(sched.ScheduledJob(
+            device_name="k", chat_id_origin=1, target_action="off",
+            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+            once=True,
+        ))
+        s.tick("k", {"apower": 1.0, "output": True}, now=now)
+        s.tick("k", {"apower": 1.0, "output": True}, now=now + 65)
+        self.assertEqual(len(fires), 1)
+        # Once-rule is gone after firing.
+        self.assertEqual(len(s.jobs_for_device("k")), 0)
+
+    def test_dormant_when_already_in_target(self):
+        # An off-rule does nothing while the device is already off.
+        fires = []
+        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
+        now = int(time.time())
+        s.schedule(sched.ScheduledJob(
+            device_name="k", chat_id_origin=1, target_action="off",
+            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+        ))
+        # output=False → dormant; the below-threshold readings should NOT
+        # build up _below_since.
+        s.tick("k", {"apower": 1.0, "output": False}, now=now)
+        s.tick("k", {"apower": 1.0, "output": False}, now=now + 65)
+        s.tick("k", {"apower": 1.0, "output": False}, now=now + 200)
+        self.assertEqual(fires, [])
+        # Once the device flips on, the rule starts evaluating fresh.
+        s.tick("k", {"apower": 1.0, "output": True}, now=now + 1000)
+        s.tick("k", {"apower": 1.0, "output": True}, now=now + 1070)
+        self.assertEqual(len(fires), 1)
+
+    def test_migration_old_rules_default_once(self):
+        # Pre-v1.5 rules.json had no `once` field and one-shot was the
+        # default for non-recurring rules. Loader should preserve that.
+        path = Path(tempfile.mkdtemp()) / "rules.json"
+        path.write_text(json.dumps({"jobs": [
+            # Old non-recurring rule (no `once`, no `recurring_tod`)
+            {"device_name": "k", "chat_id_origin": 1, "target_action": "off",
+             "rule_id": "consumed:5Wh:600s", "deadline_ts": None,
+             "consumed_field": "apower", "consumed_threshold_wh": 5.0,
+             "consumed_window_s": 600},
+            # Old recurring TOD
+            {"device_name": "k", "chat_id_origin": 1, "target_action": "on",
+             "rule_id": "tod:0700d", "deadline_ts": 9999999999,
+             "time_of_day": [7, 0], "recurring_tod": True,
+             "_time_mode": "tod"},
+        ]}))
+        s = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
+        s.load_persisted()
+        jobs = {j.rule_id: j for j in s.jobs_for_device("k")}
+        # Old non-recurring → once=True (preserved)
+        self.assertTrue(jobs["consumed:5Wh:600s"].once)
+        # Old recurring TOD → once=False (was already recurring)
+        self.assertFalse(jobs["tod:0700d"].once)
+
     def test_persist_drops_expired_oneshots(self):
         path = Path(tempfile.mkdtemp()) / "rules.json"
         s1 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)

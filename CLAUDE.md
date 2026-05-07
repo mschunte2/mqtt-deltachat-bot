@@ -594,6 +594,21 @@ month's first hour).
   every visible device. App grows a 30-day daily-energy bar chart.
   Threshold tuning from the app can now persist to `devices.json`
   via a `set_param` request with `persist: true`.
+- 2026-05-07 v1.5 — same-day. **Rules are recurring by default.**
+  Schedule a rule once and it fires every time its condition is met
+  again, until you cancel it. Opt-in `once` flag (chat keyword and
+  app checkbox) preserves the old fire-and-delete behaviour.
+  State-aware dormancy: an off-rule does nothing while the plug is
+  already off, an on-rule does nothing while it's already on, so
+  no spurious chat messages and no wasted CPU. Re-arm logic per
+  policy: TOD → next occurrence, timer → `now + timer_seconds`,
+  idle/consumed → reset transient counters. Migration of pre-v1.5
+  rules.json: missing `once` field is inferred from `recurring_tod`
+  so existing rules' behaviour is preserved across the upgrade.
+  ScheduledJob gains `once` and `timer_seconds`; ScheduledPolicy
+  gains `once`. parse_policy strips a `once` keyword from anywhere
+  in the clause. Engine surfaces `once` in the snapshot; /rules
+  marks one-shot rules with `(once)`. 110 tests.
 - 2026-05-07 v1.4 — same-day. Rules persist to
   `~/.config/<BOT_NAME>/rules.json`; load on startup re-arms recurring
   TODs and drops expired one-shots. **Rehydrate from history**: the

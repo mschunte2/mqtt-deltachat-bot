@@ -250,6 +250,10 @@ header select {
   border-top: 1px solid #eee;
   margin-top: 6px;
 }
+.rule-form .once {
+  font-size: 0.85rem;
+  color: #6b6b70;
+}
 .add-rule-btn {
   align-self: flex-start;
   padding: 6px 14px;
