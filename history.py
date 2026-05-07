@@ -99,7 +99,13 @@ class History:
         `output` is the relay state at the time of the sample. When the
         minute boundary rolls over, the LATEST output value seen during
         that minute is what gets persisted alongside the avg apower.
+
+        No-op once the connection has been closed — late writes can
+        race the SIGTERM-triggered close() while the MQTT thread is
+        still draining its inbox.
         """
+        if self._closed:
+            return
         if apower is not None and isinstance(apower, (int, float)):
             out_int = (1 if output is True else 0 if output is False else None)
             self._buffer_apower(device, ts, float(apower), out_int)
@@ -108,6 +114,8 @@ class History:
         self._maybe_prune(ts)
 
     def write_event(self, device: str, ts: int, suffix: str, payload_text: str) -> None:
+        if self._closed:
+            return
         kind = None
         try:
             decoded = json.loads(payload_text)

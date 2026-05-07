@@ -799,25 +799,17 @@ class TestEngineOnFire(unittest.TestCase):
         self.assertTrue(any("auto-off (idle" in (t or "") for t in sent),
                         f"expected idle message; got {sent}")
 
-    def test_on_fire_suppresses_when_already_in_target_state(self):
-        # Sibling rules: once one rule has switched the plug off, further
-        # off-rules firing should be no-ops — no MQTT publish, no chat msg.
+    def test_on_fire_publishes_even_when_already_in_target_state(self):
+        # In OR-combined parallel rules, every fire should be visible.
+        # Republish + chat message even if cached output already matches —
+        # the user wants confirmation that each rule independently tripped.
         e = _build_engine_with_class()
-        # Mark device as already off.
-        e._states["kitchen"].set("output", False)
+        e._states["kitchen"].set("output", False)  # already off
         e.on_fire("kitchen", chat_id_origin=12, target_action="off",
                   mode="idle", ctx={"value": 0.1, "seconds": 60, "field": "apower"})
-        self.assertEqual(e.mqtt.published, [])
-        self.assertEqual(e.bot.rpc.sent, [])
-
-    def test_on_fire_publishes_when_not_in_target_state(self):
-        # Counterpart to the suppression test: when output != target,
-        # the fire goes through.
-        e = _build_engine_with_class()
-        e._states["kitchen"].set("output", True)  # currently on
-        e.on_fire("kitchen", chat_id_origin=12, target_action="off",
-                  mode="timer", ctx={})
         self.assertEqual(len(e.mqtt.published), 1)
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertTrue(any("auto-off" in (t or "").lower() for t in sent))
 
     def test_on_fire_threads_action_verb_into_template(self):
         # Build a class with a template that uses {action_verb} + {threshold}

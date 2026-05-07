@@ -324,24 +324,12 @@ class Engine:
                       target_action, device_name)
             return
 
-        # Sibling-rule suppression: if the device's cached output already
-        # matches the rule's target state, this fire is redundant. A
-        # different rule already moved the plug into the target state and
-        # publishing again would just generate a noise chat message + a
-        # redundant MQTT command. We only do this for boolean target
-        # actions (on/off) where we can compare; toggle has no fixed target.
-        target_output = (
-            True if target_action == "on"
-            else False if target_action == "off"
-            else None
-        )
-        if target_output is not None:
-            cur = self._states.get(device_name, state_mod.DeviceState()).fields.get("output")
-            if cur is target_output:
-                log.info("scheduler fire %s/%s mode=%s suppressed "
-                         "(output already %s)",
-                         device_name, target_action, mode, cur)
-                return
+        # NOTE: we deliberately DO NOT suppress fires whose target state
+        # already matches the cached output. In an OR-combined model the
+        # user wants every rule that trips to be visible in chat (even if
+        # redundant) — it confirms that rules are doing what they were
+        # configured to do. Republishing an already-true command is a
+        # cheap no-op on the plug.
 
         topic = f"{device.topic_prefix}/{cmd.suffix}"
         payload = templating.render(cmd.payload, {"client_id": self.client_id})
