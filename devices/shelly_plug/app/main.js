@@ -176,7 +176,15 @@ function appendSample(name, ts, power) {
   if (h.length > SAMPLES_MAX_COUNT) h.splice(0, h.length - SAMPLES_MAX_COUNT);
 }
 
+let _dbgCount = 0;
 window.webxdc.setUpdateListener((update) => {
+  _dbgCount++;
+  const dbgCount = $('dbg-count'); if (dbgCount) dbgCount.textContent = _dbgCount;
+  const dbgPre = $('dbg-pre');
+  if (dbgPre) {
+    try { dbgPre.textContent = JSON.stringify(update, null, 2).slice(0, 2000); }
+    catch (e) { dbgPre.textContent = 'JSON.stringify failed: ' + e; }
+  }
   const p = update.payload;
   if (!p || !p.devices) return;
   state.devices = p.devices;
