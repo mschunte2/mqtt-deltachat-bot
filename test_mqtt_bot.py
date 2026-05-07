@@ -911,18 +911,25 @@ class TestEngineOnFire(unittest.TestCase):
 
     def test_list_rules_renders_pending_jobs(self):
         e = _build_engine_with_class()
-        # Schedule two rules for kitchen.
-        from scheduler import ScheduledJob, ScheduledPolicy, parse_policy
+        # Schedule two single-clause rules + one OR-combined rule.
+        from scheduler import ScheduledJob, parse_policy
         d = sched.PolicyDefaults()
-        for clause in ("for 30m", "if idle 5W 60s"):
+        for clause in ("for 30m", "if idle 5W 60s",
+                       "for 1h or if idle 5W 60s"):
             policy = parse_policy(clause, d)
             e.scheduler.schedule(ScheduledJob.from_policy(
                 policy, "kitchen", 12, "off", int(time.time()),
             ))
         text = e.list_rules(12, "kitchen")
         self.assertIn("kitchen:", text)
+        # Single-clause stays inline (no stray "or").
         self.assertIn("off in", text)
-        self.assertIn("when apower<5W", text)
+        self.assertIn("off when apower<5W", text)
+        self.assertNotIn("off or when", text)
+        # OR-combined gets the bulleted multi-line treatment.
+        self.assertIn("off:", text)
+        self.assertIn("  - in", text)
+        self.assertIn("  - when apower<5W", text)
 
     def test_list_rules_empty(self):
         e = _build_engine_with_class()

@@ -319,7 +319,8 @@ class Engine:
                 continue
             lines.append(f"{d.name}:")
             for j in jobs:
-                lines.append("  " + self._format_rule_summary(j))
+                for line in self._format_rule_lines(j):
+                    lines.append("  " + line)
                 total += 1
         if not total:
             return "no rules pending"
@@ -772,43 +773,45 @@ class Engine:
             bits.append(f"[{cls.name}]")
         return " ".join(bits)
 
-    def _format_rule_summary(self, job: sched_mod.ScheduledJob) -> str:
-        """One-line description used by /rules output."""
-        bits = [job.target_action]
+    def _rule_clauses(self, job: sched_mod.ScheduledJob) -> list[str]:
+        """Each enabled policy as a clean clause string — NO 'or' prefixes.
+        Callers join them however they like (single-line via 'or', or
+        multi-line indented)."""
+        out: list[str] = []
         if job.deadline_ts:
             remaining = max(0, job.deadline_ts - int(time.time()))
             if job._time_mode == "tod" and job.time_of_day:
                 h, m = job.time_of_day
                 suffix = " daily" if job.recurring_tod else ""
-                bits.append(f"at {h:02d}:{m:02d}{suffix} (in {_fmt_secs(remaining)})")
+                out.append(f"at {h:02d}:{m:02d}{suffix} (in {_fmt_secs(remaining)})")
             else:
-                bits.append(f"in {_fmt_secs(remaining)}")
+                out.append(f"in {_fmt_secs(remaining)}")
         if job.has_idle():
-            bits.append(f"or when {job.idle_field}<{job.idle_threshold:g}W "
-                        f"for {_fmt_secs(job.idle_duration_s)}")
+            out.append(f"when {job.idle_field}<{job.idle_threshold:g}W "
+                       f"for {_fmt_secs(job.idle_duration_s)}")
         if job.has_consumed():
-            bits.append(f"or when used<{job.consumed_threshold_wh:g}Wh "
-                        f"in {_fmt_secs(job.consumed_window_s)}")
-        return " ".join(bits)
+            out.append(f"when used<{job.consumed_threshold_wh:g}Wh "
+                       f"in {_fmt_secs(job.consumed_window_s)}")
+        return out
+
+    def _format_rule_lines(self, job: sched_mod.ScheduledJob) -> list[str]:
+        """List-of-lines description used by /rules. Single-clause rules
+        stay inline; multi-clause (OR-combined) rules get an indented
+        bullet list under the action header."""
+        clauses = self._rule_clauses(job)
+        if not clauses:
+            return [job.target_action]
+        if len(clauses) == 1:
+            return [f"{job.target_action} {clauses[0]}"]
+        return [f"{job.target_action}:"] + [f"  - {c}" for c in clauses]
 
     def _format_schedule_ack(self, device_name: str, target_action: str,
                              job: sched_mod.ScheduledJob) -> str:
-        bits = [f"scheduled {device_name} {target_action}"]
-        if job.deadline_ts:
-            remaining = max(0, job.deadline_ts - int(time.time()))
-            if job._time_mode == "tod" and job.time_of_day:
-                h, m = job.time_of_day
-                suffix = " daily" if job.recurring_tod else ""
-                bits.append(f"at {h:02d}:{m:02d}{suffix} (in {_fmt_secs(remaining)})")
-            else:
-                bits.append(f"in {_fmt_secs(remaining)}")
-        if job.has_idle():
-            bits.append(f"or when {job.idle_field}<{job.idle_threshold:g}W "
-                        f"for {_fmt_secs(job.idle_duration_s)}")
-        if job.has_consumed():
-            bits.append(f"or when used<{job.consumed_threshold_wh:g}Wh "
-                        f"in {_fmt_secs(job.consumed_window_s)}")
-        return " ".join(bits)
+        clauses = self._rule_clauses(job)
+        head = f"scheduled {device_name} {target_action}"
+        if not clauses:
+            return head
+        return head + " " + " or ".join(clauses)
 
     def _policy_from_request(self, raw: dict, section) -> sched_mod.ScheduledPolicy:
         """Build a ScheduledPolicy from a webxdc request payload subobject.
