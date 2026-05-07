@@ -11,6 +11,17 @@ const state = {
   serverHistory: {},    // device -> { window_seconds, bucket_seconds, power_points, energy_points }
 };
 
+// Restore the last-chosen time window from localStorage (per-device UI
+// preference; doesn't sync to other chat members, which is the right
+// thing for a per-user view setting).
+try {
+  const saved = localStorage.getItem('windowSeconds');
+  if (saved !== null) {
+    const n = parseInt(saved, 10);
+    if (Number.isFinite(n) && n >= 0) state.historyWindow = n;
+  }
+} catch (_e) { /* localStorage may be disabled; ignore */ }
+
 const $ = (id) => document.getElementById(id);
 const picker = $('device-picker');
 const onlineDot = $('online-dot');
@@ -96,9 +107,19 @@ picker.addEventListener('change', () => {
 
 windowPick.addEventListener('change', () => {
   state.historyWindow = parseInt(windowPick.value, 10) || 0;
+  try { localStorage.setItem('windowSeconds', String(state.historyWindow)); }
+  catch (_e) { /* ignore */ }
   if (state.historyWindow > 0) requestHistory();
   renderSparkline();
 });
+
+// Pre-select the restored window in the <select> element BEFORE any
+// snapshot arrives, so the picker shows the persisted choice.
+if (windowPick) {
+  const opt = Array.from(windowPick.options)
+    .find(o => o.value === String(state.historyWindow));
+  if (opt) windowPick.value = String(state.historyWindow);
+}
 
 function requestHistory() {
   if (!state.active || state.historyWindow <= 0) return;
