@@ -72,6 +72,7 @@ class History:
         self._minute: dict[str, tuple[int, list[float], int | None]] = {}
         self._hour_seen: dict[str, int] = {}     # last hour-start written per device
         self._last_prune_ts = 0
+        self._closed = False
 
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(db_path), check_same_thread=False)
@@ -309,9 +310,17 @@ class History:
                      n1, n2, n3)
 
     def close(self) -> None:
-        self.flush_pending_minutes()
-        with self._lock:
-            self._db.close()
+        # Idempotent: SIGTERM handler runs close(), then sys.exit fires atexit
+        # which would otherwise re-enter and ProgrammingError on the now-closed
+        # connection.
+        if self._closed:
+            return
+        try:
+            self.flush_pending_minutes()
+        finally:
+            with self._lock:
+                self._db.close()
+            self._closed = True
 
 
 def _round_bucket(approx_seconds: int) -> int:
