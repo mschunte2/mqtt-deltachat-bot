@@ -1,0 +1,697 @@
+"""Unit tests for the pure modules.
+
+Run with: python3 test_mqtt_bot.py     (or `python3 -m unittest`)
+No external deps required — modules under test are stdlib-only.
+"""
+
+import json
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import config as cfg_mod
+import durations
+import permissions
+import scheduler as sched
+import state as state_mod
+import templating
+
+
+# --- durations ------------------------------------------------------------
+
+class TestDurations(unittest.TestCase):
+    def test_simple(self):
+        self.assertEqual(durations.parse("30s"), 30)
+        self.assertEqual(durations.parse("5m"), 300)
+        self.assertEqual(durations.parse("1h"), 3600)
+        self.assertEqual(durations.parse("1h30m"), 5400)
+        self.assertEqual(durations.parse("2h15m30s"), 8130)
+        self.assertEqual(durations.parse("90s"), 90)
+
+    def test_case_and_whitespace(self):
+        self.assertEqual(durations.parse("1H30M"), 5400)
+        self.assertEqual(durations.parse(" 30s "), 30)
+
+    def test_invalid(self):
+        for bad in ["", "30", "tomorrow", "30x", "1d", "0s", "0m"]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    durations.parse(bad)
+
+    def test_format(self):
+        self.assertEqual(durations.format(0), "0s")
+        self.assertEqual(durations.format(30), "30s")
+        self.assertEqual(durations.format(60), "1m")
+        self.assertEqual(durations.format(90), "1m30s")
+        self.assertEqual(durations.format(3600), "1h")
+        self.assertEqual(durations.format(3661), "1h1m1s")
+
+
+# --- templating -----------------------------------------------------------
+
+class TestTemplating(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(templating.render("hello {name}", {"name": "world"}), "hello world")
+
+    def test_missing_keys_empty(self):
+        self.assertEqual(templating.render("a={a} b={b}", {"a": 1}), "a=1 b=")
+
+    def test_format_spec(self):
+        self.assertEqual(templating.render("{v:.2f}", {"v": 1.5}), "1.50")
+
+
+# --- permissions ----------------------------------------------------------
+
+def _device(name, allowed):
+    return cfg_mod.Device(
+        name=name, class_name="x", topic_prefix="p/" + name,
+        description="", allowed_chats=tuple(allowed), params={},
+    )
+
+
+class TestPermissions(unittest.TestCase):
+    def test_global_gate(self):
+        self.assertTrue(permissions.is_allowed(7, {7, 8}))
+        self.assertFalse(permissions.is_allowed(9, {7, 8}))
+
+    def test_per_device_overrides_global(self):
+        d = _device("kitchen", [11])
+        # chat 11 in device list — allowed even if not in global
+        self.assertTrue(permissions.chat_can_see(11, d, set()))
+        # chat 7 in global but NOT in device list — denied
+        self.assertFalse(permissions.chat_can_see(7, d, {7, 11}))
+
+    def test_empty_device_list_falls_back(self):
+        d = _device("kitchen", [])
+        self.assertTrue(permissions.chat_can_see(7, d, {7, 8}))
+        self.assertFalse(permissions.chat_can_see(9, d, {7, 8}))
+
+
+# --- state extraction ----------------------------------------------------
+
+def _make_class():
+    return cfg_mod.DeviceClass(
+        name="t", app_id="t", description="",
+        subscribe=(),
+        commands={},
+        state_fields={
+            "online":  cfg_mod.StateFieldDef(from_suffix="online",
+                                             extract="bool_text"),
+            "output":  cfg_mod.StateFieldDef(from_suffix="status/switch:0",
+                                             json_path="output"),
+            "apower":  cfg_mod.StateFieldDef(from_suffix="status/switch:0",
+                                             json_path="apower"),
+            "aenergy": cfg_mod.StateFieldDef(from_suffix="status/switch:0",
+                                             json_path="aenergy.total"),
+        },
+        chat_events=(),
+        auto_off=None, auto_on=None,
+    )
+
+
+class TestStateExtract(unittest.TestCase):
+    def test_bool_text(self):
+        cls = _make_class()
+        self.assertEqual(state_mod.extract(cls, "online", b"true"), {"online": True})
+        self.assertEqual(state_mod.extract(cls, "online", b"false"), {"online": False})
+
+    def test_bool_text_unknown_skipped(self):
+        cls = _make_class()
+        self.assertEqual(state_mod.extract(cls, "online", b"maybe"), {})
+
+    def test_json_path(self):
+        cls = _make_class()
+        payload = json.dumps({"output": True, "apower": 12.5,
+                              "aenergy": {"total": 100.4}})
+        out = state_mod.extract(cls, "status/switch:0", payload)
+        self.assertEqual(out, {"output": True, "apower": 12.5, "aenergy": 100.4})
+
+    def test_unrelated_suffix_returns_empty(self):
+        cls = _make_class()
+        self.assertEqual(state_mod.extract(cls, "events/rpc", b"{}"), {})
+
+    def test_malformed_json_skipped(self):
+        cls = _make_class()
+        self.assertEqual(state_mod.extract(cls, "status/switch:0", b"not json"), {})
+
+
+# --- scheduler.parse_policy ----------------------------------------------
+
+class TestParsePolicy(unittest.TestCase):
+    def setUp(self):
+        self.d = sched.PolicyDefaults(
+            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+            consumed_field="apower", consumed_threshold_wh=5.0, consumed_window_s=600,
+        )
+
+    def test_timer(self):
+        p = sched.parse_policy("for 30m", self.d)
+        self.assertEqual(p.timer_seconds, 1800)
+        self.assertIsNone(p.time_of_day)
+
+    def test_in_alias(self):
+        self.assertEqual(sched.parse_policy("in 30m", self.d).timer_seconds, 1800)
+
+    def test_tod(self):
+        p = sched.parse_policy("at 18h", self.d)
+        self.assertEqual(p.time_of_day, (18, 0))
+        self.assertFalse(p.recurring_tod)
+        p = sched.parse_policy("at 18:30", self.d)
+        self.assertEqual(p.time_of_day, (18, 30))
+
+    def test_tod_daily(self):
+        p = sched.parse_policy("at 7h daily", self.d)
+        self.assertEqual(p.time_of_day, (7, 0))
+        self.assertTrue(p.recurring_tod)
+
+    def test_tod_invalid(self):
+        with self.assertRaises(ValueError):
+            sched.parse_policy("at 25h", self.d)
+
+    def test_idle_defaults(self):
+        p = sched.parse_policy("until idle", self.d)
+        self.assertEqual(p.idle_threshold, 5.0)
+        self.assertEqual(p.idle_duration_s, 60)
+
+    def test_idle_overrides(self):
+        p = sched.parse_policy("until idle 10W 120s", self.d)
+        self.assertEqual(p.idle_threshold, 10.0)
+        self.assertEqual(p.idle_duration_s, 120)
+
+    def test_consumed(self):
+        p = sched.parse_policy("until used <5Wh in 10m", self.d)
+        self.assertEqual(p.consumed_threshold_wh, 5.0)
+        self.assertEqual(p.consumed_window_s, 600)
+
+    def test_consumed_kwh(self):
+        p = sched.parse_policy("until used 1.5kWh in 1h", self.d)
+        self.assertEqual(p.consumed_threshold_wh, 1500.0)
+        self.assertEqual(p.consumed_window_s, 3600)
+
+    def test_or_combination(self):
+        p = sched.parse_policy("for 1h or until idle", self.d)
+        self.assertEqual(p.timer_seconds, 3600)
+        self.assertIsNotNone(p.idle_field)
+
+    def test_two_time_policies_rejected(self):
+        with self.assertRaises(ValueError):
+            sched.parse_policy("for 1h or at 18h", self.d)
+
+    def test_restricted_kinds(self):
+        # auto-on only allows timer + tod
+        with self.assertRaises(ValueError):
+            sched.parse_policy("until idle", self.d, allowed=frozenset({"timer", "tod"}))
+        # but tod alone is fine
+        p = sched.parse_policy("at 7h", self.d, allowed=frozenset({"timer", "tod"}))
+        self.assertEqual(p.time_of_day, (7, 0))
+
+
+# --- scheduler.integrate_wh ----------------------------------------------
+
+class TestIntegrate(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(sched.integrate_wh([], 0, 60), 0.0)
+
+    def test_constant_one_sample(self):
+        # 100W constant for 60s = 100 * 60 / 3600 ≈ 1.667 Wh
+        wh = sched.integrate_wh([(0, 100.0)], 0, 60)
+        self.assertAlmostEqual(wh, 100 * 60 / 3600.0, places=4)
+
+    def test_two_samples(self):
+        # samples at t=0 and t=60, power 100→100, then extends to t=120 at 100W
+        wh = sched.integrate_wh([(0, 100.0), (60, 100.0)], 0, 120)
+        self.assertAlmostEqual(wh, 100 * 120 / 3600.0, places=4)
+
+    def test_window_trim(self):
+        # window starts at 30, sample at 0 should be ignored
+        wh = sched.integrate_wh([(0, 1000.0), (60, 100.0)], 30, 60)
+        # only (60, 100.0) inside window → constant 100W * 30s = ~0.833Wh
+        self.assertAlmostEqual(wh, 100 * 30 / 3600.0, places=4)
+
+
+# --- scheduler.next_tod_deadline ------------------------------------------
+
+class TestTodDeadline(unittest.TestCase):
+    def test_future_today(self):
+        # pick a target far enough in the future to not be ambiguous
+        now = int(time.time())
+        lt = time.localtime(now)
+        h = (lt.tm_hour + 2) % 24
+        target = sched.next_tod_deadline(h, 0, now)
+        self.assertGreater(target, now)
+        # within 25 hours
+        self.assertLess(target - now, 25 * 3600)
+
+    def test_past_rolls_to_tomorrow(self):
+        now = int(time.time())
+        lt = time.localtime(now)
+        h_past = (lt.tm_hour - 1) % 24
+        target = sched.next_tod_deadline(h_past, lt.tm_min, now)
+        # must be in the future
+        self.assertGreater(target, now)
+        # within ~25 hours
+        self.assertLess(target - now, 25 * 3600)
+
+
+# --- config loader -------------------------------------------------------
+
+CLASS_JSON_OK = {
+    "name": "tplug",
+    "app_id": "tplug",
+    "subscribe": [
+        {"suffix": "online", "format": "text"},
+        {"suffix": "status/switch:0", "format": "json"},
+    ],
+    "commands": {
+        "on":     {"suffix": "command/switch:0", "payload": "on"},
+        "off":    {"suffix": "command/switch:0", "payload": "off"},
+        "toggle": {"suffix": "command/switch:0", "payload": "toggle"},
+        "status": {"suffix": "rpc",
+                   "payload": '{"id":1,"src":"{client_id}","method":"Switch.GetStatus","params":{"id":0}}'},
+    },
+    "state_fields": {
+        "online": {"from_suffix": "online", "extract": "bool_text"},
+        "output": {"from_suffix": "status/switch:0", "json_path": "output"},
+        "apower": {"from_suffix": "status/switch:0", "json_path": "apower"},
+    },
+    "chat_events": [
+        {"type": "on_change", "field": "output",
+         "values": {"true": "{name} ON", "false": "{name} OFF"}},
+        {"type": "threshold", "field": "apower",
+         "limit_param":    "power_threshold_watts",
+         "duration_param": "power_threshold_duration_s",
+         "above": "drew {value:.0f}W for {seconds}s",
+         "below": "load cleared"},
+    ],
+    "auto_off": {
+        "command": "off",
+        "default_idle_field": "apower",
+        "default_idle_threshold": 5,
+        "default_idle_duration": 60,
+        "default_consumed_field": "apower",
+        "default_consumed_threshold_wh": 5,
+        "default_consumed_window_s": 600,
+        "trigger_messages": {
+            "timer":            "{name} auto-off (timer)",
+            "tod":              "{name} auto-off ({hh}:{mm})",
+            "idle":             "{name} auto-off (idle: {field}={value:.1f}W for {seconds}s)",
+            "consumed":         "{name} auto-off (used {value:.2f}Wh)",
+            "cancelled_manual": "{name} auto-off cancelled (manually toggled)",
+        },
+    },
+}
+
+
+class TestConfigLoad(unittest.TestCase):
+    def _setup(self, with_class=True, instance_overrides=None):
+        tmp = Path(tempfile.mkdtemp())
+        if with_class:
+            cls_dir = tmp / "devices" / "tplug"
+            cls_dir.mkdir(parents=True)
+            (cls_dir / "class.json").write_text(json.dumps(CLASS_JSON_OK))
+        else:
+            (tmp / "devices").mkdir()
+        instance = {
+            "devices": [{
+                "name": "kitchen",
+                "class": "tplug",
+                "topic_prefix": "shellyplug-aaa",
+                "allowed_chats": [12],
+            }],
+        }
+        if instance_overrides:
+            instance.update(instance_overrides)
+        (tmp / "devices.json").write_text(json.dumps(instance))
+        return tmp
+
+    def test_happy(self):
+        tmp = self._setup()
+        c = cfg_mod.load(devices_dir=tmp / "devices",
+                         instances_file=tmp / "devices.json")
+        self.assertIn("tplug", c.classes)
+        self.assertIn("kitchen", c.devices)
+        d = c.devices["kitchen"]
+        self.assertEqual(d.topic_prefix, "shellyplug-aaa")
+        self.assertEqual(d.allowed_chats, (12,))
+
+    def test_no_classes(self):
+        tmp = self._setup(with_class=False)
+        with self.assertRaises(cfg_mod.ConfigError):
+            cfg_mod.load(devices_dir=tmp / "devices",
+                         instances_file=tmp / "devices.json")
+
+    def test_bad_class_ref(self):
+        tmp = self._setup(instance_overrides={
+            "devices": [{
+                "name": "kitchen", "class": "nope",
+                "topic_prefix": "p", "allowed_chats": [],
+            }]
+        })
+        with self.assertRaises(cfg_mod.ConfigError):
+            cfg_mod.load(devices_dir=tmp / "devices",
+                         instances_file=tmp / "devices.json")
+
+    def test_duplicate_prefix(self):
+        tmp = self._setup(instance_overrides={
+            "devices": [
+                {"name": "a", "class": "tplug", "topic_prefix": "x", "allowed_chats": []},
+                {"name": "b", "class": "tplug", "topic_prefix": "x", "allowed_chats": []},
+            ]
+        })
+        with self.assertRaises(cfg_mod.ConfigError):
+            cfg_mod.load(devices_dir=tmp / "devices",
+                         instances_file=tmp / "devices.json")
+
+    def test_bad_device_name(self):
+        tmp = self._setup(instance_overrides={
+            "devices": [{
+                "name": "Kitchen",  # uppercase rejected
+                "class": "tplug", "topic_prefix": "x", "allowed_chats": [],
+            }]
+        })
+        with self.assertRaises(cfg_mod.ConfigError):
+            cfg_mod.load(devices_dir=tmp / "devices",
+                         instances_file=tmp / "devices.json")
+
+
+# --- parse_allowed_chats --------------------------------------------------
+
+class TestParseAllowedChats(unittest.TestCase):
+    def test_empty(self):
+        self.assertEqual(cfg_mod.parse_allowed_chats(""), set())
+        self.assertEqual(cfg_mod.parse_allowed_chats(None), set())
+
+    def test_simple(self):
+        self.assertEqual(cfg_mod.parse_allowed_chats("12,34"), {12, 34})
+
+    def test_whitespace(self):
+        self.assertEqual(cfg_mod.parse_allowed_chats(" 12 , 34 ,, "), {12, 34})
+
+
+# --- Scheduler integration: timer fires + cancel by manual action --------
+
+class TestSchedulerJob(unittest.TestCase):
+    def test_cancel_returns_jobs(self):
+        fires = []
+        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
+        job = sched.ScheduledJob(
+            device_name="kitchen", chat_id_origin=12, target_action="off",
+            deadline_ts=int(time.time()) + 3600, _time_mode="timer",
+        )
+        s.schedule(job)
+        cancelled = s.cancel("kitchen", target_action="off")
+        self.assertEqual(len(cancelled), 1)
+        # second cancel returns empty
+        self.assertEqual(s.cancel("kitchen", target_action="off"), [])
+
+    def test_cancel_only_matching_action(self):
+        s = sched.Scheduler(on_fire=lambda *a: None)
+        s.schedule(sched.ScheduledJob(
+            device_name="kitchen", chat_id_origin=12, target_action="off",
+            deadline_ts=int(time.time()) + 3600))
+        s.schedule(sched.ScheduledJob(
+            device_name="kitchen", chat_id_origin=12, target_action="on",
+            deadline_ts=int(time.time()) + 3600))
+        # cancel only "off" should leave the "on" job alone
+        cancelled = s.cancel("kitchen", target_action="off")
+        self.assertEqual(len(cancelled), 1)
+        remaining = s.jobs_for_device("kitchen")
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].target_action, "on")
+
+    def test_idle_fires_when_below_for_long_enough(self):
+        fires = []
+        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
+        now = int(time.time())
+        job = sched.ScheduledJob(
+            device_name="kitchen", chat_id_origin=12, target_action="off",
+            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+        )
+        s.schedule(job)
+        # First tick at t0: power 1 → just below; below_since set to now
+        s.tick("kitchen", {"apower": 1.0}, now=now)
+        self.assertEqual(fires, [])
+        # Tick 30s later: still below, but only 30s elapsed
+        s.tick("kitchen", {"apower": 1.0}, now=now + 30)
+        self.assertEqual(fires, [])
+        # Tick 70s later: 70 >= 60 → fires
+        s.tick("kitchen", {"apower": 1.0}, now=now + 70)
+        self.assertEqual(len(fires), 1)
+        device, chat, target, mode, ctx = fires[0]
+        self.assertEqual(device, "kitchen")
+        self.assertEqual(target, "off")
+        self.assertEqual(mode, "idle")
+
+    def test_idle_resets_when_above(self):
+        fires = []
+        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
+        now = int(time.time())
+        s.schedule(sched.ScheduledJob(
+            device_name="k", chat_id_origin=1, target_action="off",
+            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+        ))
+        s.tick("k", {"apower": 1.0}, now=now)
+        s.tick("k", {"apower": 100.0}, now=now + 30)  # spike — resets
+        s.tick("k", {"apower": 1.0}, now=now + 60)    # 60s still not enough since reset
+        self.assertEqual(fires, [])
+
+
+# --- engine integration ---------------------------------------------------
+#
+# These tests stub deltachat2.MsgData (engine imports it at module level)
+# so we don't need the real package installed. We also use stub objects
+# for bot.rpc, mqtt, webxdc, scheduler so we can observe what the engine
+# tries to do without any network or thread.
+
+import types as _types
+
+_deltachat_stub = _types.ModuleType("deltachat2")
+class _MsgData:
+    def __init__(self, text=None, file=None):
+        self.text = text
+        self.file = file
+_deltachat_stub.MsgData = _MsgData
+sys.modules.setdefault("deltachat2", _deltachat_stub)
+
+import engine as engine_mod  # noqa: E402  (after sys.modules patch)
+
+
+class _StubMqtt:
+    def __init__(self):
+        self.published: list[tuple[str, str]] = []
+    def publish(self, topic, payload, qos=0, retain=False):
+        self.published.append((topic, payload))
+
+
+class _StubWebxdc:
+    def __init__(self):
+        self.pushes = 0
+    def push_filtered(self, *_a, **_kw):
+        self.pushes += 1
+    def class_for_msgid(self, *_a):
+        return None
+
+
+class _StubScheduler:
+    def __init__(self):
+        self._jobs: dict[tuple[str, str], object] = {}
+        self.cancel_calls: list[tuple[str, str | None]] = []
+    def schedule(self, job):
+        self._jobs[(job.device_name, job.target_action)] = job
+    def cancel(self, device_name, target_action=None):
+        self.cancel_calls.append((device_name, target_action))
+        out = []
+        for k in list(self._jobs.keys()):
+            if k[0] != device_name:
+                continue
+            if target_action is not None and k[1] != target_action:
+                continue
+            out.append(self._jobs.pop(k))
+        return out
+    def jobs_for_device(self, device_name):
+        return [j for k, j in self._jobs.items() if k[0] == device_name]
+    def all_jobs(self):
+        return list(self._jobs.values())
+    def tick(self, *_a, **_kw):
+        pass
+
+
+class _StubBotRpc:
+    def __init__(self):
+        self.sent: list[tuple[int, str]] = []
+        self.reactions: list[tuple[int, list[str]]] = []
+    def send_msg(self, _accid, chat_id, msg):
+        self.sent.append((chat_id, msg.text))
+    def send_reaction(self, _accid, msgid, emojis):
+        self.reactions.append((msgid, emojis))
+
+
+class _StubBot:
+    def __init__(self):
+        self.rpc = _StubBotRpc()
+        self.logger = logging.getLogger("test")
+
+
+import logging  # noqa: E402
+from pathlib import Path as _P  # noqa: E402
+
+
+def _build_engine_with_class(class_overrides=None, device_overrides=None):
+    """Build an Engine wired to stubs against a temp config dir."""
+    tmp = _P(tempfile.mkdtemp())
+    cls_def = json.loads(json.dumps(CLASS_JSON_OK))  # deep copy
+    if class_overrides:
+        cls_def.update(class_overrides)
+    cls_dir = tmp / "devices" / "tplug"
+    cls_dir.mkdir(parents=True)
+    (cls_dir / "class.json").write_text(json.dumps(cls_def))
+    instance = {
+        "devices": [{
+            "name": "kitchen", "class": "tplug",
+            "topic_prefix": "p/kitchen", "allowed_chats": [12],
+            "power_threshold_watts": 1500,
+            "power_threshold_duration_s": 30,
+        }],
+    }
+    if device_overrides:
+        instance["devices"][0].update(device_overrides)
+    (tmp / "devices.json").write_text(json.dumps(instance))
+    cfg = cfg_mod.load(devices_dir=tmp / "devices",
+                       instances_file=tmp / "devices.json")
+    e = engine_mod.Engine(
+        cfg=cfg,
+        allowed_chats={12},
+        mqtt=_StubMqtt(),
+        webxdc=_StubWebxdc(),
+        scheduler=_StubScheduler(),
+        client_id="bot",
+    )
+    e.set_bot(_StubBot(), accid=1)
+    return e
+
+
+class TestEngineDispatch(unittest.TestCase):
+    def test_unknown_device(self):
+        e = _build_engine_with_class()
+        ok, msg = e.dispatch_command(12, "ghost", "on")
+        self.assertFalse(ok)
+        self.assertIn("unknown", msg)
+
+    def test_permission_denied_for_chat_not_in_device_list(self):
+        e = _build_engine_with_class()
+        ok, msg = e.dispatch_command(99, "kitchen", "on")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "permission denied")
+
+    def test_unknown_action(self):
+        e = _build_engine_with_class()
+        ok, msg = e.dispatch_command(12, "kitchen", "explode")
+        self.assertFalse(ok)
+        self.assertIn("unknown action", msg)
+
+    def test_publish_on_success(self):
+        e = _build_engine_with_class()
+        ok, _ = e.dispatch_command(12, "kitchen", "on")
+        self.assertTrue(ok)
+        self.assertEqual(e.mqtt.published, [("p/kitchen/command/switch:0", "on")])
+
+    def test_template_substitution(self):
+        e = _build_engine_with_class()
+        ok, _ = e.dispatch_command(12, "kitchen", "status")
+        self.assertTrue(ok)
+        topic, payload = e.mqtt.published[0]
+        self.assertEqual(topic, "p/kitchen/rpc")
+        self.assertIn('"src":"bot"', payload)
+
+    def test_manual_off_cancels_pending_auto_off(self):
+        e = _build_engine_with_class()
+        # Pre-seed a fake auto-off job
+        from scheduler import ScheduledJob
+        e.scheduler.schedule(ScheduledJob(
+            device_name="kitchen", chat_id_origin=12, target_action="off",
+            deadline_ts=int(time.time()) + 600,
+        ))
+        e.dispatch_command(12, "kitchen", "off")
+        # cancel should have been called for action="off"
+        self.assertEqual(e.scheduler.cancel_calls,
+                         [("kitchen", "off")])
+        # cancellation chat message should have been posted
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertTrue(any("cancelled" in (t or "").lower() for t in sent),
+                        f"expected cancelled message; got {sent}")
+
+
+class TestEngineThreshold(unittest.TestCase):
+    def test_threshold_fires_after_sustained_above(self):
+        e = _build_engine_with_class()
+        device = e.cfg.devices["kitchen"]
+        # Drive power above threshold for >= duration via repeated on_message.
+        # We simulate two updates: first sets above_since, second exceeds duration.
+        cls = e.cfg.device_class(device)
+        # Seed via on_mqtt_message — pretend the plug published a status JSON.
+        topic = "p/kitchen/status/switch:0"
+        e.on_mqtt_message(topic, json.dumps({"output": True, "apower": 2000}).encode())
+        # Inject above_since back in time so the second message exceeds duration.
+        ts = e._thresholds[("kitchen", "apower")]
+        ts.above_since = int(time.time()) - 31  # > 30s threshold duration
+        e.on_mqtt_message(topic, json.dumps({"output": True, "apower": 2100}).encode())
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertTrue(any("drew" in (t or "") for t in sent),
+                        f"expected ⚠️ drew message; got {sent}")
+
+    def test_threshold_clears(self):
+        e = _build_engine_with_class()
+        topic = "p/kitchen/status/switch:0"
+        # Trip the alert
+        e.on_mqtt_message(topic, json.dumps({"apower": 2000}).encode())
+        e._thresholds[("kitchen", "apower")].above_since = int(time.time()) - 31
+        e.on_mqtt_message(topic, json.dumps({"apower": 2100}).encode())
+        self.assertTrue(e._thresholds[("kitchen", "apower")].active)
+        # Drop below
+        e.on_mqtt_message(topic, json.dumps({"apower": 5}).encode())
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertTrue(any("cleared" in (t or "") for t in sent),
+                        f"expected ✅ cleared message; got {sent}")
+        self.assertFalse(e._thresholds[("kitchen", "apower")].active)
+
+
+class TestEngineOnFire(unittest.TestCase):
+    def test_on_fire_publishes_and_posts(self):
+        e = _build_engine_with_class()
+        e.on_fire("kitchen", chat_id_origin=12,
+                  target_action="off", mode="timer", ctx={})
+        self.assertEqual(e.mqtt.published, [("p/kitchen/command/switch:0", "off")])
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertTrue(any("auto-off (timer)" in (t or "") for t in sent),
+                        f"expected timer message; got {sent}")
+
+    def test_on_fire_idle_uses_idle_template(self):
+        e = _build_engine_with_class()
+        e.on_fire("kitchen", chat_id_origin=12, target_action="off",
+                  mode="idle", ctx={"value": 1.5, "seconds": 60, "field": "apower"})
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertTrue(any("auto-off (idle" in (t or "") for t in sent),
+                        f"expected idle message; got {sent}")
+
+
+class TestEngineSnapshot(unittest.TestCase):
+    def test_snapshot_for_visible_chat(self):
+        e = _build_engine_with_class()
+        snap = e.snapshot_for(12, "tplug")
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["class"], "tplug")
+        self.assertIn("kitchen", snap["devices"])
+
+    def test_snapshot_filters_invisible_chat(self):
+        e = _build_engine_with_class()
+        # chat 99 is not in ALLOWED_CHATS and not in device.allowed_chats
+        self.assertIsNone(e.snapshot_for(99, "tplug"))
+
+
+if __name__ == "__main__":
+    unittest.main()

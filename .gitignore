@@ -1,0 +1,13 @@
+# Local secrets and per-deployment data — never commit
+.env/
+venv/
+__pycache__/
+*.pyc
+
+# Built webxdc artifacts; rebuild with ./build-xdc.sh
+devices/*/*.xdc
+
+# Editor / OS junk
+.vscode/
+.idea/
+.DS_Store

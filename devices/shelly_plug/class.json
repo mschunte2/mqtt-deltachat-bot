@@ -1,0 +1,66 @@
+{
+  "name": "shelly_plug",
+  "description": "Shelly plugs with the JSON-RPC MQTT API (Plus Plug S Gen 2, Plug M Gen 3, Plug US, etc.)",
+  "app_id": "shelly_plug",
+
+  "subscribe": [
+    {"suffix": "online",          "format": "text"},
+    {"suffix": "status/switch:0", "format": "json"},
+    {"suffix": "events/rpc",      "format": "json", "optional": true}
+  ],
+
+  "commands": {
+    "on":     {"suffix": "command/switch:0", "payload": "on"},
+    "off":    {"suffix": "command/switch:0", "payload": "off"},
+    "toggle": {"suffix": "command/switch:0", "payload": "toggle"},
+    "status": {"suffix": "rpc",
+               "payload": "{\"id\":1,\"src\":\"{client_id}\",\"method\":\"Switch.GetStatus\",\"params\":{\"id\":0}}"}
+  },
+
+  "state_fields": {
+    "online":  {"from_suffix": "online",          "extract": "bool_text"},
+    "output":  {"from_suffix": "status/switch:0", "json_path": "output"},
+    "apower":  {"from_suffix": "status/switch:0", "json_path": "apower"},
+    "aenergy": {"from_suffix": "status/switch:0", "json_path": "aenergy.total"},
+    "voltage": {"from_suffix": "status/switch:0", "json_path": "voltage"},
+    "current": {"from_suffix": "status/switch:0", "json_path": "current"},
+    "tempC":   {"from_suffix": "status/switch:0", "json_path": "temperature.tC"}
+  },
+
+  "chat_events": [
+    {"type": "on_change", "field": "output",
+     "values": {"true": "💡 {name} is now ON", "false": "💡 {name} is now OFF"}},
+    {"type": "on_change", "field": "online",
+     "values": {"true": "🟢 {name} back online", "false": "🔴 {name} went offline"}},
+    {"type": "threshold", "field": "apower",
+     "limit_param":    "power_threshold_watts",
+     "duration_param": "power_threshold_duration_s",
+     "above": "⚠️ {name} drew {value:.0f} W for {seconds}s",
+     "below": "✅ {name} load cleared"}
+  ],
+
+  "auto_off": {
+    "command": "off",
+    "default_idle_field":            "apower",
+    "default_idle_threshold":        5,
+    "default_idle_duration":         60,
+    "default_consumed_field":        "apower",
+    "default_consumed_threshold_wh": 5,
+    "default_consumed_window_s":     600,
+    "trigger_messages": {
+      "timer":            "🕐 {name} auto-off (timer)",
+      "tod":              "📅 {name} auto-off ({hh}:{mm})",
+      "idle":             "💤 {name} auto-off (idle: apower={value:.1f} W for {seconds}s)",
+      "consumed":         "🔋 {name} auto-off (used {value:.2f} Wh in last {seconds}s)",
+      "cancelled_manual": "↩️ {name} auto-off cancelled (manually toggled)"
+    }
+  },
+
+  "auto_on": {
+    "command": "on",
+    "trigger_messages": {
+      "tod":              "📅 {name} auto-on ({hh}:{mm})",
+      "cancelled_manual": "↩️ {name} auto-on cancelled (manually toggled)"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "_comment": "Device instances. Class definitions live in devices/<class>/class.json -- they are auto-discovered.",
+  "devices": [
+    {
+      "name": "kitchen",
+      "class": "shelly_plug",
+      "topic_prefix": "shellyplugmg3-XXXXXXXXXXXX",
+      "description": "Kitchen counter (Plug M Gen 3)",
+      "allowed_chats": [],
+      "power_threshold_watts": 1500,
+      "power_threshold_duration_s": 30
+    }
+  ]
+}

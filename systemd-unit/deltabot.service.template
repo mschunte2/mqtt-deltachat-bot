@@ -1,0 +1,18 @@
+[Unit]
+# Placeholders (@UPPERCASE@) are substituted by install-systemd-unit.sh
+# at install time; do not hand-edit the rendered unit under
+# /etc/systemd/system/ -- re-run the installer instead.
+Description=mqtt-bot - @DESCRIPTION@
+After=network.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@WORKING_DIR@
+ExecStart=@WORKING_DIR@/start-mqtt-bot.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

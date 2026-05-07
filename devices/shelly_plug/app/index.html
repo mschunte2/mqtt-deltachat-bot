@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shelly Plug</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <select id="device-picker" aria-label="device"></select>
+    <span id="online-dot" class="dot"></span>
+  </header>
+
+  <section class="state-card">
+    <div class="state-line">
+      <span class="state-icon">💡</span>
+      <span id="state-text">unknown</span>
+    </div>
+    <div class="metrics">
+      <span id="state-power">— W</span>
+      <span id="state-energy"></span>
+    </div>
+  </section>
+
+  <section class="buttons">
+    <button id="btn-off" class="off">OFF</button>
+    <button id="btn-on" class="on">ON</button>
+    <button id="btn-toggle" class="toggle" title="toggle">⇄</button>
+  </section>
+
+  <section class="chart">
+    <div class="chart-header">
+      <span>Power (last 5 min)</span>
+      <span id="chart-max"></span>
+    </div>
+    <svg id="sparkline" viewBox="0 0 200 60" preserveAspectRatio="none"
+         xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+  </section>
+
+  <details class="auto-off">
+    <summary>
+      <span>Auto-off</span>
+      <span id="auto-status" class="auto-status">(none)</span>
+    </summary>
+    <form id="auto-form">
+      <label class="opt"><input type="radio" name="auto" value="none" checked> none</label>
+      <label class="opt"><input type="radio" name="auto" value="timer"> in
+        <input type="number" id="auto-min" value="30" min="1" max="1440"> min</label>
+      <label class="opt"><input type="radio" name="auto" value="tod"> at
+        <input type="time" id="auto-tod" value="22:00">
+        <label class="sub"><input type="checkbox" id="auto-tod-daily"> daily</label>
+      </label>
+      <label class="opt"><input type="radio" name="auto" value="idle"> below
+        <input type="number" id="auto-idle-w" value="5" min="0" step="0.1"> W for
+        <input type="number" id="auto-idle-s" value="60" min="5"> s</label>
+      <label class="opt"><input type="radio" name="auto" value="consumed"> used &lt;
+        <input type="number" id="auto-cons-wh" value="5" min="0" step="0.1"> Wh in
+        <input type="number" id="auto-cons-min" value="10" min="1"> min</label>
+      <div class="actions">
+        <button type="button" id="btn-apply">Apply</button>
+        <button type="button" id="btn-cancel" hidden>Cancel pending</button>
+      </div>
+    </form>
+  </details>
+
+  <footer>
+    <small id="last-update">no data yet</small>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>
