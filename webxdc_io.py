@@ -165,11 +165,20 @@ class WebxdcIO:
         push as a webxdc status update. Returns count of successful pushes.
         """
         pushed = 0
+        skipped = 0
         for chat_id, apps in list(self._map.items()):
             for cls, msgid in apps.items():
                 snap = snapshot_for(chat_id, cls)
                 if snap is None:
+                    skipped += 1
                     continue
-                if self.push_to_msgid(bot, accid, msgid, snap):
+                dev_count = len(snap.get("devices", {})) if isinstance(snap, dict) else 0
+                ok = self.push_to_msgid(bot, accid, msgid, snap)
+                log.info("push chat=%d class=%s msgid=%d devices=%d ok=%s",
+                         chat_id, cls, msgid, dev_count, ok)
+                if ok:
                     pushed += 1
+        if skipped:
+            log.info("push_filtered: %d (chat,class) pairs skipped (snapshot=None)",
+                     skipped)
         return pushed
