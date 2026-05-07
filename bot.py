@@ -179,6 +179,17 @@ def _on_webxdc_update(bot, accid, event):
 def _on_new_message(bot, accid, event):
     msg = event.msg
     chatid = msg.chat_id
+
+    # Auto-post help when a new member is added to a group. Only do this
+    # in allowed chats — staying silent in unauthorised chats (otherwise
+    # the bot would dump its command surface to anyone who happened to
+    # add it to a group).
+    if getattr(msg, "is_info", False) and \
+            getattr(msg, "system_message_type", "") == "MemberAddedToGroup":
+        if _is_allowed(chatid):
+            bot.rpc.send_msg(accid, chatid, MsgData(text=engine.help_text(chatid)))
+        return
+
     text = (msg.text or "")
     parsed = _parse_text_command(text)
 
@@ -191,9 +202,9 @@ def _on_new_message(bot, accid, event):
         )
         return
 
+    # Non-slash text in an authorised chat → stay silent. Help is now only
+    # posted on explicit /help or when a new member joins.
     if parsed is None:
-        if _is_allowed(chatid):
-            bot.rpc.send_msg(accid, chatid, MsgData(text=engine.help_text(chatid)))
         return
 
     if not _is_allowed(chatid):
@@ -276,7 +287,7 @@ def _on_new_message(bot, accid, event):
         return
 
     bot.rpc.send_msg(accid, chatid,
-                     MsgData(text=f"unknown command: {verb}\n\n{engine.help_text(chatid)}"))
+                     MsgData(text=f"unknown command: {verb}. Try /help."))
 
 
 def _handle_on_clause(bot, accid, chatid: int, device_name: str, clause: str) -> None:
