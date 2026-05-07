@@ -541,6 +541,60 @@ class TestSchedulerJob(unittest.TestCase):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0].rule_id, rid_to_keep)
 
+    def test_persist_round_trip(self):
+        # Schedule a few rules → close → reopen → all restored.
+        path = Path(tempfile.mkdtemp()) / "rules.json"
+        s1 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
+        d = sched.PolicyDefaults()
+        for clause in ("for 1h", "if idle 5W 60s", "at 7h daily"):
+            policy = sched.parse_policy(clause, d)
+            s1.schedule(sched.ScheduledJob.from_policy(
+                policy, "kitchen", 12, "off", int(time.time()),
+            ))
+        self.assertTrue(path.exists())
+
+        # Fresh scheduler with same path — should pick up the rules.
+        s2 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
+        loaded = s2.load_persisted()
+        self.assertEqual(loaded, 3)
+        self.assertEqual(len(s2.jobs_for_device("kitchen")), 3)
+        # Recurring TOD survives.
+        rules = s2.jobs_for_device("kitchen")
+        self.assertTrue(any(j.recurring_tod for j in rules))
+
+    def test_persist_drops_expired_oneshots(self):
+        path = Path(tempfile.mkdtemp()) / "rules.json"
+        s1 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
+        # Manually schedule a one-shot timer with a deadline in the past.
+        old = sched.ScheduledJob(
+            device_name="k", chat_id_origin=1, target_action="off",
+            rule_id="timer:60",
+            deadline_ts=int(time.time()) - 7200,  # 2h ago
+            _time_mode="timer",
+        )
+        s1.schedule(old)
+        s2 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
+        loaded = s2.load_persisted()
+        self.assertEqual(loaded, 0)  # expired one-shot dropped
+        self.assertEqual(len(s2.jobs_for_device("k")), 0)
+
+    def test_persist_rearms_expired_recurring_tod(self):
+        path = Path(tempfile.mkdtemp()) / "rules.json"
+        s1 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
+        old = sched.ScheduledJob(
+            device_name="k", chat_id_origin=1, target_action="on",
+            rule_id="tod:0700d",
+            deadline_ts=int(time.time()) - 3600,  # passed
+            time_of_day=(7, 0), recurring_tod=True, _time_mode="tod",
+        )
+        s1.schedule(old)
+        s2 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
+        s2.load_persisted()
+        rules = s2.jobs_for_device("k")
+        self.assertEqual(len(rules), 1)
+        # Re-armed to the future.
+        self.assertGreater(rules[0].deadline_ts, int(time.time()))
+
     def test_derive_rule_id_distinguishes_different_policies(self):
         d = sched.PolicyDefaults()
         a = sched.parse_policy("for 30m", d)

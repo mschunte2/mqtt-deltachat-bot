@@ -99,7 +99,10 @@ import atexit  # noqa: E402
 import signal  # noqa: E402
 atexit.register(_on_shutdown)
 signal.signal(signal.SIGTERM, _on_shutdown)
-scheduler = sched_mod.Scheduler(on_fire=lambda *a, **kw: engine.on_fire(*a, **kw))
+scheduler = sched_mod.Scheduler(
+    on_fire=lambda *a, **kw: engine.on_fire(*a, **kw),
+    persist_path=STATE_DIR / "rules.json",
+)
 mqtt = MqttClient(
     host=os.environ.get("MQTT_HOST", "127.0.0.1"),
     port=int(os.environ.get("MQTT_PORT", "1883")),
@@ -536,6 +539,11 @@ def _on_start(bot, _args):
         return
     accid = accounts[0]
     engine.set_bot(bot, accid)
+    # Restore any rules that were pending across the bot restart. Done
+    # AFTER set_bot so any in-memory housekeeping has the bot ref it
+    # needs, BEFORE scheduler.start() so the timer thread sees the
+    # restored state on its first iteration.
+    scheduler.load_persisted()
     mqtt.start()
     scheduler.start()
     bot.logger.info(

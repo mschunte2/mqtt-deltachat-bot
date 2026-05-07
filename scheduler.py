@@ -1,5 +1,15 @@
 """Action scheduler — fires a target_action on a device when any policy trips.
 
+Pending rules are persisted to a JSON file (`rules.json` under the bot's
+config dir) so a `systemctl restart` doesn't silently drop them. On
+load:
+  - one-shot rules whose deadline elapsed during downtime are dropped
+    (firing them retroactively would surprise the user),
+  - recurring time-of-day rules re-arm to their next occurrence.
+Transient state (idle's _below_since, consumed's _samples,
+consumed_started_at) is reset on load — at worst an idle/consumed rule
+takes one extra cycle to fire after restart.
+
 Four trigger policies, any subset of which may be active on a single job
 (OR semantics — whichever fires first wins):
 
@@ -21,13 +31,16 @@ In-memory only; bot restart drops pending jobs by design.
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
 import threading
 import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import durations
@@ -150,6 +163,49 @@ class ScheduledJob:
 
     def has_consumed(self) -> bool:
         return self.consumed_field is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Persistence shape — every non-transient field. Reverse of
+        from_dict. Transient state (_below_since, _samples,
+        _consumed_started_at) is intentionally omitted; rules re-acquire
+        idle/consumed state organically after load."""
+        return {
+            "device_name": self.device_name,
+            "chat_id_origin": self.chat_id_origin,
+            "target_action": self.target_action,
+            "rule_id": self.rule_id,
+            "deadline_ts": self.deadline_ts,
+            "time_of_day": list(self.time_of_day) if self.time_of_day else None,
+            "recurring_tod": self.recurring_tod,
+            "_time_mode": self._time_mode,
+            "idle_field": self.idle_field,
+            "idle_threshold": self.idle_threshold,
+            "idle_duration_s": self.idle_duration_s,
+            "consumed_field": self.consumed_field,
+            "consumed_threshold_wh": self.consumed_threshold_wh,
+            "consumed_window_s": self.consumed_window_s,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ScheduledJob":
+        tod = d.get("time_of_day")
+        return cls(
+            device_name=str(d["device_name"]),
+            chat_id_origin=int(d["chat_id_origin"]),
+            target_action=str(d["target_action"]),
+            rule_id=str(d.get("rule_id") or "default"),
+            deadline_ts=d.get("deadline_ts"),
+            time_of_day=(int(tod[0]), int(tod[1])) if tod else None,
+            recurring_tod=bool(d.get("recurring_tod", False)),
+            _time_mode=d.get("_time_mode"),
+            idle_field=d.get("idle_field"),
+            idle_threshold=d.get("idle_threshold"),
+            idle_duration_s=d.get("idle_duration_s"),
+            consumed_field=d.get("consumed_field"),
+            consumed_threshold_wh=d.get("consumed_threshold_wh"),
+            consumed_window_s=d.get("consumed_window_s"),
+            _consumed_started_at=int(time.time()) if d.get("consumed_field") else 0,
+        )
 
     def to_snapshot(self) -> dict[str, Any]:
         """JSON-safe snapshot for the webxdc app (countdowns, indicators)."""
@@ -376,7 +432,8 @@ FireCallback = Callable[[str, int, str, str, dict[str, Any]], None]
 
 
 class Scheduler:
-    def __init__(self, on_fire: FireCallback) -> None:
+    def __init__(self, on_fire: FireCallback,
+                 persist_path: Path | str | None = None) -> None:
         self._on_fire = on_fire
         # Keyed by (device, target_action, rule_id) so multiple rules with
         # the same target action can coexist and fire independently.
@@ -384,6 +441,7 @@ class Scheduler:
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
+        self._persist_path = Path(persist_path) if persist_path else None
 
     # --- lifecycle --------------------------------------------------------
 
@@ -400,6 +458,7 @@ class Scheduler:
         with self._lock:
             self._jobs[(job.device_name, job.target_action, job.rule_id)] = job
         self._wake.set()
+        self._persist()
 
     def cancel(self, device_name: str,
                target_action: str | None = None,
@@ -417,6 +476,7 @@ class Scheduler:
                 cancelled.append(self._jobs.pop(key))
         if cancelled:
             self._wake.set()
+            self._persist()
         return cancelled
 
     def get(self, device_name: str, target_action: str,
@@ -480,6 +540,8 @@ class Scheduler:
                                            "field": job.consumed_field}))
         for j, mode, ctx in fires:
             self._safe_fire(j, mode, ctx)
+        if fires:
+            self._persist()
 
     # --- timer thread -----------------------------------------------------
 
@@ -517,6 +579,8 @@ class Scheduler:
                         next_deadline = j.deadline_ts
             for j, mode, ctx in fires:
                 self._safe_fire(j, mode, ctx)
+            if fires:
+                self._persist()
             if next_deadline is None:
                 self._wake.wait()
             else:
@@ -524,6 +588,61 @@ class Scheduler:
             self._wake.clear()
 
     # --- internals --------------------------------------------------------
+
+    # --- persistence ------------------------------------------------------
+
+    def load_persisted(self) -> int:
+        """Read rules.json into _jobs. Drop expired one-shots; re-arm
+        recurring TODs whose deadline elapsed during downtime. Idempotent
+        — safe to call before .start(). Returns count of rules loaded.
+        """
+        if self._persist_path is None or not self._persist_path.exists():
+            return 0
+        try:
+            data = json.loads(self._persist_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            log.exception("failed to read %s; skipping load", self._persist_path)
+            return 0
+        now = int(time.time())
+        loaded = 0
+        with self._lock:
+            for d in data.get("jobs", []):
+                try:
+                    job = ScheduledJob.from_dict(d)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                # Re-arm recurring TODs whose deadline passed during downtime.
+                if job.deadline_ts and job.deadline_ts < now:
+                    if job.recurring_tod and job.time_of_day:
+                        h, m = job.time_of_day
+                        job.deadline_ts = next_tod_deadline(h, m, now)
+                    else:
+                        # One-shot timer/tod expired during downtime — skip.
+                        continue
+                self._jobs[(job.device_name, job.target_action, job.rule_id)] = job
+                loaded += 1
+        log.info("loaded %d persisted rules from %s",
+                 loaded, self._persist_path)
+        # If we re-armed any recurring TODs the on-disk state diverged
+        # from in-memory — sync.
+        self._persist()
+        return loaded
+
+    def _persist(self) -> None:
+        """Write _jobs to disk atomically. No-op if no persist_path was
+        configured. Caller MUST NOT hold self._lock — we acquire it."""
+        if self._persist_path is None:
+            return
+        with self._lock:
+            data = {"jobs": [j.to_dict() for j in self._jobs.values()]}
+        try:
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._persist_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            os.replace(tmp, self._persist_path)
+        except Exception:
+            log.exception("persist scheduler state to %s failed",
+                          self._persist_path)
 
     def _safe_fire(self, job: ScheduledJob, mode: str, ctx: dict[str, Any]) -> None:
         try:
