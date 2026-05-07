@@ -18,6 +18,15 @@ import os
 import sys
 from pathlib import Path
 
+# Wire our package loggers (mqtt_bot.*) to stderr — deltabot-cli only
+# attaches a handler to its own logger, so without basicConfig our
+# engine/scheduler/mqtt_client log calls would be silently dropped.
+_LOG_LEVEL = (os.environ.get("LOG_LEVEL") or "info").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+)
+
 import config as config_mod
 
 # --- Lightweight startup (no deltachat2 / paho dependency) ---------------
