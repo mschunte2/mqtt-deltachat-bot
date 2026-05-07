@@ -657,18 +657,24 @@ class _StubWebxdc:
 
 
 class _StubScheduler:
+    """Mirror the real Scheduler's keying: (device, target_action, rule_id)
+    so parallel rules with distinct rule_ids coexist in the stub the same
+    way they do in production."""
     def __init__(self):
-        self._jobs: dict[tuple[str, str], object] = {}
+        self._jobs: dict[tuple[str, str, str], object] = {}
         self.cancel_calls: list[tuple[str, str | None]] = []
     def schedule(self, job):
-        self._jobs[(job.device_name, job.target_action)] = job
-    def cancel(self, device_name, target_action=None):
+        rid = getattr(job, "rule_id", None) or "default"
+        self._jobs[(job.device_name, job.target_action, rid)] = job
+    def cancel(self, device_name, target_action=None, rule_id=None):
         self.cancel_calls.append((device_name, target_action))
         out = []
         for k in list(self._jobs.keys()):
             if k[0] != device_name:
                 continue
             if target_action is not None and k[1] != target_action:
+                continue
+            if rule_id is not None and k[2] != rule_id:
                 continue
             out.append(self._jobs.pop(k))
         return out
