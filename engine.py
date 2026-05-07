@@ -127,8 +127,8 @@ class Engine:
             return
         key = self._coerce_value_key(new)
         template = rule.values.get(key)
-        log.info("on_change %s.%s prev=%r new=%r key=%s template=%s",
-                 device.name, rule.field, prev, new, key, bool(template))
+        log.debug("on_change %s.%s prev=%r new=%r key=%s template=%s",
+                  device.name, rule.field, prev, new, key, bool(template))
         if not template:
             return
         ctx = {"name": device.name, "value": new, "field": rule.field}

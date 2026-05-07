@@ -176,27 +176,7 @@ function appendSample(name, ts, power) {
   if (h.length > SAMPLES_MAX_COUNT) h.splice(0, h.length - SAMPLES_MAX_COUNT);
 }
 
-let _dbgCount = 0;
-function _setDbgStatus(s) {
-  const el = $('dbg-status'); if (el) el.textContent = s;
-}
-_setDbgStatus('script loaded');
-if (typeof window.webxdc === 'undefined') {
-  _setDbgStatus('ERROR: window.webxdc undefined');
-} else if (typeof window.webxdc.setUpdateListener !== 'function') {
-  _setDbgStatus('ERROR: setUpdateListener not a function');
-} else {
-  _setDbgStatus('listener about to register…');
-}
 window.webxdc.setUpdateListener((update) => {
-  _dbgCount++;
-  _setDbgStatus('listener fired ' + _dbgCount + 'x');
-  const dbgCount = $('dbg-count'); if (dbgCount) dbgCount.textContent = _dbgCount;
-  const dbgPre = $('dbg-pre');
-  if (dbgPre) {
-    try { dbgPre.textContent = JSON.stringify(update, null, 2).slice(0, 2000); }
-    catch (e) { dbgPre.textContent = 'JSON.stringify failed: ' + e; }
-  }
   const p = update.payload;
   if (!p || !p.devices) return;
   state.devices = p.devices;
