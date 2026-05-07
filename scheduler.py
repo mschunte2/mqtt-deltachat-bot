@@ -81,7 +81,13 @@ class ScheduledJob:
     chat_id_origin: int
     target_action: str
 
-    # time-based (mutually exclusive: either timer or tod)
+    # Stable identifier within (device, target_action). Derived from the
+    # job's policy contents so re-adding an identical rule replaces in
+    # place; differing rules get distinct ids and run in parallel.
+    rule_id: str = ""
+
+    # time-based (mutually exclusive within ONE rule: either timer or tod;
+    # multiple rules can each have their own time-based policy)
     deadline_ts: int | None = None
     time_of_day: tuple[int, int] | None = None
     recurring_tod: bool = False
@@ -122,6 +128,7 @@ class ScheduledJob:
             device_name=device_name,
             chat_id_origin=chat_id_origin,
             target_action=target_action,
+            rule_id=derive_rule_id(policy),
             deadline_ts=deadline_ts,
             time_of_day=policy.time_of_day,
             recurring_tod=policy.recurring_tod,
@@ -147,6 +154,7 @@ class ScheduledJob:
     def to_snapshot(self) -> dict[str, Any]:
         """JSON-safe snapshot for the webxdc app (countdowns, indicators)."""
         return {
+            "rule_id": self.rule_id,
             "target_action": self.target_action,
             "deadline_ts": self.deadline_ts,
             "time_of_day": list(self.time_of_day) if self.time_of_day else None,
@@ -157,6 +165,28 @@ class ScheduledJob:
                           "threshold_wh": self.consumed_threshold_wh,
                           "window_s": self.consumed_window_s} if self.has_consumed() else None),
         }
+
+
+def derive_rule_id(policy: ScheduledPolicy) -> str:
+    """Stable, human-readable id derived from the policy's contents.
+
+    Same policy contents → same rule_id → schedule() replaces in place.
+    Different contents → different rule_id → both rules coexist and fire
+    independently. Hand-readable so the app can log/show it.
+    """
+    parts: list[str] = []
+    if policy.timer_seconds is not None:
+        parts.append(f"timer:{policy.timer_seconds}")
+    if policy.time_of_day is not None:
+        h, m = policy.time_of_day
+        suffix = "d" if policy.recurring_tod else ""
+        parts.append(f"tod:{h:02d}{m:02d}{suffix}")
+    if policy.idle_field is not None:
+        parts.append(f"idle:{policy.idle_threshold:g}W:{policy.idle_duration_s}s")
+    if policy.consumed_field is not None:
+        parts.append(f"consumed:{policy.consumed_threshold_wh:g}Wh:"
+                     f"{policy.consumed_window_s}s")
+    return ",".join(parts) or "empty"
 
 
 # --- Helpers --------------------------------------------------------------
@@ -339,7 +369,9 @@ FireCallback = Callable[[str, int, str, str, dict[str, Any]], None]
 class Scheduler:
     def __init__(self, on_fire: FireCallback) -> None:
         self._on_fire = on_fire
-        self._jobs: dict[tuple[str, str], ScheduledJob] = {}
+        # Keyed by (device, target_action, rule_id) so multiple rules with
+        # the same target action can coexist and fire independently.
+        self._jobs: dict[tuple[str, str, str], ScheduledJob] = {}
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -353,26 +385,35 @@ class Scheduler:
     # --- public API -------------------------------------------------------
 
     def schedule(self, job: ScheduledJob) -> None:
+        if not job.rule_id:
+            # Backward-compat: a job without a rule_id is a single rule.
+            job.rule_id = "default"
         with self._lock:
-            self._jobs[(job.device_name, job.target_action)] = job
+            self._jobs[(job.device_name, job.target_action, job.rule_id)] = job
         self._wake.set()
 
-    def cancel(self, device_name: str, target_action: str | None = None) -> list[ScheduledJob]:
+    def cancel(self, device_name: str,
+               target_action: str | None = None,
+               rule_id: str | None = None) -> list[ScheduledJob]:
         cancelled: list[ScheduledJob] = []
         with self._lock:
             for key in list(self._jobs.keys()):
-                if key[0] != device_name:
+                d, a, rid = key
+                if d != device_name:
                     continue
-                if target_action is not None and key[1] != target_action:
+                if target_action is not None and a != target_action:
+                    continue
+                if rule_id is not None and rid != rule_id:
                     continue
                 cancelled.append(self._jobs.pop(key))
         if cancelled:
             self._wake.set()
         return cancelled
 
-    def get(self, device_name: str, target_action: str) -> ScheduledJob | None:
+    def get(self, device_name: str, target_action: str,
+            rule_id: str = "default") -> ScheduledJob | None:
         with self._lock:
-            return self._jobs.get((device_name, target_action))
+            return self._jobs.get((device_name, target_action, rule_id))
 
     def jobs_for_device(self, device_name: str) -> list[ScheduledJob]:
         with self._lock:
@@ -388,7 +429,8 @@ class Scheduler:
         fires: list[tuple[ScheduledJob, str, dict[str, Any]]] = []
         with self._lock:
             for key in list(self._jobs.keys()):
-                if key[0] != device_name:
+                d, _action, _rid = key
+                if d != device_name:
                     continue
                 job = self._jobs[key]
                 fired = False

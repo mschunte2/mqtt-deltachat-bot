@@ -253,13 +253,16 @@ class Engine:
         return True, self._format_schedule_ack(device_name, target_action, job)
 
     def cancel_schedule(self, chat_id: int, device_name: str,
-                        target_action: str | None = None) -> tuple[bool, str]:
+                        target_action: str | None = None,
+                        rule_id: str | None = None) -> tuple[bool, str]:
         device = self.cfg.devices.get(device_name)
         if device is None:
             return False, f"unknown device: {device_name}"
         if not permissions.chat_can_see(chat_id, device, self.allowed_chats):
             return False, "permission denied"
-        cancelled = self.scheduler.cancel(device_name, target_action=target_action)
+        cancelled = self.scheduler.cancel(
+            device_name, target_action=target_action, rule_id=rule_id
+        )
         if not cancelled:
             return True, f"no pending schedule for {device_name}"
         return True, f"cancelled {len(cancelled)} schedule(s) for {device_name}"
@@ -320,6 +323,26 @@ class Engine:
             log.error("scheduler fired for unknown action %s on %s",
                       target_action, device_name)
             return
+
+        # Sibling-rule suppression: if the device's cached output already
+        # matches the rule's target state, this fire is redundant. A
+        # different rule already moved the plug into the target state and
+        # publishing again would just generate a noise chat message + a
+        # redundant MQTT command. We only do this for boolean target
+        # actions (on/off) where we can compare; toggle has no fixed target.
+        target_output = (
+            True if target_action == "on"
+            else False if target_action == "off"
+            else None
+        )
+        if target_output is not None:
+            cur = self._states.get(device_name, state_mod.DeviceState()).fields.get("output")
+            if cur is target_output:
+                log.info("scheduler fire %s/%s mode=%s suppressed "
+                         "(output already %s)",
+                         device_name, target_action, mode, cur)
+                return
+
         topic = f"{device.topic_prefix}/{cmd.suffix}"
         payload = templating.render(cmd.payload, {"client_id": self.client_id})
         self.mqtt.publish(topic, payload)
@@ -439,7 +462,13 @@ class Engine:
                 target = cls.auto_off.command
             elif cls and action == "cancel-auto-on" and cls.auto_on:
                 target = cls.auto_on.command
-            ok, msg = self.cancel_schedule(chat_id, device_name, target_action=target)
+            # The app may include a rule_id to delete one specific rule
+            # (rather than every rule of that direction).
+            rid = request.get("rule_id")
+            rule_id = str(rid) if isinstance(rid, str) and rid else None
+            ok, msg = self.cancel_schedule(
+                chat_id, device_name, target_action=target, rule_id=rule_id
+            )
             if msg and self.bot:
                 self.bot.rpc.send_msg(self.accid, chat_id, MsgData(text=msg))
             return

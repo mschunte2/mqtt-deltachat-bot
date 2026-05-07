@@ -23,13 +23,14 @@ const chartMax = $('chart-max');
 const chartFoot = $('chart-foot');
 const windowPick = $('window-pick');
 const lastUpdate = $('last-update');
-const autoStatus = $('auto-status');
-const btnApply = $('btn-apply');
-const btnCancel = $('btn-cancel');
 const eventsList = $('events-list');
 const tuneWatts = $('tune-watts');
 const tuneSecs = $('tune-secs');
 const tuneApply = $('tune-apply');
+const offCount = $('off-count');
+const onCount = $('on-count');
+const offRulesList = $('off-rules-list');
+const onRulesList = $('on-rules-list');
 
 function activeDevice() { return state.devices[state.active] || null; }
 
@@ -43,43 +44,45 @@ function send(req) {
 $('btn-on').addEventListener('click', () => send({ action: 'on' }));
 $('btn-off').addEventListener('click', () => send({ action: 'off' }));
 $('btn-toggle').addEventListener('click', () => send({ action: 'toggle' }));
-btnCancel.addEventListener('click', () => send({ action: 'cancel-auto-off' }));
 
-btnApply.addEventListener('click', () => {
-  const mode = document.querySelector('input[name="auto"]:checked').value;
-  if (mode === 'none') {
-    send({ action: 'cancel-auto-off' });
-    return;
-  }
-  const auto_off = {};
+// "Add rule" buttons: one per direction.
+function readRuleForm(direction) {
+  // direction is 'off' or 'on'. Returns the auto_off / auto_on payload.
+  const root = document.querySelector(`.rule-form[data-action="${direction}"]`);
+  if (!root) return null;
+  const mode = root.querySelector(`input[name="${direction}-mode"]:checked`).value;
+  const policy = {};
   if (mode === 'timer') {
-    const mins = parseInt($('auto-min').value, 10) || 0;
-    auto_off.timer_seconds = mins * 60;
+    const mins = parseInt(root.querySelector(`.${direction}-timer-min`).value, 10) || 0;
+    policy.timer_seconds = mins * 60;
   } else if (mode === 'tod') {
-    const v = $('auto-tod').value || '22:00';
+    const v = root.querySelector(`.${direction}-tod`).value || '22:00';
     const [h, m] = v.split(':').map(n => parseInt(n, 10));
-    auto_off.time_of_day = [h, m];
-    auto_off.recurring_tod = $('auto-tod-daily').checked;
+    policy.time_of_day = [h, m];
+    policy.recurring_tod = root.querySelector(`.${direction}-tod-daily`).checked;
   } else if (mode === 'idle') {
-    auto_off.idle = {
-      threshold: parseFloat($('auto-idle-w').value),
-      duration_s: parseInt($('auto-idle-s').value, 10),
+    policy.idle = {
+      threshold: parseFloat(root.querySelector(`.${direction}-idle-w`).value),
+      duration_s: parseInt(root.querySelector(`.${direction}-idle-s`).value, 10),
     };
   } else if (mode === 'consumed') {
-    auto_off.consumed = {
-      threshold_wh: parseFloat($('auto-cons-wh').value),
-      window_s: parseInt($('auto-cons-min').value, 10) * 60,
+    policy.consumed = {
+      threshold_wh: parseFloat(root.querySelector(`.${direction}-cons-wh`).value),
+      window_s: parseInt(root.querySelector(`.${direction}-cons-min`).value, 10) * 60,
     };
   }
-  // If the device is currently OFF, "Apply" turns it on AND schedules.
-  // If already on or unknown, just schedule the auto-off (no toggle).
-  const dev = activeDevice();
-  const isOff = dev && dev.fields && dev.fields.output === false;
-  if (isOff) {
-    send({ action: 'on', auto_off });
-  } else {
-    send({ action: 'auto-off', auto_off });
-  }
+  return policy;
+}
+
+document.querySelectorAll('.add-rule-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const direction = btn.dataset.action;
+    const policy = readRuleForm(direction);
+    if (!policy) return;
+    const verb = direction === 'off' ? 'auto-off' : 'auto-on';
+    const key  = direction === 'off' ? 'auto_off' : 'auto_on';
+    send({ action: verb, [key]: policy });
+  });
 });
 
 picker.addEventListener('change', () => {
@@ -193,7 +196,7 @@ function render() {
     lastUpdate.textContent = `last update: ${d.toLocaleTimeString()}`;
   }
   renderSparkline();
-  renderAutoStatus(dev);
+  renderRulesList(dev);
   renderEnergySummary(dev);
   renderTuningInputs(dev);
 }
@@ -359,24 +362,75 @@ function renderSparkline() {
   chartFoot.textContent = footText;
 }
 
-function renderAutoStatus(dev) {
-  const jobs = (dev.scheduled_jobs || []).filter(j => j.target_action === 'off');
-  if (!jobs.length) {
-    autoStatus.textContent = '(none)';
-    btnCancel.hidden = true;
-    return;
-  }
-  const j = jobs[0];
+function describeRule(j) {
+  // Build a human description from a scheduled_jobs row.
   const parts = [];
   if (j.deadline_ts) {
     const remaining = Math.max(0, j.deadline_ts - Math.floor(Date.now() / 1000));
-    parts.push(`in ${fmtSecs(remaining)}`);
+    if (j.time_of_day) {
+      const [h, m] = j.time_of_day;
+      const suffix = j.recurring_tod ? ' daily' : '';
+      const hh = String(h).padStart(2, '0');
+      const mm = String(m).padStart(2, '0');
+      parts.push(`at ${hh}:${mm}${suffix} (in ${fmtSecs(remaining)})`);
+    } else {
+      parts.push(`in ${fmtSecs(remaining)}`);
+    }
   }
-  if (j.idle) parts.push(`idle<${j.idle.threshold}W`);
-  if (j.consumed) parts.push(`<${j.consumed.threshold_wh}Wh/${Math.round(j.consumed.window_s / 60)}m`);
-  autoStatus.textContent = `(${parts.join(' or ')})`;
-  btnCancel.hidden = false;
+  if (j.idle) {
+    parts.push(`when ${j.idle.field || 'apower'} < ${j.idle.threshold}W `
+             + `for ${fmtSecs(j.idle.duration_s)}`);
+  }
+  if (j.consumed) {
+    parts.push(`when used < ${j.consumed.threshold_wh}Wh in `
+             + `${fmtSecs(j.consumed.window_s)}`);
+  }
+  return parts.join(' or ') || '(empty)';
 }
+
+function renderRulesList(dev) {
+  const jobs = dev.scheduled_jobs || [];
+  const offJobs = jobs.filter(j => j.target_action === 'off');
+  const onJobs  = jobs.filter(j => j.target_action === 'on');
+  if (offCount) offCount.textContent = `(${offJobs.length})`;
+  if (onCount)  onCount.textContent  = `(${onJobs.length})`;
+
+  const renderInto = (ul, list, action) => {
+    if (!ul) return;
+    if (!list.length) {
+      ul.innerHTML = '<li class="empty"><span class="rule-text" '
+        + 'style="color:#8e8e93">no rules</span></li>';
+      return;
+    }
+    ul.innerHTML = list.map(j => {
+      const desc = describeRule(j);
+      const rid  = j.rule_id || '';
+      return `<li><span class="rule-text">${esc(desc)}</span>`
+           + `<span class="rule-id">${esc(rid)}</span>`
+           + `<button class="delete-btn" data-action="${action}" `
+           + `data-rule-id="${esc(rid)}">×</button></li>`;
+    }).join('');
+  };
+  renderInto(offRulesList, offJobs, 'off');
+  renderInto(onRulesList,  onJobs,  'on');
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// Click delegation for the per-rule delete buttons (since the lists
+// are re-rendered on every snapshot, individual listeners would leak).
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.delete-btn');
+  if (!btn) return;
+  const direction = btn.dataset.action;
+  const rid = btn.dataset.ruleId;
+  if (!rid) return;
+  const cancel_action = direction === 'off' ? 'cancel-auto-off' : 'cancel-auto-on';
+  send({ action: cancel_action, rule_id: rid });
+});
 
 function fmtSecs(s) {
   if (s < 60) return `${s}s`;
@@ -435,5 +489,5 @@ window.webxdc.setUpdateListener((update) => {
 // keep countdowns live
 setInterval(() => {
   const dev = activeDevice();
-  if (dev) renderAutoStatus(dev);
+  if (dev) renderRulesList(dev);
 }, 1000);

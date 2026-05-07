@@ -454,6 +454,63 @@ class TestSchedulerJob(unittest.TestCase):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0].target_action, "on")
 
+    def test_multiple_rules_per_device_action(self):
+        # Schedule three different auto-off rules; they should all coexist.
+        s = sched.Scheduler(on_fire=lambda *a: None)
+        d = sched.PolicyDefaults(idle_field="apower", idle_threshold=5,
+                                  idle_duration_s=60,
+                                  consumed_field="apower",
+                                  consumed_threshold_wh=5,
+                                  consumed_window_s=600)
+        now = int(time.time())
+        for clause in ("for 30m", "if idle 10W 60s", "if idle 5Wh in 5m"):
+            policy = sched.parse_policy(clause, d)
+            s.schedule(sched.ScheduledJob.from_policy(
+                policy, "kitchen", chat_id_origin=12,
+                target_action="off", now=now,
+            ))
+        jobs = s.jobs_for_device("kitchen")
+        self.assertEqual(len(jobs), 3)
+        # All distinct rule_ids
+        rids = {j.rule_id for j in jobs}
+        self.assertEqual(len(rids), 3)
+
+    def test_re_adding_identical_rule_replaces(self):
+        s = sched.Scheduler(on_fire=lambda *a: None)
+        d = sched.PolicyDefaults()
+        now = int(time.time())
+        for _ in range(3):
+            p = sched.parse_policy("for 30m", d)
+            s.schedule(sched.ScheduledJob.from_policy(
+                p, "kitchen", 12, "off", now,
+            ))
+        # Same content → same rule_id → only one job
+        self.assertEqual(len(s.jobs_for_device("kitchen")), 1)
+
+    def test_cancel_by_rule_id(self):
+        s = sched.Scheduler(on_fire=lambda *a: None)
+        d = sched.PolicyDefaults()
+        now = int(time.time())
+        p1 = sched.parse_policy("for 30m", d)
+        p2 = sched.parse_policy("at 18h", d)
+        s.schedule(sched.ScheduledJob.from_policy(p1, "k", 12, "off", now))
+        s.schedule(sched.ScheduledJob.from_policy(p2, "k", 12, "off", now))
+        rid_to_keep = s.jobs_for_device("k")[0].rule_id
+        rid_to_drop = s.jobs_for_device("k")[1].rule_id
+        cancelled = s.cancel("k", target_action="off", rule_id=rid_to_drop)
+        self.assertEqual(len(cancelled), 1)
+        remaining = s.jobs_for_device("k")
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].rule_id, rid_to_keep)
+
+    def test_derive_rule_id_distinguishes_different_policies(self):
+        d = sched.PolicyDefaults()
+        a = sched.parse_policy("for 30m", d)
+        b = sched.parse_policy("for 60m", d)
+        c = sched.parse_policy("for 30m", d)  # same as a
+        self.assertNotEqual(sched.derive_rule_id(a), sched.derive_rule_id(b))
+        self.assertEqual(sched.derive_rule_id(a), sched.derive_rule_id(c))
+
     def test_idle_fires_when_below_for_long_enough(self):
         fires = []
         s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
@@ -741,6 +798,26 @@ class TestEngineOnFire(unittest.TestCase):
         sent = [t for _, t in e.bot.rpc.sent]
         self.assertTrue(any("auto-off (idle" in (t or "") for t in sent),
                         f"expected idle message; got {sent}")
+
+    def test_on_fire_suppresses_when_already_in_target_state(self):
+        # Sibling rules: once one rule has switched the plug off, further
+        # off-rules firing should be no-ops — no MQTT publish, no chat msg.
+        e = _build_engine_with_class()
+        # Mark device as already off.
+        e._states["kitchen"].set("output", False)
+        e.on_fire("kitchen", chat_id_origin=12, target_action="off",
+                  mode="idle", ctx={"value": 0.1, "seconds": 60, "field": "apower"})
+        self.assertEqual(e.mqtt.published, [])
+        self.assertEqual(e.bot.rpc.sent, [])
+
+    def test_on_fire_publishes_when_not_in_target_state(self):
+        # Counterpart to the suppression test: when output != target,
+        # the fire goes through.
+        e = _build_engine_with_class()
+        e._states["kitchen"].set("output", True)  # currently on
+        e.on_fire("kitchen", chat_id_origin=12, target_action="off",
+                  mode="timer", ctx={})
+        self.assertEqual(len(e.mqtt.published), 1)
 
     def test_on_fire_threads_action_verb_into_template(self):
         # Build a class with a template that uses {action_verb} + {threshold}

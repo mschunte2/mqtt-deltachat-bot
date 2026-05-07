@@ -91,29 +91,41 @@
     </form>
   </details>
 
-  <details class="auto-off">
+  <details class="rules auto-off-rules">
     <summary>
-      <span>Auto-off</span>
-      <span id="auto-status" class="auto-status">(none)</span>
+      <span>Auto-off rules</span>
+      <span id="off-count" class="rule-count">(0)</span>
     </summary>
-    <form id="auto-form">
-      <label class="opt"><input type="radio" name="auto" value="none" checked> none</label>
-      <label class="opt"><input type="radio" name="auto" value="timer"> in
-        <input type="number" id="auto-min" value="30" min="1" max="1440"> min</label>
-      <label class="opt"><input type="radio" name="auto" value="tod"> at
-        <input type="time" id="auto-tod" value="22:00">
-        <label class="sub"><input type="checkbox" id="auto-tod-daily"> daily</label>
-      </label>
-      <label class="opt"><input type="radio" name="auto" value="idle"> below
-        <input type="number" id="auto-idle-w" value="5" min="0" step="0.1"> W for
-        <input type="number" id="auto-idle-s" value="60" min="5"> s</label>
-      <label class="opt"><input type="radio" name="auto" value="consumed"> used &lt;
-        <input type="number" id="auto-cons-wh" value="5" min="0" step="0.1"> Wh in
-        <input type="number" id="auto-cons-min" value="10" min="1"> min</label>
-      <div class="actions">
-        <button type="button" id="btn-apply">Apply</button>
-        <button type="button" id="btn-cancel" hidden>Cancel pending</button>
-      </div>
+    <ul id="off-rules-list" class="rules-list"></ul>
+    <form class="rule-form" data-action="off">
+      <label class="opt"><input type="radio" name="off-mode" value="timer" checked>
+        after <input type="number" class="off-timer-min" value="30" min="1" max="1440"> min</label>
+      <label class="opt"><input type="radio" name="off-mode" value="tod">
+        at <input type="time" class="off-tod" value="22:00">
+        <label class="sub"><input type="checkbox" class="off-tod-daily"> daily</label></label>
+      <label class="opt"><input type="radio" name="off-mode" value="idle">
+        when below <input type="number" class="off-idle-w" value="5" min="0" step="0.1"> W
+        for <input type="number" class="off-idle-s" value="60" min="5"> s</label>
+      <label class="opt"><input type="radio" name="off-mode" value="consumed">
+        when used &lt; <input type="number" class="off-cons-wh" value="5" min="0" step="0.1"> Wh
+        in <input type="number" class="off-cons-min" value="10" min="1"> min</label>
+      <button type="button" class="add-rule-btn" data-action="off">Add auto-off rule</button>
+    </form>
+  </details>
+
+  <details class="rules auto-on-rules">
+    <summary>
+      <span>Auto-on rules</span>
+      <span id="on-count" class="rule-count">(0)</span>
+    </summary>
+    <ul id="on-rules-list" class="rules-list"></ul>
+    <form class="rule-form" data-action="on">
+      <label class="opt"><input type="radio" name="on-mode" value="timer" checked>
+        after <input type="number" class="on-timer-min" value="30" min="1" max="1440"> min</label>
+      <label class="opt"><input type="radio" name="on-mode" value="tod">
+        at <input type="time" class="on-tod" value="07:00">
+        <label class="sub"><input type="checkbox" class="on-tod-daily"> daily</label></label>
+      <button type="button" class="add-rule-btn" data-action="on">Add auto-on rule</button>
     </form>
   </details>
 
