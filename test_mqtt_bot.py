@@ -732,25 +732,41 @@ class TestHistory(unittest.TestCase):
 
     def test_write_sample_buffers_until_minute_rolls(self):
         # All samples in the same minute → not yet flushed
-        self.h.write_sample("kaffeete", 1000, 5.0, None)
-        self.h.write_sample("kaffeete", 1010, 15.0, None)
-        # No row yet — still in buffer
+        self.h.write_sample("kaffeete", 1000, 5.0, None, output=True)
+        self.h.write_sample("kaffeete", 1010, 15.0, None, output=True)
         bucket, pts = self.h.query_power("kaffeete", 0, 2000)
         self.assertEqual(pts, [])
         # Cross minute boundary → previous minute flushes
-        self.h.write_sample("kaffeete", 1080, 100.0, None)
+        self.h.write_sample("kaffeete", 1080, 100.0, None, output=True)
         bucket, pts = self.h.query_power("kaffeete", 0, 2000)
         self.assertEqual(len(pts), 1)
         self.assertEqual(pts[0][0], 960)  # 1000 // 60 * 60
-        self.assertAlmostEqual(pts[0][1], 10.0)  # avg of 5 + 15
+        self.assertAlmostEqual(pts[0][1], 10.0)
+        self.assertEqual(pts[0][2], 1)  # output=on
+
+    def test_output_off_persisted(self):
+        self.h.write_sample("k", 100, 0.0, None, output=False)
+        self.h.write_sample("k", 110, 0.1, None, output=False)
+        self.h.flush_pending_minutes(now=200)
+        _, pts = self.h.query_power("k", 0, 200)
+        self.assertEqual(len(pts), 1)
+        self.assertEqual(pts[0][2], 0)  # output=off
+
+    def test_output_unknown_when_never_reported(self):
+        self.h.write_sample("k", 100, 5.0, None)  # no output kwarg
+        self.h.flush_pending_minutes(now=200)
+        _, pts = self.h.query_power("k", 0, 200)
+        self.assertEqual(len(pts), 1)
+        self.assertIsNone(pts[0][2])  # output unknown
 
     def test_flush_pending_minutes(self):
-        self.h.write_sample("k", 100, 7.0, None)
-        self.h.write_sample("k", 110, 13.0, None)
+        self.h.write_sample("k", 100, 7.0, None, output=True)
+        self.h.write_sample("k", 110, 13.0, None, output=True)
         self.h.flush_pending_minutes(now=200)
         bucket, pts = self.h.query_power("k", 0, 200)
         self.assertEqual(len(pts), 1)
         self.assertAlmostEqual(pts[0][1], 10.0)
+        self.assertEqual(pts[0][2], 1)
 
     def test_energy_snapshot_replaces_within_hour(self):
         self.h.write_sample("k", 100, None, 50.0)

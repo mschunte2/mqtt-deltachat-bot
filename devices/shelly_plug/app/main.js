@@ -149,7 +149,7 @@ function renderSparkline() {
   let footText = '';
   if (state.historyWindow === 0) {
     const hist = (state.history[state.active] || []).slice();
-    pts = hist.map(s => [s.ts, s.power]);
+    pts = hist.map(s => [s.ts, s.power, s.out]);
     footText = pts.length ? `${pts.length} samples (live)` : '(live, waiting…)';
   } else {
     const sh = state.serverHistory[state.active];
@@ -177,13 +177,35 @@ function renderSparkline() {
   const tSpan = Math.max(1, tMax - tMin);
   const pMax = Math.max(1, ...pts.map(p => p[1]));
   const W = 200, H = 60;
-  const linePts = pts.map(([t, w]) => {
-    const x = ((t - tMin) / tSpan) * W;
-    const y = H - (w / pMax) * (H - 6) - 3;
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(' ');
-  sparkline.innerHTML =
-    `<polyline fill="none" stroke="#34c759" stroke-width="1.5" points="${linePts}"/>`;
+  const yOff = H - 2;  // baseline 0-line (for off segments)
+  // Build two paths: green (on / unknown) tracing apower; red flat baseline
+  // for off segments. Each segment connects pts[i] → pts[i+1] coloured by
+  // pts[i].output.
+  const onSegs = [];
+  const offSegs = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [t1, w1, o1] = pts[i];
+    const [t2, w2] = pts[i + 1];
+    const x1 = ((t1 - tMin) / tSpan) * W;
+    const x2 = ((t2 - tMin) / tSpan) * W;
+    if (o1 === 0) {
+      offSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
+    } else {
+      const y1 = H - (w1 / pMax) * (H - 6) - 3;
+      const y2 = H - (w2 / pMax) * (H - 6) - 3;
+      onSegs.push(`M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)}`);
+    }
+  }
+  let svg = '';
+  if (offSegs.length) {
+    svg += `<path fill="none" stroke="#ff3b30" stroke-width="2"
+                  stroke-linecap="round" d="${offSegs.join(' ')}"/>`;
+  }
+  if (onSegs.length) {
+    svg += `<path fill="none" stroke="#34c759" stroke-width="1.5"
+                  stroke-linecap="round" d="${onSegs.join(' ')}"/>`;
+  }
+  sparkline.innerHTML = svg;
   chartMax.textContent = `max ${pMax.toFixed(0)} W`;
   chartFoot.textContent = footText;
 }
@@ -215,11 +237,13 @@ function fmtSecs(s) {
   return m ? `${h}h${m}m` : `${h}h`;
 }
 
-function appendSample(name, ts, power) {
+function appendSample(name, ts, power, output) {
   if (typeof power !== 'number') return;
   const h = (state.history[name] = state.history[name] || []);
   if (h.length && h[h.length - 1].ts === ts) return;  // dedup same-second pushes
-  h.push({ ts, power });
+  // output: true → 1, false → 0, anything else → null (unknown)
+  const out = output === true ? 1 : output === false ? 0 : null;
+  h.push({ ts, power, out });
   const cutoff = ts - SAMPLES_MAX_AGE;
   while (h.length && h[0].ts < cutoff) h.shift();
   if (h.length > SAMPLES_MAX_COUNT) h.splice(0, h.length - SAMPLES_MAX_COUNT);
@@ -241,7 +265,7 @@ window.webxdc.setUpdateListener((update) => {
   const ts = p.server_ts || Math.floor(Date.now() / 1000);
   for (const [name, dev] of Object.entries(p.devices)) {
     if (dev.fields && typeof dev.fields.apower === 'number') {
-      appendSample(name, ts, dev.fields.apower);
+      appendSample(name, ts, dev.fields.apower, dev.fields.output);
     }
   }
   render();

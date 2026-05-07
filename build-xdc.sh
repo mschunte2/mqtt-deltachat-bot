@@ -35,7 +35,7 @@ build_one() {
     stage=$(mktemp -d)
     trap 'rm -rf "$stage"' RETURN
 
-    cp "$app_src/"*.{html,js,css,toml} "$stage/" 2>/dev/null || true
+    cp "$app_src/"*.{html,js,css,toml,svg,png} "$stage/" 2>/dev/null || true
     if [[ -d "$app_src/public" ]]; then
         cp -r "$app_src/public/." "$stage/"
     fi

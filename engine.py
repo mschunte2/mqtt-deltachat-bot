@@ -126,6 +126,7 @@ class Engine:
                     cache.last_update_ts,
                     cache.fields.get("apower"),
                     cache.fields.get("aenergy"),
+                    cache.fields.get("output"),
                 )
             if suffix == "events/rpc":
                 payload_text = (payload.decode("utf-8", errors="replace")

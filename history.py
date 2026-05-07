@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS power_minute (
   ts           INTEGER NOT NULL,
   avg_apower_w REAL    NOT NULL,
   sample_count INTEGER NOT NULL,
+  output       INTEGER,           -- 0/1 if known, NULL if device never reported it
   PRIMARY KEY (device, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_power_minute_ts ON power_minute (ts);
@@ -66,8 +67,9 @@ class History:
         self.db_path = db_path
         self.retention_days = max(0, int(retention_days))
         self._lock = threading.Lock()
-        # Per-device current-minute accumulator: {device: (minute_start_ts, [apower, ...])}
-        self._minute: dict[str, tuple[int, list[float]]] = {}
+        # Per-device current-minute accumulator:
+        # {device: (minute_start_ts, [apower, ...], latest_output_or_None)}
+        self._minute: dict[str, tuple[int, list[float], int | None]] = {}
         self._hour_seen: dict[str, int] = {}     # last hour-start written per device
         self._last_prune_ts = 0
 
@@ -76,6 +78,11 @@ class History:
         self._db.execute("PRAGMA journal_mode=WAL")
         with self._lock:
             self._db.executescript(_SCHEMA)
+            # Idempotent migration: add `output` column to existing dbs that
+            # were created before we tracked it.
+            cols = {row[1] for row in self._db.execute("PRAGMA table_info(power_minute)")}
+            if "output" not in cols:
+                self._db.execute("ALTER TABLE power_minute ADD COLUMN output INTEGER")
             self._db.commit()
         log.info("history db at %s (retention_days=%s)",
                  db_path, "forever" if self.retention_days == 0 else self.retention_days)
@@ -84,10 +91,17 @@ class History:
 
     def write_sample(self, device: str, ts: int,
                      apower: float | None,
-                     aenergy_wh: float | None) -> None:
-        """Called on every MQTT status update where apower or aenergy changed."""
+                     aenergy_wh: float | None,
+                     output: bool | None = None) -> None:
+        """Called on every MQTT status update where apower or aenergy changed.
+
+        `output` is the relay state at the time of the sample. When the
+        minute boundary rolls over, the LATEST output value seen during
+        that minute is what gets persisted alongside the avg apower.
+        """
         if apower is not None and isinstance(apower, (int, float)):
-            self._buffer_apower(device, ts, float(apower))
+            out_int = (1 if output is True else 0 if output is False else None)
+            self._buffer_apower(device, ts, float(apower), out_int)
         if aenergy_wh is not None and isinstance(aenergy_wh, (int, float)):
             self._snapshot_aenergy(device, ts, float(aenergy_wh))
         self._maybe_prune(ts)
@@ -120,22 +134,24 @@ class History:
     # --- reads -----------------------------------------------------------
 
     def query_power(self, device: str, since_ts: int, until_ts: int,
-                    max_points: int = 200) -> tuple[int, list[tuple[int, float]]]:
-        """Return (bucket_seconds, [(ts, avg_w), ...]) for the window.
+                    max_points: int = 200,
+                    ) -> tuple[int, list[tuple[int, float, int | None]]]:
+        """Return (bucket_seconds, [(ts, avg_w, output), ...]) for the window.
 
-        For windows ≤ 24h: read minute granularity, downsample if needed.
-        For windows > 24h: aggregate from minute table by hour-or-larger
-        buckets to avoid sending tens of thousands of points.
+        `output` for a bucket is MAX(output) over its underlying minute
+        rows: 1 if the device was on for any minute, 0 if every minute was
+        off, NULL if no minutes had a known output. (Treating "any-on as
+        on" keeps brief usage visible in coarse buckets.)
         """
         if until_ts <= since_ts:
             return (60, [])
         window = until_ts - since_ts
-        # Pick a bucket size such that points ≤ max_points and bucket ≥ 60s.
         bucket = max(60, _round_bucket(window // max(1, max_points)))
         with self._lock:
             cur = self._db.execute(
                 "SELECT (ts/?)*?, "
-                "       SUM(avg_apower_w * sample_count) / SUM(sample_count) "
+                "       SUM(avg_apower_w * sample_count) / SUM(sample_count), "
+                "       MAX(output) "
                 "FROM power_minute "
                 "WHERE device=? AND ts >= ? AND ts < ? "
                 "GROUP BY ts/? "
@@ -143,7 +159,10 @@ class History:
                 (bucket, bucket, device, int(since_ts), int(until_ts), bucket),
             )
             rows = cur.fetchall()
-        return (bucket, [(int(t), float(w)) for t, w in rows if w is not None])
+        return (bucket, [
+            (int(t), float(w), int(o) if o is not None else None)
+            for t, w, o in rows if w is not None
+        ])
 
     def query_energy(self, device: str, since_ts: int, until_ts: int
                      ) -> list[tuple[int, float]]:
@@ -177,44 +196,49 @@ class History:
 
     # --- internals -------------------------------------------------------
 
-    def _buffer_apower(self, device: str, ts: int, apower: float) -> None:
+    def _buffer_apower(self, device: str, ts: int, apower: float,
+                       output: int | None) -> None:
         ts = int(ts)
         minute_start = ts - (ts % 60)
         with self._lock:
             cur = self._minute.get(device)
             if cur is None:
-                self._minute[device] = (minute_start, [apower])
+                self._minute[device] = (minute_start, [apower], output)
                 return
-            prev_start, samples = cur
+            prev_start, samples, prev_output = cur
             if minute_start > prev_start:
                 # Flush previous minute, start new
                 if samples:
                     avg = sum(samples) / len(samples)
                     self._db.execute(
                         "INSERT OR REPLACE INTO power_minute "
-                        "(device, ts, avg_apower_w, sample_count) "
-                        "VALUES (?, ?, ?, ?)",
-                        (device, prev_start, avg, len(samples)),
+                        "(device, ts, avg_apower_w, sample_count, output) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (device, prev_start, avg, len(samples), prev_output),
                     )
                     self._db.commit()
-                self._minute[device] = (minute_start, [apower])
+                self._minute[device] = (minute_start, [apower], output)
             else:
                 samples.append(apower)
+                # Latest known output wins; preserve previous if this sample
+                # didn't include the field.
+                final_output = output if output is not None else prev_output
+                self._minute[device] = (prev_start, samples, final_output)
 
     def _flush_minute(self, device: str, now: int) -> None:
         with self._lock:
             cur = self._minute.pop(device, None)
             if cur is None:
                 return
-            minute_start, samples = cur
+            minute_start, samples, output = cur
             if not samples:
                 return
             avg = sum(samples) / len(samples)
             self._db.execute(
                 "INSERT OR REPLACE INTO power_minute "
-                "(device, ts, avg_apower_w, sample_count) "
-                "VALUES (?, ?, ?, ?)",
-                (device, minute_start, avg, len(samples)),
+                "(device, ts, avg_apower_w, sample_count, output) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (device, minute_start, avg, len(samples), output),
             )
             self._db.commit()
 
