@@ -177,8 +177,20 @@ function appendSample(name, ts, power) {
 }
 
 let _dbgCount = 0;
+function _setDbgStatus(s) {
+  const el = $('dbg-status'); if (el) el.textContent = s;
+}
+_setDbgStatus('script loaded');
+if (typeof window.webxdc === 'undefined') {
+  _setDbgStatus('ERROR: window.webxdc undefined');
+} else if (typeof window.webxdc.setUpdateListener !== 'function') {
+  _setDbgStatus('ERROR: setUpdateListener not a function');
+} else {
+  _setDbgStatus('listener about to register…');
+}
 window.webxdc.setUpdateListener((update) => {
   _dbgCount++;
+  _setDbgStatus('listener fired ' + _dbgCount + 'x');
   const dbgCount = $('dbg-count'); if (dbgCount) dbgCount.textContent = _dbgCount;
   const dbgPre = $('dbg-pre');
   if (dbgPre) {
