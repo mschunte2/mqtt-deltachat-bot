@@ -347,6 +347,12 @@ def _handle_apps(bot, accid: int, chatid: int) -> None:
         or (not d.allowed_chats and chatid in ALLOWED_CHATS)
     }
     sent, retracted = webxdc.send_apps(bot, accid, chatid, visible_classes)
+    # Seed the freshly-installed instances with the current cache so the
+    # twisty populates immediately. Without this push, the app stays
+    # blank until the next inbound MQTT message — and Shelly's status
+    # JSON is non-retained, so a quiet plug means a blank UI for minutes.
+    if sent:
+        webxdc.push_filtered(bot, accid, engine.snapshot_for)
     fragments: list[str] = []
     if sent:
         fragments.append(f"Sent: {', '.join(sent)}")
