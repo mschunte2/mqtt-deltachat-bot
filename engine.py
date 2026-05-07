@@ -499,9 +499,16 @@ class Engine:
                 self.bot.rpc.send_msg(self.accid, chat_id, MsgData(text=msg))
             return
 
+        # Pure scheduling actions: action="auto-off" / "auto-on" with the
+        # policy in a sibling key. Don't try to dispatch these as class
+        # commands — they're not in cls.commands.
+        if action in ("auto-off", "auto-on"):
+            self._schedule_from_request(chat_id, device_name, action, request)
+            return
+
         # Direct action with optional inline policy from the app.
-        # The app may include {"auto_off": {...}} or {"auto_on": {...}} alongside the
-        # action — the bot handles both as a follow-up schedule call.
+        # The app may include {"auto_off": {...}} or {"auto_on": {...}} alongside
+        # the action — the bot handles both as a follow-up schedule call.
         ok, msg = self.dispatch_command(chat_id, device_name, action)
         if not ok and msg and self.bot:
             self.bot.rpc.send_msg(self.accid, chat_id, MsgData(text=msg))
@@ -524,6 +531,37 @@ class Engine:
                                           MsgData(text=f"bad {key}: {ex}"))
                 continue
             self.schedule(chat_id, device_name, section.command, policy)
+
+    def _schedule_from_request(self, chat_id: int, device_name: str,
+                                action: str, request: dict[str, Any]) -> None:
+        """action ∈ {auto-off, auto-on}: pull the policy from the matching
+        sibling key in the request body and schedule it. No dispatch."""
+        direction = "off" if action == "auto-off" else "on"
+        key = "auto_off" if action == "auto-off" else "auto_on"
+        extra = request.get(key)
+        if not isinstance(extra, dict):
+            if self.bot:
+                self.bot.rpc.send_msg(self.accid, chat_id,
+                                      MsgData(text=f"missing {key} body"))
+            return
+        device = self.cfg.devices.get(device_name)
+        if device is None:
+            return
+        cls = self.cfg.device_class(device)
+        section = cls.auto_off if direction == "off" else cls.auto_on
+        if section is None:
+            if self.bot:
+                self.bot.rpc.send_msg(self.accid, chat_id,
+                                      MsgData(text=f"{action} not supported"))
+            return
+        try:
+            policy = self._policy_from_request(extra, section)
+        except ValueError as ex:
+            if self.bot:
+                self.bot.rpc.send_msg(self.accid, chat_id,
+                                      MsgData(text=f"bad {key}: {ex}"))
+            return
+        self.schedule(chat_id, device_name, section.command, policy)
 
     def _handle_history_request(self, chat_id: int, msgid: int,
                                  device_name: str, request: dict[str, Any]) -> None:

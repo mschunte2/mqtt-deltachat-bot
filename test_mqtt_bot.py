@@ -849,6 +849,40 @@ class TestEngineOnFire(unittest.TestCase):
         sent = [t for _, t in e.bot.rpc.sent]
         self.assertTrue(any("auto-off" in (t or "").lower() for t in sent))
 
+    def test_handle_webxdc_auto_off_does_not_dispatch(self):
+        # The "Add auto-off rule" button sends action="auto-off" with the
+        # policy in a sibling key. Earlier engine routed this through
+        # dispatch_command which errored "unknown action: auto-off"
+        # because auto-off isn't a class command. The fix special-cases
+        # auto-off / auto-on before dispatch.
+        e = _build_engine_with_class()
+        # Pretend the chat already has a registered webxdc instance.
+        class _W:
+            def class_for_msgid(self, *_a):
+                return "tplug"
+            def push_filtered(self, *a, **k):
+                pass
+            def push_to_msgid(self, *a, **k):
+                return True
+        e.webxdc = _W()
+        e.handle_webxdc_request(
+            chat_id=12, msgid=99,
+            request={
+                "device": "kitchen", "action": "auto-off",
+                "auto_off": {"timer_seconds": 1800},
+            },
+        )
+        # No error message should have been posted (the old bug surfaced
+        # "unknown action: auto-off" here).
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertFalse(any("unknown action" in (t or "") for t in sent),
+                         f"got error message; sent={sent}")
+        # And the rule should be in the scheduler.
+        jobs = e.scheduler.jobs_for_device("kitchen")
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].target_action, "off")
+        self.assertEqual(jobs[0].deadline_ts is not None, True)
+
     def test_on_fire_threads_action_verb_into_template(self):
         # Build a class with a template that uses {action_verb} + {threshold}
         # + {duration_human} so we can prove the enriched ctx flows.
