@@ -132,6 +132,19 @@ class Engine:
                     cache.fields.get("aenergy"),
                     cache.fields.get("output"),
                 )
+            # Lossless raw capture + by_minute extraction for status updates.
+            if suffix == "status/switch:0":
+                try:
+                    payload_obj = json.loads(
+                        payload.decode("utf-8", errors="replace")
+                        if isinstance(payload, bytes) else str(payload)
+                    )
+                    if isinstance(payload_obj, dict):
+                        self.history.record_status(
+                            device_name, cache.last_update_ts, payload_obj,
+                        )
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
             if suffix == "events/rpc":
                 payload_text = (payload.decode("utf-8", errors="replace")
                                 if isinstance(payload, bytes) else str(payload))

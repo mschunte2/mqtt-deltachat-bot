@@ -1079,6 +1079,74 @@ class TestHistory(unittest.TestCase):
         # Asking after the last snapshot returns None
         self.assertIsNone(self.h.aenergy_at("k", 10000))
 
+    def test_record_status_writes_samples_raw(self):
+        payload = {
+            "id": 0, "output": True,
+            "apower": 42.0, "voltage": 230.5, "current": 0.18,
+            "freq": 49.95, "temperature": {"tC": 28.5},
+            "aenergy": {"total": 100.5, "by_minute": [0.0, 3500.0, 3200.0],
+                        "minute_ts": 1700000060},
+        }
+        self.h.record_status("k", 1700000050, payload)
+        rows = self.h.query_samples_raw("k", 0, 2_000_000_000)
+        self.assertEqual(len(rows), 1)
+        ts, ap, v, c, fz, ae, out, tc = rows[0]
+        self.assertEqual(ap, 42.0)
+        self.assertEqual(v, 230.5)
+        self.assertEqual(c, 0.18)
+        self.assertEqual(fz, 49.95)
+        self.assertEqual(ae, 100.5)
+        self.assertEqual(out, 1)
+        self.assertEqual(tc, 28.5)
+
+    def test_record_status_extracts_energy_minute(self):
+        # by_minute[1] should land at minute_ts-60, by_minute[2] at -120.
+        # by_minute[0] (the in-progress 0) should be skipped.
+        payload = {
+            "aenergy": {"total": 100.0,
+                        "by_minute": [0.0, 3500.0, 3200.0],
+                        "minute_ts": 1700000060},
+        }
+        self.h.record_status("k", 1700000050, payload)
+        rows = self.h.query_energy_minute("k", 0, 2_000_000_000)
+        self.assertEqual(len(rows), 2)
+        # Sorted ascending. First = oldest = 1700000060 - 120
+        self.assertEqual(rows[0][0], 1699999940)
+        self.assertAlmostEqual(rows[0][1], 3200.0)
+        self.assertEqual(rows[1][0], 1700000000)
+        self.assertAlmostEqual(rows[1][1], 3500.0)
+
+    def test_record_status_idempotent(self):
+        # Re-reporting the same minute is a no-op (INSERT OR REPLACE
+        # against the same primary key).
+        payload = {"aenergy": {"total": 100.0,
+                               "by_minute": [0.0, 3500.0, 3200.0],
+                               "minute_ts": 1700000060}}
+        for _ in range(3):
+            self.h.record_status("k", 1700000050 + 1, payload)
+        rows = self.h.query_energy_minute("k", 0, 2_000_000_000)
+        self.assertEqual(len(rows), 2)  # not 6
+
+    def test_energy_consumed_in_prefers_authoritative(self):
+        # When energy_minute has data, it wins over power_minute integration.
+        # Insert minute_ts=1700000060 → by_minute[1]=10000mWh covers
+        # minute starting 1700000000.
+        payload = {"aenergy": {"by_minute": [0.0, 10000.0, 0.0],
+                                "minute_ts": 1700000060}}
+        self.h.record_status("k", 1700000050, payload)
+        # Also insert a competing power_minute row that would yield a
+        # different number — to prove we read from energy_minute, not
+        # power_minute.
+        with self.h._lock:
+            self.h._db.execute(
+                "INSERT INTO power_minute (device, ts, avg_apower_w, sample_count) "
+                "VALUES ('k', 1700000000, 1.0, 1)"
+            )
+            self.h._db.commit()
+        wh, _earliest = self.h.energy_consumed_in("k", 1699999990, 1700000060)
+        # Authoritative: 10000 mWh = 10 Wh
+        self.assertAlmostEqual(wh, 10.0)
+
     def test_query_power_raw(self):
         self.h.write_sample("k", 60,  10.0, None, output=True)
         self.h.write_sample("k", 70,  20.0, None, output=True)  # same minute

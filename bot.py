@@ -395,8 +395,10 @@ def _handle_export(bot, accid: int, chatid: int, device_name: str, rest: str) ->
     since_ts = until_ts - window_seconds
     power_rows = history.query_power_raw(device_name, since_ts, until_ts)
     energy_rows = history.query_energy(device_name, since_ts, until_ts)
+    energy_minute_rows = history.query_energy_minute(device_name, since_ts, until_ts)
+    samples_rows = history.query_samples_raw(device_name, since_ts, until_ts)
 
-    if not power_rows and not energy_rows:
+    if not (power_rows or energy_rows or energy_minute_rows or samples_rows):
         bot.rpc.send_msg(accid, chatid,
                          MsgData(text=f"no history yet for {device_name} ({window_str})"))
         return
@@ -405,28 +407,51 @@ def _handle_export(bot, accid: int, chatid: int, device_name: str, rest: str) ->
     try:
         with os.fdopen(fd, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["unix_ts", "iso_time", "device", "kind",
-                        "avg_apower_w", "output", "sample_count", "aenergy_wh"])
+            w.writerow([
+                "unix_ts", "iso_time", "device", "kind",
+                # power_minute / energy_hour / energy_minute fields:
+                "avg_apower_w", "output", "sample_count",
+                "aenergy_wh", "energy_mwh",
+                # samples_raw fields:
+                "apower_w", "voltage_v", "current_a", "freq_hz",
+                "aenergy_total_wh", "temperature_c",
+            ])
             for ts, apower, output, count in power_rows:
-                w.writerow([
-                    ts, _dt.datetime.fromtimestamp(ts).isoformat(),
-                    device_name, "power_minute",
-                    f"{apower:.3f}",
-                    "" if output is None else output,
-                    count, "",
-                ])
+                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
+                            device_name, "power_minute",
+                            f"{apower:.3f}",
+                            "" if output is None else output,
+                            count, "", "", "", "", "", "", "", ""])
             for ts, aenergy in energy_rows:
-                w.writerow([
-                    ts, _dt.datetime.fromtimestamp(ts).isoformat(),
-                    device_name, "energy_hour",
-                    "", "", "", f"{aenergy:.3f}",
-                ])
+                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
+                            device_name, "energy_hour",
+                            "", "", "", f"{aenergy:.3f}", "",
+                            "", "", "", "", "", ""])
+            for ts, mwh in energy_minute_rows:
+                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
+                            device_name, "energy_minute",
+                            "", "", "", "", f"{mwh:.3f}",
+                            "", "", "", "", "", ""])
+            for row in samples_rows:
+                ts, ap, v, c, f_hz, ae, out, tc = row
+                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
+                            device_name, "samples_raw",
+                            "", "", "", "", "",
+                            "" if ap is None else f"{ap:.3f}",
+                            "" if v is None else f"{v:.2f}",
+                            "" if c is None else f"{c:.4f}",
+                            "" if f_hz is None else f"{f_hz:.2f}",
+                            "" if ae is None else f"{ae:.3f}",
+                            "" if out is None else out,
+                            "" if tc is None else f"{tc:.1f}"])
         bot.rpc.send_msg(
             accid, chatid,
             MsgData(file=path,
                     text=f"{device_name} export · {window_str} · "
-                         f"{len(power_rows)} minute samples · "
-                         f"{len(energy_rows)} hourly snapshots"),
+                         f"{len(samples_rows)} status updates · "
+                         f"{len(power_rows)} per-min · "
+                         f"{len(energy_minute_rows)} energy-min · "
+                         f"{len(energy_rows)} energy-hr"),
         )
     finally:
         try:

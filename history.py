@@ -32,16 +32,48 @@ from pathlib import Path
 log = logging.getLogger("mqtt_bot.history")
 
 _SCHEMA = """
+-- Every status/switch:0 message, captured verbatim. The richest source —
+-- everything else can be re-derived from this.
+CREATE TABLE IF NOT EXISTS samples_raw (
+  device           TEXT    NOT NULL,
+  ts               INTEGER NOT NULL,
+  apower_w         REAL,
+  voltage_v        REAL,
+  current_a        REAL,
+  freq_hz          REAL,
+  aenergy_total_wh REAL,
+  output           INTEGER,
+  temperature_c    REAL,
+  payload_json     TEXT,
+  PRIMARY KEY (device, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_samples_raw_ts ON samples_raw (ts);
+
+-- Authoritative per-minute energy in mWh, lifted from Shelly's
+-- aenergy.by_minute[] (indices 1 and 2 — fully-completed minutes).
+-- Idempotent: re-reporting the same minute is a no-op.
+CREATE TABLE IF NOT EXISTS energy_minute (
+  device     TEXT    NOT NULL,
+  ts         INTEGER NOT NULL,    -- minute boundary in unix seconds
+  energy_mwh REAL    NOT NULL,
+  PRIMARY KEY (device, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_energy_minute_ts ON energy_minute (ts);
+
+-- Per-minute apower average (computed from raw samples). Kept for the
+-- live sparkline and chart queries; could be regenerated from samples_raw.
 CREATE TABLE IF NOT EXISTS power_minute (
   device       TEXT    NOT NULL,
   ts           INTEGER NOT NULL,
   avg_apower_w REAL    NOT NULL,
   sample_count INTEGER NOT NULL,
-  output       INTEGER,           -- 0/1 if known, NULL if device never reported it
+  output       INTEGER,
   PRIMARY KEY (device, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_power_minute_ts ON power_minute (ts);
 
+-- Cumulative aenergy.total snapshot per hour — kept for backwards compat
+-- with existing queries and for cross-checking with energy_minute.
 CREATE TABLE IF NOT EXISTS energy_hour (
   device     TEXT    NOT NULL,
   ts         INTEGER NOT NULL,
@@ -112,6 +144,63 @@ class History:
         if aenergy_wh is not None and isinstance(aenergy_wh, (int, float)):
             self._snapshot_aenergy(device, ts, float(aenergy_wh))
         self._maybe_prune(ts)
+
+    def record_status(self, device: str, ts: int, payload: dict[str, Any]) -> None:
+        """Capture a status/switch:0 message verbatim (samples_raw) AND
+        extract Shelly's authoritative per-minute energy (energy_minute).
+
+        Called from engine.on_mqtt_message in addition to write_sample —
+        write_sample handles the per-minute apower aggregation, this
+        handles the lossless raw record + by_minute extraction.
+        """
+        if self._closed or not isinstance(payload, dict):
+            return
+        ts = int(ts)
+        aenergy = payload.get("aenergy") if isinstance(payload.get("aenergy"), dict) else {}
+        temperature = payload.get("temperature") if isinstance(payload.get("temperature"), dict) else {}
+        try:
+            payload_json = json.dumps(payload, separators=(",", ":"))
+        except (TypeError, ValueError):
+            payload_json = None
+
+        with self._lock:
+            self._db.execute(
+                "INSERT OR REPLACE INTO samples_raw "
+                "(device, ts, apower_w, voltage_v, current_a, freq_hz, "
+                " aenergy_total_wh, output, temperature_c, payload_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    device, ts,
+                    _coerce_float(payload.get("apower")),
+                    _coerce_float(payload.get("voltage")),
+                    _coerce_float(payload.get("current")),
+                    _coerce_float(payload.get("freq")),
+                    _coerce_float(aenergy.get("total")),
+                    _coerce_bool_int(payload.get("output")),
+                    _coerce_float(temperature.get("tC")),
+                    payload_json,
+                ),
+            )
+            # Authoritative per-minute energy from aenergy.by_minute[1..2].
+            # by_minute[0] is the in-progress minute (always 0); skip it.
+            # by_minute[1] = previous full minute (minute_ts - 60),
+            # by_minute[2] = two minutes ago      (minute_ts - 120).
+            # minute_ts is minute-aligned per Shelly's spec.
+            by_minute = aenergy.get("by_minute")
+            minute_ts = aenergy.get("minute_ts")
+            if (isinstance(by_minute, list) and len(by_minute) >= 3
+                    and isinstance(minute_ts, (int, float))):
+                base = int(minute_ts)
+                for offset, idx in ((-60, 1), (-120, 2)):
+                    val = _coerce_float(by_minute[idx])
+                    if val is None:
+                        continue
+                    self._db.execute(
+                        "INSERT OR REPLACE INTO energy_minute "
+                        "(device, ts, energy_mwh) VALUES (?, ?, ?)",
+                        (device, base + offset, val),
+                    )
+            self._db.commit()
 
     def write_event(self, device: str, ts: int, suffix: str, payload_text: str) -> None:
         if self._closed:
@@ -219,22 +308,29 @@ class History:
 
     def energy_consumed_in(self, device: str, since_ts: int, until_ts: int
                            ) -> tuple[float, int | None]:
-        """Wh consumed in the window, integrated from minute samples.
+        """Wh consumed in the window. Prefers Shelly's authoritative
+        energy_minute table; falls back to apower integration over
+        power_minute when the window has no by_minute coverage.
 
-        Returns (wh, earliest_sample_ts):
-          - wh is sum(avg_apower_w * 1 minute) over rows in [since_ts, until_ts)
-            divided by 60 (one row = one minute).
-          - earliest_sample_ts tells the caller whether the window is
-            fully-covered. None means we have NO samples in the window;
-            otherwise it's the ts of the earliest minute we saw — useful
-            for marking a value as 'partial' if it's much later than
-            since_ts.
-
-        This avoids the imprecision of aenergy_at, which buckets to hour
-        boundaries and can over- or under-count by up to a full hour.
+        Returns (wh, earliest_ts) — earliest_ts is the start of the
+        oldest sample we actually have inside the window (None if the
+        window is empty).
         """
         if until_ts <= since_ts:
             return (0.0, None)
+        with self._lock:
+            authoritative = self._db.execute(
+                "SELECT SUM(energy_mwh) / 1000.0, MIN(ts) "
+                "FROM energy_minute "
+                "WHERE device=? AND ts >= ? AND ts < ?",
+                (device, int(since_ts), int(until_ts)),
+            ).fetchone()
+        if authoritative and authoritative[0] is not None:
+            return (float(authoritative[0]),
+                    int(authoritative[1]) if authoritative[1] is not None else None)
+        # No by_minute coverage in this window (e.g. plug runs an old
+        # firmware that doesn't report it, or we deployed before any
+        # status arrived). Fall back to per-minute apower integration.
         with self._lock:
             row = self._db.execute(
                 "SELECT SUM(avg_apower_w) / 60.0, MIN(ts) "
@@ -245,6 +341,30 @@ class History:
         wh = float(row[0]) if row and row[0] is not None else 0.0
         earliest = int(row[1]) if row and row[1] is not None else None
         return (wh, earliest)
+
+    def query_energy_minute(self, device: str, since_ts: int, until_ts: int
+                             ) -> list[tuple[int, float]]:
+        """Per-minute Wh-equivalent (returned as mWh from Shelly's by_minute)."""
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT ts, energy_mwh FROM energy_minute "
+                "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
+                (device, int(since_ts), int(until_ts)),
+            )
+            return [(int(t), float(e)) for t, e in cur.fetchall()]
+
+    def query_samples_raw(self, device: str, since_ts: int, until_ts: int
+                           ) -> list[tuple]:
+        """Lossless dump of every status update in the window."""
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT ts, apower_w, voltage_v, current_a, freq_hz, "
+                "       aenergy_total_wh, output, temperature_c "
+                "FROM samples_raw "
+                "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
+                (device, int(since_ts), int(until_ts)),
+            )
+            return cur.fetchall()
 
     def query_events(self, device: str, since_ts: int, until_ts: int,
                      limit: int = 500) -> list[tuple[int, str, str, str]]:
@@ -330,21 +450,18 @@ class History:
         if now - self._last_prune_ts < 86400:
             return
         cutoff = now - self.retention_days * 86400
+        counts = {}
         with self._lock:
-            n1 = self._db.execute(
-                "DELETE FROM power_minute WHERE ts < ?", (cutoff,)
-            ).rowcount
-            n2 = self._db.execute(
-                "DELETE FROM energy_hour WHERE ts < ?", (cutoff,)
-            ).rowcount
-            n3 = self._db.execute(
-                "DELETE FROM events WHERE ts < ?", (cutoff,)
-            ).rowcount
+            for table in ("samples_raw", "power_minute", "energy_minute",
+                          "energy_hour", "events"):
+                counts[table] = self._db.execute(
+                    f"DELETE FROM {table} WHERE ts < ?", (cutoff,)
+                ).rowcount
             self._db.commit()
         self._last_prune_ts = now
-        if n1 or n2 or n3:
-            log.info("history prune: %d power_minute, %d energy_hour, %d events",
-                     n1, n2, n3)
+        if any(counts.values()):
+            log.info("history prune: %s",
+                     ", ".join(f"{n} {t}" for t, n in counts.items() if n))
 
     def close(self) -> None:
         # Idempotent: SIGTERM handler runs close(), then sys.exit fires atexit
@@ -358,6 +475,20 @@ class History:
             with self._lock:
                 self._db.close()
             self._closed = True
+
+
+def _coerce_float(v: Any) -> float | None:
+    if isinstance(v, (int, float)):
+        return float(v)
+    return None
+
+
+def _coerce_bool_int(v: Any) -> int | None:
+    if v is True:
+        return 1
+    if v is False:
+        return 0
+    return None
 
 
 def _round_bucket(approx_seconds: int) -> int:
