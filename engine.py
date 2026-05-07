@@ -220,7 +220,12 @@ class Engine:
                 tpl = section.trigger_messages.get("cancelled_manual")
                 if tpl:
                     self._post_to_visible_chats(
-                        device, templating.render(tpl, {"name": device_name})
+                        device,
+                        templating.render(
+                            tpl,
+                            {"name": device_name, "action": action,
+                             "action_verb": _action_verb(action)},
+                        ),
                     )
 
         if source_msgid is not None and self.bot:
@@ -324,7 +329,12 @@ class Engine:
         if section:
             template = section.trigger_messages.get(mode)
             if template:
-                full_ctx = {"name": device_name, **ctx}
+                full_ctx = {
+                    "name": device_name,
+                    "action": target_action,
+                    "action_verb": _action_verb(target_action),
+                    **ctx,
+                }
                 self._post_to_visible_chats(device, templating.render(template, full_ctx))
 
     def snapshot_for(self, chat_id: int, class_name: str) -> dict[str, Any] | None:
@@ -678,6 +688,15 @@ class Engine:
 
 
 # --- module-level helpers -------------------------------------------------
+
+def _action_verb(action: str) -> str:
+    """Human-readable verb for trigger_messages. Used as {action_verb} in templates."""
+    return {
+        "off": "switching off",
+        "on": "switching on",
+        "toggle": "toggling",
+    }.get(action, f"running {action}")
+
 
 def _local_midnight(now_ts: int) -> int:
     lt = time.localtime(now_ts)

@@ -48,19 +48,19 @@
     "default_consumed_threshold_wh": 5,
     "default_consumed_window_s":     600,
     "trigger_messages": {
-      "timer":            "🕐 {name} auto-off (timer)",
-      "tod":              "📅 {name} auto-off ({hh}:{mm})",
-      "idle":             "💤 {name} auto-off (idle: apower={value:.1f} W for {seconds}s)",
-      "consumed":         "🔋 {name} auto-off (used {value:.2f} Wh in last {seconds}s)",
-      "cancelled_manual": "↩️ {name} auto-off cancelled (manually toggled)"
+      "timer":            "🕐 {name}: timer elapsed; {action_verb}",
+      "tod":              "📅 {name}: scheduled time {hh}:{mm} reached; {action_verb}",
+      "idle":             "💤 {name}: power {value:.1f} W < {threshold:.0f} W threshold for {duration_human}; {action_verb}",
+      "consumed":         "🔋 {name}: consumed {value:.2f} Wh < {threshold:.1f} Wh threshold over last {window_human}; {action_verb}",
+      "cancelled_manual": "↩️ {name}: pending auto-{action} cancelled (manually toggled)"
     }
   },
 
   "auto_on": {
     "command": "on",
     "trigger_messages": {
-      "tod":              "📅 {name} auto-on ({hh}:{mm})",
-      "cancelled_manual": "↩️ {name} auto-on cancelled (manually toggled)"
+      "tod":              "📅 {name}: scheduled time {hh}:{mm} reached; {action_verb}",
+      "cancelled_manual": "↩️ {name}: pending auto-{action} cancelled (manually toggled)"
     }
   }
 }

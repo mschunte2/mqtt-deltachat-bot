@@ -477,6 +477,40 @@ class TestSchedulerJob(unittest.TestCase):
         self.assertEqual(target, "off")
         self.assertEqual(mode, "idle")
 
+    def test_idle_fire_includes_threshold_and_duration_human(self):
+        fires = []
+        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
+        now = int(time.time())
+        s.schedule(sched.ScheduledJob(
+            device_name="k", chat_id_origin=1, target_action="off",
+            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+        ))
+        s.tick("k", {"apower": 1.0}, now=now)
+        s.tick("k", {"apower": 1.0}, now=now + 65)
+        self.assertEqual(len(fires), 1)
+        _, _, _, _, ctx = fires[0]
+        self.assertEqual(ctx["threshold"], 5.0)
+        self.assertEqual(ctx["seconds"], 65)
+        self.assertEqual(ctx["duration_human"], "1m5s")
+
+    def test_consumed_fire_includes_threshold_and_window_human(self):
+        fires = []
+        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
+        now = int(time.time())
+        s.schedule(sched.ScheduledJob(
+            device_name="k", chat_id_origin=1, target_action="off",
+            consumed_field="apower", consumed_threshold_wh=5.0,
+            consumed_window_s=120, _consumed_started_at=now - 200,
+        ))
+        # apower=1 W constant for 120s ≈ 0.033 Wh, well below 5 Wh
+        s.tick("k", {"apower": 1.0}, now=now)
+        s.tick("k", {"apower": 1.0}, now=now + 1)
+        self.assertEqual(len(fires), 1)
+        _, _, _, _, ctx = fires[0]
+        self.assertEqual(ctx["threshold"], 5.0)
+        self.assertEqual(ctx["seconds"], 120)
+        self.assertEqual(ctx["window_human"], "2m")
+
     def test_idle_resets_when_above(self):
         fires = []
         s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
@@ -707,6 +741,25 @@ class TestEngineOnFire(unittest.TestCase):
         sent = [t for _, t in e.bot.rpc.sent]
         self.assertTrue(any("auto-off (idle" in (t or "") for t in sent),
                         f"expected idle message; got {sent}")
+
+    def test_on_fire_threads_action_verb_into_template(self):
+        # Build a class with a template that uses {action_verb} + {threshold}
+        # + {duration_human} so we can prove the enriched ctx flows.
+        cls = json.loads(json.dumps(CLASS_JSON_OK))
+        cls["auto_off"]["trigger_messages"]["consumed"] = (
+            "{name} consumed {value:.2f} Wh < {threshold:.1f} Wh "
+            "in last {window_human}; {action_verb}"
+        )
+        e = _build_engine_with_class(class_overrides=cls)
+        e.on_fire("kitchen", chat_id_origin=12, target_action="off",
+                  mode="consumed",
+                  ctx={"value": 3.21, "threshold": 5.0, "seconds": 600,
+                       "window_human": "10m", "field": "apower"})
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertTrue(
+            any("3.21 Wh < 5.0 Wh in last 10m; switching off" in (t or "")
+                for t in sent),
+            f"expected enriched consumed message; got {sent}")
 
 
 class TestEngineSnapshot(unittest.TestCase):

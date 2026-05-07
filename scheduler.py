@@ -400,9 +400,12 @@ class Scheduler:
                                 job._below_since = now
                             elif now - job._below_since >= job.idle_duration_s:
                                 del self._jobs[key]
+                                duration = now - job._below_since
                                 fires.append((job, "idle",
                                               {"value": float(v),
-                                               "seconds": now - job._below_since,
+                                               "threshold": float(job.idle_threshold),
+                                               "seconds": duration,
+                                               "duration_human": durations.format(duration),
                                                "field": job.idle_field}))
                                 fired = True
                         else:
@@ -420,7 +423,9 @@ class Scheduler:
                             del self._jobs[key]
                             fires.append((job, "consumed",
                                           {"value": float(wh),
+                                           "threshold": float(job.consumed_threshold_wh),
                                            "seconds": job.consumed_window_s,
+                                           "window_human": durations.format(job.consumed_window_s),
                                            "field": job.consumed_field}))
         for j, mode, ctx in fires:
             self._safe_fire(j, mode, ctx)
@@ -439,7 +444,11 @@ class Scheduler:
                     if not job.has_time() or job.deadline_ts > now:
                         continue
                     mode = job._time_mode or "timer"
-                    ctx: dict[str, Any] = {"value": 0, "seconds": 0, "field": ""}
+                    elapsed = max(0, now - (job.deadline_ts or now))
+                    ctx: dict[str, Any] = {
+                        "value": 0, "seconds": elapsed, "field": "",
+                        "duration_human": durations.format(elapsed) if elapsed else "",
+                    }
                     if job.time_of_day:
                         h, m = job.time_of_day
                         ctx["hh"] = f"{h:02d}"
