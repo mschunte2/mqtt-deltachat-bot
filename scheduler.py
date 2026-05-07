@@ -234,12 +234,21 @@ ALL_POLICY_KINDS = frozenset({"timer", "tod", "idle", "consumed"})
 _TOD_RE = re.compile(
     r"^at\s+(\d{1,2})(?:h(\d{2})?|:(\d{2}))?\s*(daily)?$", re.IGNORECASE
 )
-_TIMER_RE = re.compile(r"^(?:for|in)\s+(\S+)$", re.IGNORECASE)
+
+# Timer / idle accept multi-token durations like "30 min", "1 hour 30 min".
+# Capture the rest of the line and let durations.parse handle it.
+_TIMER_RE = re.compile(r"^(?:for|in)\s+(.+?)\s*$", re.IGNORECASE)
+
 # Unified idle clause: power threshold (W) OR rolling-window energy (Wh/kWh).
-# The unit on the value discriminates which policy fires; `if` and `until` are synonyms.
-# Optional "in" keyword between value and duration (natural with energy, accepted with power too).
+# Value is a number with optional unit, possibly with a space between
+# (e.g. "200W", "200 W", "200Wh", "200 Wh"). Duration is the rest of the
+# line, so "30min", "30 min", "1h 30m", "1 hour" all parse.
 _IDLE_RE = re.compile(
-    r"^(?:if|until)\s+idle(?:\s+(\S+)\s+(?:in\s+)?(\S+))?$",
+    r"^(?:if|until)\s+idle"
+    r"(?:\s+(\d+(?:\.\d+)?\s*[a-zA-Z]*)"   # value with optional unit
+    r"(?:\s+in)?"                           # optional "in" keyword
+    r"\s+(.+?))?"                            # duration (rest)
+    r"\s*$",
     re.IGNORECASE,
 )
 _NUM_UNIT_RE = re.compile(r"^([0-9]*\.?[0-9]+)\s*([a-zA-Z]+)?$")

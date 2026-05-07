@@ -18,7 +18,6 @@ const stateText = $('state-text');
 const statePower = $('state-power');
 const stateEnergy = $('state-energy');
 const sparkline = $('sparkline');
-const bars = $('bars');
 const chartMax = $('chart-max');
 const chartFoot = $('chart-foot');
 const windowPick = $('window-pick');
@@ -207,19 +206,14 @@ function fmtKwh(kwh) {
   return `${kwh.toFixed(2)} kWh`;
 }
 
-function fmtIntervalEntry(entry, intervalLabel) {
-  // entry shape: {kwh, partial_since_ts | null}
+function fmtIntervalEntry(entry) {
+  // entry shape: {kwh, partial_since_ts | null} or legacy bare number.
   if (entry == null) return '—';
-  if (typeof entry === 'number') {
-    // legacy shape — old bot/new app combo
-    return fmtKwh(entry);
-  }
+  if (typeof entry === 'number') return fmtKwh(entry);
   const text = fmtKwh(entry.kwh);
-  if (entry.partial_since_ts) {
-    const d = new Date(entry.partial_since_ts * 1000);
-    return text + ` (since ${d.toLocaleString()})`;
-  }
-  return text;
+  // Compact: a star indicates "data starts later than the window";
+  // verbose since-date suppressed by request.
+  return entry.partial_since_ts ? text + '*' : text;
 }
 
 function renderEnergySummary(dev) {
@@ -231,13 +225,13 @@ function renderEnergySummary(dev) {
       .forEach(id => set(id, '—'));
     return;
   }
-  set('kwh-last-hour',  fmtIntervalEntry(e.kwh_last_hour, 'last hour'));
-  set('kwh-today',      fmtIntervalEntry(e.kwh_today, 'today'));
-  set('kwh-last-24h',   fmtIntervalEntry(e.kwh_last_24h, 'last 24h'));
-  set('kwh-this-week',  fmtIntervalEntry(e.kwh_this_week, 'this week'));
-  set('kwh-last-7d',    fmtIntervalEntry(e.kwh_last_7d, 'last 7d'));
-  set('kwh-this-month', fmtIntervalEntry(e.kwh_this_month, 'this month'));
-  set('kwh-last-30d',   fmtIntervalEntry(e.kwh_last_30d, 'last 30d'));
+  set('kwh-last-hour',  fmtIntervalEntry(e.kwh_last_hour));
+  set('kwh-today',      fmtIntervalEntry(e.kwh_today));
+  set('kwh-last-24h',   fmtIntervalEntry(e.kwh_last_24h));
+  set('kwh-this-week',  fmtIntervalEntry(e.kwh_this_week));
+  set('kwh-last-7d',    fmtIntervalEntry(e.kwh_last_7d));
+  set('kwh-this-month', fmtIntervalEntry(e.kwh_this_month));
+  set('kwh-last-30d',   fmtIntervalEntry(e.kwh_last_30d));
   set('kwh-total',
       e.current_total_wh != null ? fmtKwh(e.current_total_wh / 1000) : '—');
 }
@@ -252,46 +246,6 @@ function renderTuningInputs(dev) {
       && document.activeElement !== tuneSecs) {
     tuneSecs.value = params.power_threshold_duration_s;
   }
-}
-
-function renderBars(energyPoints) {
-  if (!bars) return;
-  if (!Array.isArray(energyPoints) || energyPoints.length < 2) {
-    bars.innerHTML = '';
-    return;
-  }
-  // Compute Wh deltas between consecutive snapshots; clamp negatives to 0
-  // (counter resets shouldn't render as negative bars).
-  const deltas = [];
-  for (let i = 1; i < energyPoints.length; i++) {
-    const t = energyPoints[i][0];
-    const dWh = Math.max(0, energyPoints[i][1] - energyPoints[i - 1][1]);
-    deltas.push({ t, wh: dWh });
-  }
-  if (!deltas.length) { bars.innerHTML = ''; return; }
-  // For 31d window we have ~744 bars; downsample to ~30 daily buckets.
-  const span = deltas[deltas.length - 1].t - deltas[0].t;
-  let dec = 1;
-  if (deltas.length > 60) dec = Math.ceil(deltas.length / 60);
-  const bucketed = [];
-  for (let i = 0; i < deltas.length; i += dec) {
-    let sum = 0, count = 0, t = deltas[i].t;
-    for (let j = i; j < Math.min(i + dec, deltas.length); j++) {
-      sum += deltas[j].wh; count++;
-    }
-    bucketed.push({ t, wh: sum });
-  }
-  const W = 200, H = 36;
-  const maxWh = Math.max(1, ...bucketed.map(b => b.wh));
-  const w = W / bucketed.length;
-  const rects = bucketed.map((b, i) => {
-    const h = (b.wh / maxWh) * (H - 2);
-    return `<rect x="${(i * w).toFixed(2)}" y="${(H - h).toFixed(2)}" `
-         + `width="${(w * 0.85).toFixed(2)}" height="${h.toFixed(2)}" `
-         + `fill="#5ac8fa"/>`;
-  }).join('');
-  bars.innerHTML = rects + `<text x="${W - 2}" y="10" font-size="9" `
-    + `text-anchor="end" fill="#888">max ${maxWh.toFixed(0)} Wh</text>`;
 }
 
 function renderEvents(rows) {
@@ -474,9 +428,6 @@ window.webxdc.setUpdateListener((update) => {
   if (p.history && p.history.device) {
     state.serverHistory[p.history.device] = p.history;
     renderSparkline();
-    if (p.history.device === state.active) {
-      renderBars(p.history.energy_points);
-    }
     return;
   }
   // Events response.

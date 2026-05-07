@@ -229,6 +229,30 @@ class TestParsePolicy(unittest.TestCase):
         self.assertEqual(p.idle_threshold, 10.0)
         self.assertEqual(p.idle_duration_s, 120)
 
+    def test_idle_with_spaces_in_value_and_duration(self):
+        # User reported "200Wh in 30min" works but "200 Wh in 30 min" failed.
+        # Both should now parse identically.
+        a = sched.parse_policy("if idle 200Wh in 30min", self.d)
+        b = sched.parse_policy("if idle 200 Wh in 30 min", self.d)
+        self.assertEqual(a.consumed_threshold_wh, 200.0)
+        self.assertEqual(a.consumed_window_s, 1800)
+        self.assertEqual(b.consumed_threshold_wh, 200.0)
+        self.assertEqual(b.consumed_window_s, 1800)
+
+    def test_idle_power_with_spaces(self):
+        a = sched.parse_policy("if idle 5W 60s", self.d)
+        b = sched.parse_policy("if idle 5 W 60 s", self.d)
+        c = sched.parse_policy("if idle 5 W in 60 sec", self.d)
+        for p in (a, b, c):
+            self.assertEqual(p.idle_threshold, 5.0)
+            self.assertEqual(p.idle_duration_s, 60)
+
+    def test_timer_with_spaces(self):
+        # "for 30 min" used to fail because (\S+) captured only "30".
+        self.assertEqual(sched.parse_policy("for 30 min", self.d).timer_seconds, 1800)
+        self.assertEqual(sched.parse_policy("in 1 hour", self.d).timer_seconds, 3600)
+        self.assertEqual(sched.parse_policy("for 1 hr 30 min", self.d).timer_seconds, 5400)
+
     def test_idle_unknown_unit_rejected(self):
         with self.assertRaises(ValueError):
             sched.parse_policy("if idle 10J 60s", self.d)
