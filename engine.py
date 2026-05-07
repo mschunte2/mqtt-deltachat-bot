@@ -52,6 +52,9 @@ class Engine:
     # Optional free-text intro prepended to /help (from HELP_MESSAGE env var).
     help_prefix: str = ""
 
+    # Optional History instance for SQLite-backed time series.
+    history: Any = None
+
     # Filled in by set_bot() during on_start
     bot: Any = None
     accid: int = 0
@@ -114,6 +117,22 @@ class Engine:
 
         # Scheduler idle/consumed checks (no-op if no pending jobs for this device)
         self.scheduler.tick(device_name, cache.fields)
+
+        # Persist time series + plug events for /history queries.
+        if self.history is not None:
+            if "apower" in updates or "aenergy" in updates:
+                self.history.write_sample(
+                    device_name,
+                    cache.last_update_ts,
+                    cache.fields.get("apower"),
+                    cache.fields.get("aenergy"),
+                )
+            if suffix == "events/rpc":
+                payload_text = (payload.decode("utf-8", errors="replace")
+                                if isinstance(payload, bytes) else str(payload))
+                self.history.write_event(
+                    device_name, cache.last_update_ts, suffix, payload_text
+                )
 
         # Push the new snapshot to webxdc instances
         if self.bot:
@@ -342,6 +361,11 @@ class Engine:
         if not device_name or not action:
             return
 
+        # History query: read-only; reply only to the requesting msgid.
+        if action == "history":
+            self._handle_history_request(chat_id, msgid, device_name, request)
+            return
+
         if action == "cancel-auto-off" or action == "cancel-auto-on" or action == "cancel-schedule":
             target = None
             device = self.cfg.devices.get(device_name)
@@ -380,6 +404,42 @@ class Engine:
                                           MsgData(text=f"bad {key}: {ex}"))
                 continue
             self.schedule(chat_id, device_name, section.command, policy)
+
+    def _handle_history_request(self, chat_id: int, msgid: int,
+                                 device_name: str, request: dict[str, Any]) -> None:
+        """Reply to a webxdc history query with downsampled time series."""
+        if self.history is None or self.bot is None:
+            return
+        device = self.cfg.devices.get(device_name)
+        if device is None or not permissions.chat_can_see(
+                chat_id, device, self.allowed_chats):
+            return
+        try:
+            window_seconds = int(request.get("window_seconds", 21600))
+        except (TypeError, ValueError):
+            window_seconds = 21600
+        # Cap to ~31 days max.
+        window_seconds = max(60, min(window_seconds, 31 * 86400))
+        until_ts = int(time.time())
+        since_ts = until_ts - window_seconds
+
+        bucket_s, points = self.history.query_power(
+            device_name, since_ts, until_ts, max_points=200,
+        )
+        energy = self.history.query_energy(device_name, since_ts, until_ts)
+
+        body = {
+            "history": {
+                "device": device_name,
+                "window_seconds": window_seconds,
+                "since_ts": since_ts,
+                "until_ts": until_ts,
+                "bucket_seconds": bucket_s,
+                "power_points": points,
+                "energy_points": energy,
+            }
+        }
+        self.webxdc.push_to_msgid(self.bot, self.accid, msgid, body)
 
     # --- helpers ----------------------------------------------------------
 

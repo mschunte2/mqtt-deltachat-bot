@@ -68,6 +68,7 @@ from deltabot_cli import BotCli  # noqa: E402
 
 import engine as engine_mod  # noqa: E402
 import scheduler as sched_mod  # noqa: E402
+from history import History  # noqa: E402
 from mqtt_client import MqttClient  # noqa: E402
 from webxdc_io import WebxdcIO  # noqa: E402
 
@@ -78,6 +79,9 @@ STATE_DIR = Path(user_config_dir(BOT_NAME))
 # --- Wiring ---------------------------------------------------------------
 
 webxdc = WebxdcIO(state_dir=STATE_DIR, devices_dir=DEVICES_DIR)
+_RETENTION_DAYS = int((os.environ.get("RETENTION_DAYS") or "0").strip() or "0")
+history = History(db_path=STATE_DIR / "history.sqlite",
+                  retention_days=_RETENTION_DAYS)
 scheduler = sched_mod.Scheduler(on_fire=lambda *a, **kw: engine.on_fire(*a, **kw))
 mqtt = MqttClient(
     host=os.environ.get("MQTT_HOST", "127.0.0.1"),
@@ -97,6 +101,7 @@ engine = engine_mod.Engine(
     scheduler=scheduler,
     client_id=os.environ.get("MQTT_CLIENT_ID", BOT_NAME),
     help_prefix=(os.environ.get("HELP_MESSAGE") or "").strip(),
+    history=history,
 )
 
 

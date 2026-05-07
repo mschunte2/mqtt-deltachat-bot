@@ -85,9 +85,22 @@ header select {
 .chart-header {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   font-size: 0.85rem;
   color: #6b6b70;
   margin-bottom: 4px;
+  gap: 6px;
+}
+.chart-header select {
+  font-size: 0.85rem;
+  padding: 2px 4px;
+  border: 1px solid #d1d1d6;
+  border-radius: 4px;
+}
+.chart-foot {
+  font-size: 0.75rem;
+  color: #8e8e93;
+  margin-top: 4px;
 }
 #sparkline {
   width: 100%;
