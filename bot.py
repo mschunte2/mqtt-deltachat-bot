@@ -87,6 +87,7 @@ engine = engine_mod.Engine(
     webxdc=webxdc,
     scheduler=scheduler,
     client_id=os.environ.get("MQTT_CLIENT_ID", BOT_NAME),
+    help_prefix=(os.environ.get("HELP_MESSAGE") or "").strip(),
 )
 
 
@@ -193,13 +194,19 @@ def _on_new_message(bot, accid, event):
     text = (msg.text or "")
     parsed = _parse_text_command(text)
 
-    # /id is the only command that bypasses the allow-list (needed for setup).
+    # /id and /help bypass the allow-list (both are read-only; /id is needed
+    # for setup discovery, /help is generic command surface — it does not
+    # leak which specific devices exist for a non-allowed chat because
+    # engine.help_text filters the device list per chat).
     if parsed and parsed[0] == "" and parsed[1] == "id":
         bot.rpc.send_msg(
             accid, chatid,
             MsgData(text=f"this chat's id is {chatid}; "
                          f"add it to ALLOWED_CHATS in .env/env to authorise the bot"),
         )
+        return
+    if parsed and parsed[0] == "" and parsed[1] == "help":
+        bot.rpc.send_msg(accid, chatid, MsgData(text=engine.help_text(chatid)))
         return
 
     # Non-slash text in an authorised chat → stay silent. Help is now only

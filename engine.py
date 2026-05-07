@@ -49,6 +49,9 @@ class Engine:
     scheduler: Any       # Scheduler
     client_id: str
 
+    # Optional free-text intro prepended to /help (from HELP_MESSAGE env var).
+    help_prefix: str = ""
+
     # Filled in by set_bot() during on_start
     bot: Any = None
     accid: int = 0
@@ -248,7 +251,7 @@ class Engine:
     def help_text(self, chat_id: int) -> str:
         visible = permissions.visible_devices(chat_id, self.cfg, self.allowed_chats)
         names = ", ".join(d.name for d in visible) or "(none — your chat has no visible devices)"
-        return (
+        base = (
             "Commands:\n"
             "  /<device> on | off | toggle | status\n"
             "  /<device> off in 30m | off at 18h | off at 18:30 daily\n"
@@ -265,6 +268,9 @@ class Engine:
             "  /help                — this message\n"
             f"Devices in this chat: {names}\n"
         )
+        if self.help_prefix:
+            return f"{self.help_prefix}\n\n{base}"
+        return base
 
     # --- scheduler & webxdc callbacks ------------------------------------
 
