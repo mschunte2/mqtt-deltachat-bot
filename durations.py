@@ -10,8 +10,14 @@ sense and is almost always a typo.
 
 import re
 
-_TOKEN_RE = re.compile(r"(\d+)\s*([dhms])", re.IGNORECASE)
-_FULL_RE = re.compile(r"^(?:\s*\d+\s*[dhms]\s*)+$", re.IGNORECASE)
+_UNIT = (
+    r"(d(?:ay)?s?"            # d, day, days
+    r"|h(?:ours?|rs?)?"       # h, hr, hrs, hour, hours
+    r"|m(?:in(?:ute)?s?)?"    # m, min, mins, minute, minutes
+    r"|s(?:ec(?:ond)?s?)?)"   # s, sec, secs, second, seconds
+)
+_TOKEN_RE = re.compile(r"(\d+)\s*" + _UNIT, re.IGNORECASE)
+_FULL_RE = re.compile(r"^(?:\s*\d+\s*" + _UNIT + r"\s*)+$", re.IGNORECASE)
 
 _MULT = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 
@@ -21,7 +27,9 @@ def parse(text: str) -> int:
         raise ValueError(f"not a duration: {text!r}")
     total = 0
     for n, unit in _TOKEN_RE.findall(text):
-        total += int(n) * _MULT[unit.lower()]
+        # Verbose units (min, hours, etc.) all start with one of d/h/m/s,
+        # which is the canonical key in _MULT.
+        total += int(n) * _MULT[unit[0].lower()]
     if total <= 0:
         raise ValueError(f"duration must be positive: {text!r}")
     return total

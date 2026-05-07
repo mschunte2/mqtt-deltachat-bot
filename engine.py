@@ -387,14 +387,18 @@ class Engine:
 
     def _energy_summary(self, device_name: str,
                         current_wh: float | None) -> dict[str, Any] | None:
-        """Wh consumed in standard intervals, computed from hourly snapshots.
+        """kWh consumed in standard intervals, integrated from minute samples.
 
-        Returns None if there's no current reading. Each kwh_* is None when
-        we don't yet have a snapshot at-or-after the interval start (e.g.
-        the bot was deployed mid-week, so kwh_this_week is unknown until
-        next week).
+        Each interval is reported as a {kwh, partial_since_ts | null}
+        pair. partial_since_ts indicates the earliest minute sample we
+        actually have within the interval — if it's significantly later
+        than the requested start, the kWh is for a shorter span than the
+        label suggests (e.g. on first deploy, "last 24h" actually covers
+        only since-deploy). The app surfaces this as a "*" suffix.
+
+        Returns None if there's no current reading.
         """
-        if current_wh is None or self.history is None:
+        if self.history is None:
             return None
         now = int(time.time())
         intervals = (
@@ -406,14 +410,26 @@ class Engine:
             ("kwh_this_week",  _local_week_start(now)),
             ("kwh_this_month", _local_month_start(now)),
         )
-        out: dict[str, Any] = {"current_total_wh": float(current_wh)}
+        out: dict[str, Any] = {
+            "current_total_wh":
+                float(current_wh) if current_wh is not None else None,
+        }
+        # Threshold for marking a value "partial": we tolerate up to 90s of
+        # gap between requested start and earliest sample (one or two
+        # missed minute boundaries on bot startup).
+        PARTIAL_GAP = 90
         for key, since in intervals:
-            base = self.history.aenergy_at(device_name, since)
-            if base is None:
-                out[key] = None
-            else:
-                wh = max(0.0, float(current_wh) - float(base))
-                out[key] = wh / 1000.0
+            wh, earliest = self.history.energy_consumed_in(
+                device_name, since, now,
+            )
+            partial_since = (
+                earliest if (earliest is not None and earliest - since > PARTIAL_GAP)
+                else None
+            )
+            out[key] = {
+                "kwh": wh / 1000.0,
+                "partial_since_ts": partial_since,
+            }
         return out
 
     # --- webxdc inbound (called by bot.py from RawEvent hook) ------------

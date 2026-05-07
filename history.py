@@ -217,6 +217,35 @@ class History:
             ).fetchone()
         return float(row[0]) if row else None
 
+    def energy_consumed_in(self, device: str, since_ts: int, until_ts: int
+                           ) -> tuple[float, int | None]:
+        """Wh consumed in the window, integrated from minute samples.
+
+        Returns (wh, earliest_sample_ts):
+          - wh is sum(avg_apower_w * 1 minute) over rows in [since_ts, until_ts)
+            divided by 60 (one row = one minute).
+          - earliest_sample_ts tells the caller whether the window is
+            fully-covered. None means we have NO samples in the window;
+            otherwise it's the ts of the earliest minute we saw — useful
+            for marking a value as 'partial' if it's much later than
+            since_ts.
+
+        This avoids the imprecision of aenergy_at, which buckets to hour
+        boundaries and can over- or under-count by up to a full hour.
+        """
+        if until_ts <= since_ts:
+            return (0.0, None)
+        with self._lock:
+            row = self._db.execute(
+                "SELECT SUM(avg_apower_w) / 60.0, MIN(ts) "
+                "FROM power_minute "
+                "WHERE device=? AND ts >= ? AND ts < ?",
+                (device, int(since_ts), int(until_ts)),
+            ).fetchone()
+        wh = float(row[0]) if row and row[0] is not None else 0.0
+        earliest = int(row[1]) if row and row[1] is not None else None
+        return (wh, earliest)
+
     def query_events(self, device: str, since_ts: int, until_ts: int,
                      limit: int = 500) -> list[tuple[int, str, str, str]]:
         """Return [(ts, suffix, kind, payload), ...] for the window."""

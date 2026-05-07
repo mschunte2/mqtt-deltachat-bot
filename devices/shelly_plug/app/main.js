@@ -207,6 +207,21 @@ function fmtKwh(kwh) {
   return `${kwh.toFixed(2)} kWh`;
 }
 
+function fmtIntervalEntry(entry, intervalLabel) {
+  // entry shape: {kwh, partial_since_ts | null}
+  if (entry == null) return '—';
+  if (typeof entry === 'number') {
+    // legacy shape — old bot/new app combo
+    return fmtKwh(entry);
+  }
+  const text = fmtKwh(entry.kwh);
+  if (entry.partial_since_ts) {
+    const d = new Date(entry.partial_since_ts * 1000);
+    return text + ` (since ${d.toLocaleString()})`;
+  }
+  return text;
+}
+
 function renderEnergySummary(dev) {
   const e = dev.energy;
   const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
@@ -216,13 +231,13 @@ function renderEnergySummary(dev) {
       .forEach(id => set(id, '—'));
     return;
   }
-  set('kwh-last-hour',  fmtKwh(e.kwh_last_hour));
-  set('kwh-today',      fmtKwh(e.kwh_today));
-  set('kwh-last-24h',   fmtKwh(e.kwh_last_24h));
-  set('kwh-this-week',  fmtKwh(e.kwh_this_week));
-  set('kwh-last-7d',    fmtKwh(e.kwh_last_7d));
-  set('kwh-this-month', fmtKwh(e.kwh_this_month));
-  set('kwh-last-30d',   fmtKwh(e.kwh_last_30d));
+  set('kwh-last-hour',  fmtIntervalEntry(e.kwh_last_hour, 'last hour'));
+  set('kwh-today',      fmtIntervalEntry(e.kwh_today, 'today'));
+  set('kwh-last-24h',   fmtIntervalEntry(e.kwh_last_24h, 'last 24h'));
+  set('kwh-this-week',  fmtIntervalEntry(e.kwh_this_week, 'this week'));
+  set('kwh-last-7d',    fmtIntervalEntry(e.kwh_last_7d, 'last 7d'));
+  set('kwh-this-month', fmtIntervalEntry(e.kwh_this_month, 'this month'));
+  set('kwh-last-30d',   fmtIntervalEntry(e.kwh_last_30d, 'last 30d'));
   set('kwh-total',
       e.current_total_wh != null ? fmtKwh(e.current_total_wh / 1000) : '—');
 }

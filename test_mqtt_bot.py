@@ -49,6 +49,20 @@ class TestDurations(unittest.TestCase):
         self.assertEqual(durations.parse("7d"), 7 * 86400)
         self.assertEqual(durations.parse("1d12h"), 86400 + 12 * 3600)
 
+    def test_verbose_units(self):
+        # User wrote "30min" in chat; previously rejected — now accepted.
+        self.assertEqual(durations.parse("30min"), 1800)
+        self.assertEqual(durations.parse("30mins"), 1800)
+        self.assertEqual(durations.parse("30minute"), 1800)
+        self.assertEqual(durations.parse("30minutes"), 1800)
+        self.assertEqual(durations.parse("2hours"), 7200)
+        self.assertEqual(durations.parse("2hr"), 7200)
+        self.assertEqual(durations.parse("2hrs"), 7200)
+        self.assertEqual(durations.parse("1day"), 86400)
+        self.assertEqual(durations.parse("3days"), 3 * 86400)
+        self.assertEqual(durations.parse("45sec"), 45)
+        self.assertEqual(durations.parse("1hr30min"), 3600 + 1800)
+
     def test_format(self):
         self.assertEqual(durations.format(0), "0s")
         self.assertEqual(durations.format(30), "30s")
