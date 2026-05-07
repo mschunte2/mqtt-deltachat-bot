@@ -41,14 +41,8 @@ fi
 echo "Importing $BACKUP into $ACCOUNT_DIR ..." >&2
 activate_venv
 mkdir -p "$ACCOUNT_DIR"
-python3 -c "
-import sys
-from deltachat_rpc_server import deltachat_rpc_server  # noqa: F401
-from deltachat2 import Bot, IOTransport, Rpc
-
-with Rpc(accounts_dir=r'''$ACCOUNT_DIR''') as rpc:
-    accid = rpc.add_account()
-    rpc.import_backup(accid, r'''$BACKUP''', None)
-    print('imported account id', accid, file=sys.stderr)
-"
+# deltabot-cli ships an `import` subcommand that handles add_account +
+# import_backup correctly, so we delegate instead of hand-rolling the
+# JSON-RPC dance ourselves.
+python3 -m bot import "$BACKUP"
 echo "Done. Move or remove $BACKUP from .env/ if you do not want to retry on next deploy." >&2

@@ -2,9 +2,9 @@
   "_comment": "Device instances. Class definitions live in devices/<class>/class.json -- they are auto-discovered.",
   "devices": [
     {
-      "name": "kaffeete",
+      "name": "kafeete",
       "class": "shelly_plug",
-      "topic_prefix": "shellyplug-kaffeete",
+      "topic_prefix": "shellyplug-kafeete",
       "description": "Coffee machine",
       "allowed_chats": []
     },
