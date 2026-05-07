@@ -63,13 +63,20 @@ mqtt-bot/
 /<device> auto-on at 7h           # next 07:00 local
 /<device> auto-on at 7h daily     # recurring
 /<device> cancel-auto-off | cancel-auto-on | cancel-schedule
-/<device> export 7d               # CSV (power_minute + energy_hour) attached to chat
+/<device> export 7d               # CSV (samples_raw + power_minute + energy_minute + energy_hour)
 
+/all on | off | toggle            # act on every device visible to this chat
 /list           list devices visible to this chat
 /apps           (re)deliver webxdc control apps
 /id             show this chat's id (permission-free, needed for setup)
 /help           command reference (permission-free)
 ```
+
+Scheduling clauses tolerate verbose forms: `30min`, `30 min`, `30 minutes`,
+`1 hour`, `1hr 30min`, `1 day`, `200 Wh in 30 min`, `5 W in 60 sec`. Both
+`if` and `until` are accepted as keywords. Multiple rules per device per
+direction coexist and fire independently — adding `/<dev> off if idle 5W
+60s` AND `/<dev> off in 30m` schedules two parallel rules.
 
 ## History (SQLite time series)
 
@@ -95,6 +102,41 @@ This drives:
 older rows once per day. Storage is small — ~3 MB per device per
 month at 1 sample/min plus ~70 KB per device per month for hourly
 snapshots.
+
+## Recommended plug configuration
+
+In each Shelly plug's web UI:
+
+| Setting | Recommended | Why |
+|---|---|---|
+| MQTT enabled | yes | obvious |
+| Server | `<bot host>:1883` | the broker we set up |
+| MQTT username/password | `MQTT_USER`/`MQTT_PASS` from `.env/env` | broker auth |
+| Custom MQTT topic prefix | `shellyplug-<name>` | becomes `topic_prefix` in `devices.json` |
+| **Generic status update over MQTT** | **enabled** | required — without this we get only the LWT, no `status/switch:0` flow |
+| **Status update period** | **15 s** | 4× the default detail in the live `apower` curve and `samples_raw` table; still trivially small MQTT/disk overhead. The authoritative `aenergy.by_minute` data is unaffected (always per-minute). |
+
+Lower than 15 s is fine if you want sub-15 s power resolution, but
+remember every status update writes one row to `samples_raw`. At 1 s
+that's ~63 MB / month / device.
+
+## History data model (SQLite)
+
+`~/.config/<BOT_NAME>/history.sqlite` — five tables, all keyed by
+`(device, ts)`:
+
+| Table | What | Source |
+|---|---|---|
+| `samples_raw` | Every `status/switch:0` verbatim — apower, voltage, current, freq, aenergy.total, output, temperature.tC, plus a `payload_json` blob for the rest | one row per status update |
+| `energy_minute` | Authoritative energy in **mWh** per minute | extracted from Shelly's `aenergy.by_minute[1..2]`; idempotent |
+| `power_minute` | Per-minute average `apower` (W) | aggregated client-side from samples |
+| `energy_hour` | Cumulative `aenergy.total` snapshot per hour | latest sample within the hour wins |
+| `events` | Plug events (firmware, cloud connect, etc.) | from `events/rpc` |
+
+Energy queries are a single SQL `SUM` over a per-minute hybrid
+(`energy_minute` first, `power_minute` integration as fallback for
+minutes without by_minute coverage). This stitches data from before
+v1.3 (when `energy_minute` was added) with newer rows seamlessly.
 
 Multi-clause example: `/kitchen on for 1h or until used <2Wh in 10m`
 turns on, then off whichever fires first — a hard 1-hour cap *or* the

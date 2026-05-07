@@ -119,6 +119,7 @@ engine = engine_mod.Engine(
     client_id=os.environ.get("MQTT_CLIENT_ID", BOT_NAME),
     help_prefix=(os.environ.get("HELP_MESSAGE") or "").strip(),
     history=history,
+    instances_path=DEVICES_FILE,
 )
 
 
@@ -270,6 +271,11 @@ def _on_new_message(bot, accid, event):
         if verb == "help":
             bot.rpc.send_msg(accid, chatid, MsgData(text=engine.help_text(chatid)))
             return
+
+    # /all <verb> — apply a direct verb to every device visible to this chat.
+    if head == "all" and verb in _DIRECT_VERBS and not rest:
+        _handle_all(bot, accid, chatid, verb, msg.id)
+        return
 
     device_name = head
     if verb == "status" and not rest:
@@ -458,6 +464,35 @@ def _handle_export(bot, accid: int, chatid: int, device_name: str, rest: str) ->
             os.unlink(path)
         except OSError:
             pass
+
+
+def _handle_all(bot, accid: int, chatid: int, verb: str, source_msgid: int) -> None:
+    """Run a direct verb against every device visible to this chat."""
+    visible = [
+        d for d in cfg.devices.values()
+        if (d.allowed_chats and chatid in d.allowed_chats)
+        or (not d.allowed_chats and chatid in ALLOWED_CHATS)
+    ]
+    if not visible:
+        bot.rpc.send_msg(accid, chatid, MsgData(text="no devices visible"))
+        return
+    succeeded: list[str] = []
+    failed: list[str] = []
+    for d in visible:
+        ok, msg_text = engine.dispatch_command(
+            chatid, d.name, verb, source_msgid=None,
+        )
+        (succeeded if ok else failed).append(d.name)
+    bits = []
+    if succeeded:
+        bits.append(f"sent {verb} to {', '.join(succeeded)}")
+    if failed:
+        bits.append(f"failed: {', '.join(failed)}")
+    bot.rpc.send_msg(accid, chatid, MsgData(text=" · ".join(bits) or "(noop)"))
+    try:
+        bot.rpc.send_reaction(accid, source_msgid, ["🆗" if not failed else "⚠️"])
+    except Exception:
+        pass
 
 
 def _handle_apps(bot, accid: int, chatid: int) -> None:

@@ -1116,6 +1116,26 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(rows[1][0], 1700000000)
         self.assertAlmostEqual(rows[1][1], 3500.0)
 
+    def test_daily_energy_kwh_padded(self):
+        # Insert one day's worth of by_minute data and ask for last 5 days.
+        # Result should have 5 buckets with only the relevant one non-zero.
+        midnight = 1700001600  # any aligned-ish ts; we'll pretend it's local midnight
+        # Two minutes inside the "day at midnight - 0":
+        for minute_ts, mwh in ((midnight + 60, 5000.0), (midnight + 120, 3000.0)):
+            self.h._db.execute(
+                "INSERT INTO energy_minute (device, ts, energy_mwh) "
+                "VALUES (?, ?, ?)", ("k", minute_ts, mwh),
+            )
+        self.h._db.commit()
+        days = self.h.daily_energy_kwh("k", midnight, days=5)
+        self.assertEqual(len(days), 5)
+        # The most recent bucket (today) holds the consumption.
+        # 5000 + 3000 mWh = 8 Wh
+        self.assertAlmostEqual(days[-1][1], 8.0)
+        # Earlier buckets are zero-padded.
+        for ts, wh in days[:-1]:
+            self.assertEqual(wh, 0.0)
+
     def test_record_status_idempotent(self):
         # Re-reporting the same minute is a no-op (INSERT OR REPLACE
         # against the same primary key).

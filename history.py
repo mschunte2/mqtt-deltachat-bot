@@ -353,6 +353,50 @@ class History:
             return (0.0, None)
         return (float(row[0]), int(row[1]) if row[1] is not None else None)
 
+    def daily_energy_kwh(self, device: str, midnight_ts: int,
+                         days: int = 30) -> list[tuple[int, float]]:
+        """Return [(local_midnight_ts, wh), ...] for the last `days` days,
+        oldest first. midnight_ts must be the local-time midnight of TODAY
+        (callers compute it via _local_midnight from engine).
+
+        Each bucket uses the same hybrid energy_minute / power_minute
+        rule as energy_consumed_in. Done as a single SQL query that
+        groups by (ts - oldest_start) / 86400 — server-side aggregation
+        avoiding 30 round-trips.
+        """
+        if self._closed or days <= 0:
+            return []
+        oldest_start = midnight_ts - (days - 1) * 86400
+        until_ts = midnight_ts + 86400
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT ((ts - ?) / 86400) AS day_idx, SUM(wh) "
+                "FROM ("
+                "  SELECT ts, energy_mwh / 1000.0 AS wh "
+                "    FROM energy_minute "
+                "   WHERE device=? AND ts>=? AND ts<? "
+                "  UNION ALL "
+                "  SELECT pm.ts, pm.avg_apower_w / 60.0 AS wh "
+                "    FROM power_minute pm "
+                "   WHERE pm.device=? AND pm.ts>=? AND pm.ts<? "
+                "     AND NOT EXISTS ("
+                "       SELECT 1 FROM energy_minute em "
+                "        WHERE em.device=pm.device AND em.ts=pm.ts"
+                "     )"
+                ") "
+                "GROUP BY day_idx ORDER BY day_idx ASC",
+                (oldest_start,
+                 device, oldest_start, until_ts,
+                 device, oldest_start, until_ts),
+            ).fetchall()
+        # Pad to a dense list of `days` buckets so the chart can render
+        # zero-bars for days with no data.
+        by_idx = {int(idx): float(wh) for idx, wh in rows if wh is not None}
+        return [
+            (oldest_start + d * 86400, by_idx.get(d, 0.0))
+            for d in range(days)
+        ]
+
     def query_energy_minute(self, device: str, since_ts: int, until_ts: int
                              ) -> list[tuple[int, float]]:
         """Per-minute Wh-equivalent (returned as mWh from Shelly's by_minute)."""

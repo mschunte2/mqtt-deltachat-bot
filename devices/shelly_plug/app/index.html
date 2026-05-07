@@ -47,6 +47,10 @@
     <svg id="sparkline" viewBox="0 0 200 60" preserveAspectRatio="none"
          xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
     <div id="chart-foot" class="chart-foot"></div>
+    <div class="daily-header">Last 30 days · daily Wh</div>
+    <svg id="daily-bars" viewBox="0 0 200 36" preserveAspectRatio="none"
+         xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
+    <div id="daily-foot" class="chart-foot"></div>
   </section>
 
   <section class="energy">
@@ -121,8 +125,11 @@
         <input type="number" id="tune-watts" value="1500" min="0" step="10"> W</label>
       <label>for at least
         <input type="number" id="tune-secs"  value="30" min="1"> s</label>
-      <button type="button" id="tune-apply">Apply (in-memory)</button>
-      <small>Persistence requires editing devices.json on the bot host.</small>
+      <div class="tune-actions">
+        <button type="button" id="tune-apply">Apply (in-memory)</button>
+        <button type="button" id="tune-save">Save to devices.json</button>
+      </div>
+      <small id="tune-status"></small>
     </form>
   </details>
 

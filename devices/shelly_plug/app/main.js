@@ -18,6 +18,8 @@ const stateText = $('state-text');
 const statePower = $('state-power');
 const stateEnergy = $('state-energy');
 const sparkline = $('sparkline');
+const dailyBars = $('daily-bars');
+const dailyFoot = $('daily-foot');
 const chartMax = $('chart-max');
 const chartFoot = $('chart-foot');
 const windowPick = $('window-pick');
@@ -26,6 +28,8 @@ const eventsList = $('events-list');
 const tuneWatts = $('tune-watts');
 const tuneSecs = $('tune-secs');
 const tuneApply = $('tune-apply');
+const tuneSave = $('tune-save');
+const tuneStatus = $('tune-status');
 const offCount = $('off-count');
 const onCount = $('on-count');
 const offRulesList = $('off-rules-list');
@@ -132,32 +136,35 @@ if (recentEventsEl) {
   });
 }
 
-if (tuneApply) {
-  tuneApply.addEventListener('click', () => {
-    if (!state.active) return;
-    const w = parseFloat(tuneWatts.value);
-    const s = parseInt(tuneSecs.value, 10);
-    if (!isFinite(w) || !isFinite(s)) return;
+function _sendTune(persist) {
+  if (!state.active) return;
+  const w = parseFloat(tuneWatts.value);
+  const s = parseInt(tuneSecs.value, 10);
+  if (!isFinite(w) || !isFinite(s)) return;
+  for (const [param, value] of [
+    ['power_threshold_watts', w],
+    ['power_threshold_duration_s', s],
+  ]) {
     window.webxdc.sendUpdate({
       payload: {
         request: {
           device: state.active, action: 'set_param',
-          param: 'power_threshold_watts', value: w,
+          param, value, persist: persist || undefined,
           ts: Math.floor(Date.now() / 1000),
         }
       }
     }, '');
-    window.webxdc.sendUpdate({
-      payload: {
-        request: {
-          device: state.active, action: 'set_param',
-          param: 'power_threshold_duration_s', value: s,
-          ts: Math.floor(Date.now() / 1000),
-        }
-      }
-    }, '');
-  });
+  }
+  if (tuneStatus) {
+    tuneStatus.textContent = persist
+      ? 'Saved to devices.json (will survive bot restart).'
+      : 'Applied (in-memory; lost on bot restart).';
+    setTimeout(() => { if (tuneStatus) tuneStatus.textContent = ''; }, 4000);
+  }
 }
+
+if (tuneApply) tuneApply.addEventListener('click', () => _sendTune(false));
+if (tuneSave)  tuneSave.addEventListener('click',  () => _sendTune(true));
 
 function render() {
   const names = Object.keys(state.devices).sort();
@@ -198,6 +205,34 @@ function render() {
   renderRulesList(dev);
   renderEnergySummary(dev);
   renderTuningInputs(dev);
+  renderDailyBars(dev);
+}
+
+function renderDailyBars(dev) {
+  if (!dailyBars) return;
+  const days = dev.daily_energy_wh;
+  if (!Array.isArray(days) || days.length < 2) {
+    dailyBars.innerHTML = '';
+    if (dailyFoot) dailyFoot.textContent = '';
+    return;
+  }
+  // days is [[ts, wh], …] oldest first.
+  const W = 200, H = 36;
+  const maxWh = Math.max(1, ...days.map(d => d[1]));
+  const w = W / days.length;
+  let totalWh = 0;
+  const rects = days.map(([ts, wh], i) => {
+    totalWh += wh;
+    const h = (wh / maxWh) * (H - 2);
+    return `<rect x="${(i * w).toFixed(2)}" y="${(H - h).toFixed(2)}" `
+         + `width="${(w * 0.85).toFixed(2)}" height="${h.toFixed(2)}" `
+         + `fill="#5ac8fa"/>`;
+  }).join('');
+  dailyBars.innerHTML = rects + `<text x="${W - 2}" y="10" font-size="9" `
+    + `text-anchor="end" fill="#888">peak ${maxWh.toFixed(0)} Wh</text>`;
+  if (dailyFoot) {
+    dailyFoot.textContent = `30-day total: ${(totalWh / 1000).toFixed(2)} kWh`;
+  }
 }
 
 function fmtKwh(kwh) {

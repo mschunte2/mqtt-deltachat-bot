@@ -55,6 +55,11 @@ class Engine:
     # Optional History instance for SQLite-backed time series.
     history: Any = None
 
+    # Path to devices.json — used by the "Save" button on threshold tuning
+    # to persist param overrides across bot restarts. Optional; if None,
+    # the persist flag on set_param is silently ignored.
+    instances_path: Any = None  # str | Path | None
+
     # Filled in by set_bot() during on_start
     bot: Any = None
     accid: int = 0
@@ -386,6 +391,10 @@ class Engine:
                 summary = self._energy_summary(d.name, payload["fields"].get("aenergy"))
                 if summary is not None:
                     payload["energy"] = summary
+                # Last-30-days bar chart data.
+                payload["daily_energy_wh"] = self.history.daily_energy_kwh(
+                    d.name, _local_midnight(int(time.time())), days=30,
+                )
                 # Surface device-level params (incl. any in-memory overrides)
                 # so the app can show + edit thresholds.
                 params = dict(d.params)
@@ -609,8 +618,22 @@ class Engine:
             log.warning("rejecting set_param %s=%r (bad value)", param, raw)
             return
         self._param_overrides.setdefault(device_name, {})[param] = value
-        log.info("param override %s.%s=%r (in-memory; persists until restart)",
-                 device_name, param, value)
+        # Optional persistence: write devices.json atomically so the value
+        # survives a bot restart. Validation re-runs config.load on the
+        # rendered file before we commit; if it fails, we keep the
+        # in-memory override but don't promote.
+        persisted = False
+        if request.get("persist") is True:
+            try:
+                _persist_device_param(self._instances_path, device_name, param, value)
+                persisted = True
+                log.info("param %s.%s=%r persisted to %s",
+                         device_name, param, value, self._instances_path)
+            except Exception as ex:
+                log.exception("persist set_param failed: %s", ex)
+        log.info("param override %s.%s=%r (in-memory%s)",
+                 device_name, param, value,
+                 "; persisted" if persisted else "")
         # Reset any active threshold latch so the new limit takes effect cleanly.
         for key in [k for k in self._thresholds if k[0] == device_name]:
             self._thresholds[key] = _ThresholdState()
@@ -734,6 +757,42 @@ class Engine:
 
 
 # --- module-level helpers -------------------------------------------------
+
+def _persist_device_param(instances_path, device_name: str,
+                            param: str, value) -> None:
+    """Atomically rewrite devices.json with a single param updated for
+    one device. Validates the result still loads via config.load before
+    committing — on validation failure the original file is untouched.
+    """
+    if instances_path is None:
+        raise RuntimeError("no instances_path configured")
+    from pathlib import Path
+    p = Path(instances_path)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    devices = raw.get("devices") or []
+    found = False
+    for d in devices:
+        if d.get("name") == device_name:
+            d[param] = value
+            found = True
+            break
+    if not found:
+        raise KeyError(f"device {device_name!r} not in {p}")
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    # Validate parses cleanly via config.load before swapping.
+    from config import load as _cfg_load
+    try:
+        _cfg_load(devices_dir=p.parent / "devices", instances_file=tmp)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    import os
+    os.replace(tmp, p)
+
 
 def _action_verb(action: str) -> str:
     """Human-readable verb for trigger_messages. Used as {action_verb} in templates."""

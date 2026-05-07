@@ -572,6 +572,72 @@ month's first hour).
   shutdown hook to flush the in-minute buffer; basicConfig logging
   fix; the `<script src=webxdc.js>` fix; `/help` and `/id` bypass the
   allow-list; `/help` auto-posts on member-add. ~79 tests.
+- 2026-05-07 v1.2 — same-day. Parallel scheduled rules per
+  (device, target_action), keyed by stable rule_id derived from
+  policy contents. Each rule fires independently; redundant fires
+  are intentionally posted to chat (audit trail > silence). New
+  trigger templates use `{action_verb}`, `{threshold}`,
+  `{duration_human}`, `{window_human}` so messages spell out which
+  rule tripped and why. App grows two `<details>` sections (Auto-off
+  rules / Auto-on rules) with × delete buttons + Add-rule forms.
+- 2026-05-07 v1.3 — same-day. Maximalist data capture into SQLite:
+  `samples_raw` (every status/switch:0 verbatim, lossless) and
+  `energy_minute` (Shelly's authoritative `aenergy.by_minute[1..2]`
+  in mWh per minute boundary). `energy_consumed_in` does a
+  per-minute hybrid in one SQL query — energy_minute first,
+  power_minute fallback for minutes without by_minute coverage.
+  Parser became more permissive: `30 min`, `1 hour`, `200 Wh in 30
+  min`, `5 W in 60 sec`, `1 day`, etc. all parse (multi-token
+  durations + verbose unit names). Energy summary entries report
+  `partial_since_ts` so the app can mark a `*` when our window data
+  starts later than requested. `/all <verb>` chat shortcut acts on
+  every visible device. App grows a 30-day daily-energy bar chart.
+  Threshold tuning from the app can now persist to `devices.json`
+  via a `set_param` request with `persist: true`.
+
+## Performance + tuning
+
+- `status_update_interval` on the Shelly plug (default ~60 s,
+  minimum 1 s) controls how often `status/switch:0` arrives. We
+  recommend **15 s**: ~4× the default detail in `apower` curves +
+  `samples_raw`, but still very modest MQTT traffic and disk usage.
+  At 15 s with two plugs, samples_raw grows ~70 MB/year. The
+  authoritative `aenergy.by_minute` data is unaffected (always
+  per-minute regardless of update cadence).
+- SQLite WAL mode is enabled. Concurrent readers don't block
+  the writer. The bot has one writer (engine) and occasional readers
+  (history queries from snapshot_for / handle_history_request).
+- Read methods short-circuit on `self._closed` so the MQTT thread
+  draining its inbox after shutdown doesn't ProgrammingError.
+
+## webxdc app — section order
+
+The app is a single page; sections from top to bottom:
+
+1. Header — device picker + online dot
+2. State card — current ON/OFF + apower + aenergy
+3. On / Off / Toggle buttons
+4. Power chart (live or windowed) with daily-energy bars below
+5. Energy consumed (8-row grid)
+6. Auto-off rules (open by default — most-used surface)
+7. Auto-on rules
+8. Recent events (collapsed; on-open fetches last 50)
+9. Tuning · power threshold (Apply = in-memory; Save = persists
+   to devices.json on the bot host)
+10. Footer
+
+## Icon
+
+`icon.svg` is the source of truth. `icon.png` is committed alongside
+because the Pi doesn't ship with ImageMagick and we want fresh
+clones to render the icon without an extra apt-get. Regeneration:
+
+```sh
+cd devices/shelly_plug/app
+convert -background none -density 256 icon.svg -resize 256x256 icon.png
+```
+
+Run after editing the SVG.
 - Designed iteratively in conversation. Notable course corrections:
   - Generic engine + class-as-data was chosen over a Shelly-specific
     bot, paying ~80 LoC up front to make adding a second device
