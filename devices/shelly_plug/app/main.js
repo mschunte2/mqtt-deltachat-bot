@@ -321,12 +321,18 @@ function renderEvents(rows) {
 
 function renderSparkline() {
   // Live mode: client-side ring buffer (last 5 min).
-  // Window mode: server-pushed history (6h/12h/24h/31d).
-  let pts;     // [[ts, w], ...]
+  // Window mode: server-pushed history (1h/6h/12h/24h/31d).
+  // The x-axis is anchored to the REQUESTED window, not the data span.
+  // So if you ask for 31d and only have 1d of data, the line shows on
+  // the right ~1/31 of the canvas — not stretched across.
+  let pts;        // [[ts, w, out|null], ...]
   let footText = '';
+  let xMin, xMax; // x-axis bounds in unix seconds (REQUESTED window)
   if (state.historyWindow === 0) {
     const hist = (state.history[state.active] || []).slice();
     pts = hist.map(s => [s.ts, s.power, s.out]);
+    xMax = Math.floor(Date.now() / 1000);
+    xMin = xMax - SAMPLES_MAX_AGE;
     footText = pts.length ? `${pts.length} samples (live)` : '(live, waiting…)';
   } else {
     const sh = state.serverHistory[state.active];
@@ -335,6 +341,10 @@ function renderSparkline() {
       footText = '(loading…)';
     } else {
       pts = sh.power_points;
+      xMin = (typeof sh.since_ts === 'number') ? sh.since_ts
+            : (pts.length ? pts[0][0] : Math.floor(Date.now() / 1000));
+      xMax = (typeof sh.until_ts === 'number') ? sh.until_ts
+            : (pts.length ? pts[pts.length - 1][0] : Math.floor(Date.now() / 1000));
       // Authoritative total from the bot's hybrid energy_consumed_in
       // (energy_minute first, power_minute fallback). Falls back to the
       // older energy_hour delta for old responses without total_wh.
@@ -357,8 +367,10 @@ function renderSparkline() {
     chartFoot.textContent = footText;
     return;
   }
-  const tMin = pts[0][0];
-  const tMax = pts[pts.length - 1][0];
+  // tSpan is the WINDOW span, not the data span. So sparse data renders
+  // at its actual position, not stretched.
+  const tMin = xMin;
+  const tMax = xMax;
   const tSpan = Math.max(1, tMax - tMin);
   const pMax = Math.max(1, ...pts.map(p => p[1]));
   const W = 200, H = 60;

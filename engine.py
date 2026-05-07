@@ -84,6 +84,45 @@ class Engine:
         self.bot = bot
         self.accid = accid
 
+    def rehydrate_rules_from_history(self) -> None:
+        """After scheduler.load_persisted(), backfill consumed-rule sample
+        buffers and idle-rule below-since timestamps from the SQLite
+        history. Without this, every bot restart effectively reset rule
+        timers — a 'off when used <5Wh in 10m' rule wouldn't fire for
+        another 10 minutes after a restart, even if the actual last 10
+        minutes had no power draw at all.
+
+        Called from bot._on_start between scheduler.load_persisted() and
+        scheduler.start(). The scheduler thread isn't running yet, so it's
+        safe to mutate job state directly.
+        """
+        if self.history is None:
+            return
+        now = int(time.time())
+        for job in self.scheduler.all_jobs():
+            if job.has_consumed() and job.consumed_field == "apower":
+                since = now - job.consumed_window_s
+                rows = self.history.query_power_raw(job.device_name, since, now)
+                if not rows:
+                    continue
+                for ts, apower, _output, _count in rows:
+                    job._samples.append((ts, apower))
+                # Mark the window as having been "tracked since" the
+                # earliest sample we just loaded so integrate_wh evaluates
+                # immediately on the next tick.
+                job._consumed_started_at = rows[0][0]
+                log.info("rehydrated consumed rule %s/%s with %d samples",
+                         job.device_name, job.rule_id, len(rows))
+            if job.has_idle() and job.idle_field == "apower":
+                since = now - job.idle_duration_s
+                rows = self.history.query_power_raw(job.device_name, since, now)
+                if rows and all(r[1] < job.idle_threshold for r in rows):
+                    job._below_since = rows[0][0]
+                    log.info("rehydrated idle rule %s/%s — power has been "
+                             "below %.1fW since %d (continuous in history)",
+                             job.device_name, job.rule_id,
+                             job.idle_threshold, rows[0][0])
+
     def _build_topic_lookup(self) -> None:
         self._topic_lookup.clear()
         for d in self.cfg.devices.values():

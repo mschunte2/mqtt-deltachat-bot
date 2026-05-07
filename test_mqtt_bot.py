@@ -936,6 +936,68 @@ class TestEngineOnFire(unittest.TestCase):
         text = e.list_rules(12)
         self.assertIn("no rules", text)
 
+    def test_rehydrate_consumed_rule_from_history(self):
+        e = _build_engine_with_class()
+        e.history = history_mod.History(
+            Path(tempfile.mkdtemp()) / "h.sqlite", retention_days=0)
+        try:
+            now = int(time.time())
+            # Fill power_minute with a quiet last 30 min (avg 1 W per minute).
+            for i in range(30):
+                e.history._db.execute(
+                    "INSERT INTO power_minute (device, ts, avg_apower_w, sample_count) "
+                    "VALUES ('kitchen', ?, 1.0, 1)",
+                    (now - (30 - i) * 60,),
+                )
+            e.history._db.commit()
+            # Schedule a consumed rule (would need the full window to elapse
+            # before being able to fire under the original logic).
+            from scheduler import ScheduledJob
+            e.scheduler.schedule(ScheduledJob(
+                device_name="kitchen", chat_id_origin=12, target_action="off",
+                rule_id="consumed:200Wh:1800s",
+                consumed_field="apower", consumed_threshold_wh=200.0,
+                consumed_window_s=1800,
+                _consumed_started_at=now,  # as if loaded from disk
+            ))
+            e.rehydrate_rules_from_history()
+            # The job's _samples should now hold ~30 entries and
+            # _consumed_started_at should have been backdated to the oldest
+            # sample, so integrate_wh can evaluate immediately on next tick.
+            jobs = e.scheduler.jobs_for_device("kitchen")
+            self.assertEqual(len(jobs), 1)
+            j = jobs[0]
+            self.assertGreaterEqual(len(j._samples), 25)  # close to 30
+            self.assertLess(j._consumed_started_at, now - 1500)
+        finally:
+            e.history.close()
+
+    def test_rehydrate_idle_rule_backdates_below_since(self):
+        e = _build_engine_with_class()
+        e.history = history_mod.History(
+            Path(tempfile.mkdtemp()) / "h.sqlite", retention_days=0)
+        try:
+            now = int(time.time())
+            # 5 minutes of low power → idle rule should backdate _below_since.
+            for i in range(5):
+                e.history._db.execute(
+                    "INSERT INTO power_minute (device, ts, avg_apower_w, sample_count) "
+                    "VALUES ('kitchen', ?, 0.5, 1)",
+                    (now - (5 - i) * 60,),
+                )
+            e.history._db.commit()
+            from scheduler import ScheduledJob
+            e.scheduler.schedule(ScheduledJob(
+                device_name="kitchen", chat_id_origin=12, target_action="off",
+                rule_id="idle:5W:60s",
+                idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+                _below_since=None,
+            ))
+            e.rehydrate_rules_from_history()
+            j = e.scheduler.jobs_for_device("kitchen")[0]
+            self.assertIsNotNone(j._below_since)
+            self.assertLess(j._below_since, now - 240)  # ≥4 min ago
+
     def test_list_rules_unknown_device(self):
         e = _build_engine_with_class()
         text = e.list_rules(12, "ghost")

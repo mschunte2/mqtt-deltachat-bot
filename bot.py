@@ -539,11 +539,11 @@ def _on_start(bot, _args):
         return
     accid = accounts[0]
     engine.set_bot(bot, accid)
-    # Restore any rules that were pending across the bot restart. Done
-    # AFTER set_bot so any in-memory housekeeping has the bot ref it
-    # needs, BEFORE scheduler.start() so the timer thread sees the
-    # restored state on its first iteration.
+    # Restore any rules that were pending across the bot restart, then
+    # backfill their evaluation buffers from history so they don't have
+    # to wait a fresh window before being able to fire.
     scheduler.load_persisted()
+    engine.rehydrate_rules_from_history()
     mqtt.start()
     scheduler.start()
     bot.logger.info(
