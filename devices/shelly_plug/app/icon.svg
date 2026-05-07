@@ -1,9 +1,19 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
-  <!-- Background -->
-  <rect width="64" height="64" rx="14" fill="#34c759"/>
-  <!-- Power symbol: U-shape + vertical line -->
-  <g fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round">
-    <path d="M22,28 a14 14 0 1 0 20 0"/>
-    <path d="M32,12 v18"/>
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title desc">
+  <title id="title">Smart home power plug logo</title>
+  <desc id="desc">House silhouette with a plug and wireless signal cutout, indicating a home automation app for switching power outlets.</desc>
+  <g transform="translate(128, 138)">
+    <!-- House silhouette -->
+    <path d="M -88 -20 L 0 -94 L 88 -20 L 88 84 L -88 84 Z" fill="#dc2626"/>
+    <!-- Prongs -->
+    <rect x="-16" y="-40" width="8" height="24" rx="2" fill="#ffffff"/>
+    <rect x="8"  y="-40" width="8" height="24" rx="2" fill="#ffffff"/>
+    <!-- Plug body -->
+    <rect x="-29" y="-16" width="58" height="48" rx="6" fill="#ffffff"/>
+    <!-- Wireless signal arcs above prongs -->
+    <path d="M -29 -50 Q -4 -68 21 -50" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round"/>
+    <path d="M -42 -63 Q -4 -89 34 -63" fill="none" stroke="#ffffff" stroke-width="4" stroke-linecap="round" opacity="0.55"/>
+    <!-- Cable -->
+    <rect x="-4" y="32" width="8" height="28" fill="#ffffff"/>
   </g>
 </svg>
