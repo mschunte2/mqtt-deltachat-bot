@@ -234,6 +234,8 @@ class History:
     def query_power(self, device: str, since_ts: int, until_ts: int,
                     max_points: int = 200,
                     ) -> tuple[int, list[tuple[int, float, int | None]]]:
+        if self._closed:
+            return (60, [])
         """Return (bucket_seconds, [(ts, avg_w, output), ...]) for the window.
 
         `output` for a bucket is MAX(output) over its underlying minute
@@ -269,6 +271,8 @@ class History:
         Caller can compute per-hour consumption as deltas between
         consecutive points.
         """
+        if self._closed:
+            return []
         with self._lock:
             cur = self._db.execute(
                 "SELECT ts, aenergy_wh FROM energy_hour "
@@ -282,6 +286,8 @@ class History:
     def query_power_raw(self, device: str, since_ts: int, until_ts: int
                         ) -> list[tuple[int, float, int | None, int]]:
         """Un-bucketed minute rows for the window. Used for CSV export."""
+        if self._closed:
+            return []
         with self._lock:
             cur = self._db.execute(
                 "SELECT ts, avg_apower_w, output, sample_count FROM power_minute "
@@ -298,6 +304,8 @@ class History:
         Returns None if no snapshot at or after target_ts exists. Used to
         compute "Wh consumed since T" via current_aenergy - aenergy_at(T).
         """
+        if self._closed:
+            return None
         with self._lock:
             row = self._db.execute(
                 "SELECT aenergy_wh FROM energy_hour "
@@ -316,7 +324,7 @@ class History:
         oldest sample we actually have inside the window (None if the
         window is empty).
         """
-        if until_ts <= since_ts:
+        if self._closed or until_ts <= since_ts:
             return (0.0, None)
         with self._lock:
             authoritative = self._db.execute(
@@ -345,6 +353,8 @@ class History:
     def query_energy_minute(self, device: str, since_ts: int, until_ts: int
                              ) -> list[tuple[int, float]]:
         """Per-minute Wh-equivalent (returned as mWh from Shelly's by_minute)."""
+        if self._closed:
+            return []
         with self._lock:
             cur = self._db.execute(
                 "SELECT ts, energy_mwh FROM energy_minute "
@@ -356,6 +366,8 @@ class History:
     def query_samples_raw(self, device: str, since_ts: int, until_ts: int
                            ) -> list[tuple]:
         """Lossless dump of every status update in the window."""
+        if self._closed:
+            return []
         with self._lock:
             cur = self._db.execute(
                 "SELECT ts, apower_w, voltage_v, current_a, freq_hz, "
@@ -369,6 +381,8 @@ class History:
     def query_events(self, device: str, since_ts: int, until_ts: int,
                      limit: int = 500) -> list[tuple[int, str, str, str]]:
         """Return [(ts, suffix, kind, payload), ...] for the window."""
+        if self._closed:
+            return []
         with self._lock:
             cur = self._db.execute(
                 "SELECT ts, suffix, kind, payload FROM events "
