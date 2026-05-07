@@ -10,10 +10,10 @@ sense and is almost always a typo.
 
 import re
 
-_TOKEN_RE = re.compile(r"(\d+)\s*([hms])", re.IGNORECASE)
-_FULL_RE = re.compile(r"^(?:\s*\d+\s*[hms]\s*)+$", re.IGNORECASE)
+_TOKEN_RE = re.compile(r"(\d+)\s*([dhms])", re.IGNORECASE)
+_FULL_RE = re.compile(r"^(?:\s*\d+\s*[dhms]\s*)+$", re.IGNORECASE)
 
-_MULT = {"h": 3600, "m": 60, "s": 1}
+_MULT = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 
 
 def parse(text: str) -> int:

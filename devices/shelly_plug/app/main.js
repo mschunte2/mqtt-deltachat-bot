@@ -18,6 +18,7 @@ const stateText = $('state-text');
 const statePower = $('state-power');
 const stateEnergy = $('state-energy');
 const sparkline = $('sparkline');
+const bars = $('bars');
 const chartMax = $('chart-max');
 const chartFoot = $('chart-foot');
 const windowPick = $('window-pick');
@@ -25,6 +26,10 @@ const lastUpdate = $('last-update');
 const autoStatus = $('auto-status');
 const btnApply = $('btn-apply');
 const btnCancel = $('btn-cancel');
+const eventsList = $('events-list');
+const tuneWatts = $('tune-watts');
+const tuneSecs = $('tune-secs');
+const tuneApply = $('tune-apply');
 
 function activeDevice() { return state.devices[state.active] || null; }
 
@@ -103,6 +108,55 @@ function requestHistory() {
   }, '');
 }
 
+function requestEvents() {
+  if (!state.active) return;
+  window.webxdc.sendUpdate({
+    payload: {
+      request: {
+        device: state.active,
+        action: 'events',
+        window_seconds: 7 * 86400,
+        limit: 50,
+        ts: Math.floor(Date.now() / 1000),
+      }
+    }
+  }, '');
+}
+
+const recentEventsEl = document.querySelector('details.recent-events');
+if (recentEventsEl) {
+  recentEventsEl.addEventListener('toggle', () => {
+    if (recentEventsEl.open) requestEvents();
+  });
+}
+
+if (tuneApply) {
+  tuneApply.addEventListener('click', () => {
+    if (!state.active) return;
+    const w = parseFloat(tuneWatts.value);
+    const s = parseInt(tuneSecs.value, 10);
+    if (!isFinite(w) || !isFinite(s)) return;
+    window.webxdc.sendUpdate({
+      payload: {
+        request: {
+          device: state.active, action: 'set_param',
+          param: 'power_threshold_watts', value: w,
+          ts: Math.floor(Date.now() / 1000),
+        }
+      }
+    }, '');
+    window.webxdc.sendUpdate({
+      payload: {
+        request: {
+          device: state.active, action: 'set_param',
+          param: 'power_threshold_duration_s', value: s,
+          ts: Math.floor(Date.now() / 1000),
+        }
+      }
+    }, '');
+  });
+}
+
 function render() {
   const names = Object.keys(state.devices).sort();
   // Re-populate picker only when set changes
@@ -140,6 +194,101 @@ function render() {
   }
   renderSparkline();
   renderAutoStatus(dev);
+  renderEnergySummary(dev);
+  renderTuningInputs(dev);
+}
+
+function fmtKwh(kwh) {
+  if (kwh == null) return '—';
+  if (kwh < 0.01) return `${(kwh * 1000).toFixed(1)} Wh`;
+  return `${kwh.toFixed(2)} kWh`;
+}
+
+function renderEnergySummary(dev) {
+  const e = dev.energy;
+  const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
+  if (!e) {
+    ['kwh-last-hour','kwh-today','kwh-last-24h','kwh-this-week',
+     'kwh-last-7d','kwh-this-month','kwh-last-30d','kwh-total']
+      .forEach(id => set(id, '—'));
+    return;
+  }
+  set('kwh-last-hour',  fmtKwh(e.kwh_last_hour));
+  set('kwh-today',      fmtKwh(e.kwh_today));
+  set('kwh-last-24h',   fmtKwh(e.kwh_last_24h));
+  set('kwh-this-week',  fmtKwh(e.kwh_this_week));
+  set('kwh-last-7d',    fmtKwh(e.kwh_last_7d));
+  set('kwh-this-month', fmtKwh(e.kwh_this_month));
+  set('kwh-last-30d',   fmtKwh(e.kwh_last_30d));
+  set('kwh-total',
+      e.current_total_wh != null ? fmtKwh(e.current_total_wh / 1000) : '—');
+}
+
+function renderTuningInputs(dev) {
+  const params = dev.params || {};
+  if (typeof params.power_threshold_watts === 'number'
+      && document.activeElement !== tuneWatts) {
+    tuneWatts.value = params.power_threshold_watts;
+  }
+  if (typeof params.power_threshold_duration_s === 'number'
+      && document.activeElement !== tuneSecs) {
+    tuneSecs.value = params.power_threshold_duration_s;
+  }
+}
+
+function renderBars(energyPoints) {
+  if (!bars) return;
+  if (!Array.isArray(energyPoints) || energyPoints.length < 2) {
+    bars.innerHTML = '';
+    return;
+  }
+  // Compute Wh deltas between consecutive snapshots; clamp negatives to 0
+  // (counter resets shouldn't render as negative bars).
+  const deltas = [];
+  for (let i = 1; i < energyPoints.length; i++) {
+    const t = energyPoints[i][0];
+    const dWh = Math.max(0, energyPoints[i][1] - energyPoints[i - 1][1]);
+    deltas.push({ t, wh: dWh });
+  }
+  if (!deltas.length) { bars.innerHTML = ''; return; }
+  // For 31d window we have ~744 bars; downsample to ~30 daily buckets.
+  const span = deltas[deltas.length - 1].t - deltas[0].t;
+  let dec = 1;
+  if (deltas.length > 60) dec = Math.ceil(deltas.length / 60);
+  const bucketed = [];
+  for (let i = 0; i < deltas.length; i += dec) {
+    let sum = 0, count = 0, t = deltas[i].t;
+    for (let j = i; j < Math.min(i + dec, deltas.length); j++) {
+      sum += deltas[j].wh; count++;
+    }
+    bucketed.push({ t, wh: sum });
+  }
+  const W = 200, H = 36;
+  const maxWh = Math.max(1, ...bucketed.map(b => b.wh));
+  const w = W / bucketed.length;
+  const rects = bucketed.map((b, i) => {
+    const h = (b.wh / maxWh) * (H - 2);
+    return `<rect x="${(i * w).toFixed(2)}" y="${(H - h).toFixed(2)}" `
+         + `width="${(w * 0.85).toFixed(2)}" height="${h.toFixed(2)}" `
+         + `fill="#5ac8fa"/>`;
+  }).join('');
+  bars.innerHTML = rects + `<text x="${W - 2}" y="10" font-size="9" `
+    + `text-anchor="end" fill="#888">max ${maxWh.toFixed(0)} Wh</text>`;
+}
+
+function renderEvents(rows) {
+  if (!eventsList) return;
+  if (!rows || !rows.length) {
+    eventsList.textContent = '(no events recorded yet)';
+    return;
+  }
+  eventsList.innerHTML = rows.slice(0, 50).map(r => {
+    const d = new Date(r.ts * 1000);
+    const stamp = d.toLocaleString();
+    const kind = r.kind || '(unknown)';
+    return `<div class="ev"><span class="ts">${stamp}</span>`
+         + `<span class="kind">${kind}</span></div>`;
+  }).join('');
 }
 
 function renderSparkline() {
@@ -252,14 +401,21 @@ function appendSample(name, ts, power, output) {
 window.webxdc.setUpdateListener((update) => {
   const p = update.payload;
   if (!p) return;
-  // History response: {history: {device, window_seconds, bucket_seconds,
-  //                              power_points, energy_points, ...}}
+  // History response.
   if (p.history && p.history.device) {
     state.serverHistory[p.history.device] = p.history;
     renderSparkline();
+    if (p.history.device === state.active) {
+      renderBars(p.history.energy_points);
+    }
     return;
   }
-  // Regular snapshot: {class, devices, server_ts}
+  // Events response.
+  if (p.events && p.events.device) {
+    if (p.events.device === state.active) renderEvents(p.events.rows);
+    return;
+  }
+  // Regular snapshot.
   if (!p.devices) return;
   state.devices = p.devices;
   const ts = p.server_ts || Math.floor(Date.now() / 1000);

@@ -38,10 +38,16 @@ class TestDurations(unittest.TestCase):
         self.assertEqual(durations.parse(" 30s "), 30)
 
     def test_invalid(self):
-        for bad in ["", "30", "tomorrow", "30x", "1d", "0s", "0m"]:
+        for bad in ["", "30", "tomorrow", "30x", "0s", "0m"]:
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     durations.parse(bad)
+
+    def test_days(self):
+        # `d` is accepted (added so /<dev> export 7d works)
+        self.assertEqual(durations.parse("1d"), 86400)
+        self.assertEqual(durations.parse("7d"), 7 * 86400)
+        self.assertEqual(durations.parse("1d12h"), 86400 + 12 * 3600)
 
     def test_format(self):
         self.assertEqual(durations.format(0), "0s")
@@ -716,6 +722,69 @@ class TestEngineSnapshot(unittest.TestCase):
         # chat 99 is not in ALLOWED_CHATS and not in device.allowed_chats
         self.assertIsNone(e.snapshot_for(99, "tplug"))
 
+    def test_snapshot_includes_params_when_history_present(self):
+        e = _build_engine_with_class()
+        e.history = history_mod.History(
+            Path(tempfile.mkdtemp()) / "h.sqlite", retention_days=0)
+        try:
+            snap = e.snapshot_for(12, "tplug")
+            params = snap["devices"]["kitchen"].get("params") or {}
+            self.assertEqual(params.get("power_threshold_watts"), 1500)
+        finally:
+            e.history.close()
+
+
+class TestEngineSetParam(unittest.TestCase):
+    def _make(self):
+        e = _build_engine_with_class()
+        # The webxdc class lookup is short-circuited; engine's set_param
+        # path runs without it.
+        e.webxdc = _StubWebxdc()
+        return e
+
+    def test_override_applied(self):
+        e = self._make()
+        e._handle_set_param_request(
+            12, "kitchen",
+            {"param": "power_threshold_watts", "value": 200},
+        )
+        self.assertEqual(
+            e._param_overrides["kitchen"]["power_threshold_watts"], 200)
+
+    def test_override_rejects_unknown_param(self):
+        e = self._make()
+        e._handle_set_param_request(
+            12, "kitchen", {"param": "nope", "value": 42})
+        self.assertNotIn("kitchen", e._param_overrides)
+
+    def test_override_rejects_negative(self):
+        e = self._make()
+        e._handle_set_param_request(
+            12, "kitchen",
+            {"param": "power_threshold_watts", "value": -5})
+        self.assertNotIn("kitchen", e._param_overrides)
+
+    def test_override_overrides_threshold_evaluation(self):
+        e = self._make()
+        # Override to a low limit so a small power triggers the rule.
+        e._handle_set_param_request(
+            12, "kitchen",
+            {"param": "power_threshold_watts", "value": 50},
+        )
+        e._handle_set_param_request(
+            12, "kitchen",
+            {"param": "power_threshold_duration_s", "value": 1},
+        )
+        # Run two on_mqtt_message calls with apower=100 across the duration
+        topic = "p/kitchen/status/switch:0"
+        e.on_mqtt_message(topic, json.dumps({"output": True, "apower": 100}).encode())
+        ts_state = e._thresholds[("kitchen", "apower")]
+        ts_state.above_since = int(time.time()) - 5  # past the 1s threshold
+        e.on_mqtt_message(topic, json.dumps({"output": True, "apower": 100}).encode())
+        sent = [t for _, t in e.bot.rpc.sent]
+        self.assertTrue(any("drew" in (t or "") for t in sent),
+                        f"expected ⚠️ drew message; got {sent}")
+
 
 # --- history -------------------------------------------------------------
 
@@ -837,6 +906,35 @@ class TestHistory(unittest.TestCase):
                               [p[0] for p in all_pts])
         finally:
             h.close()
+
+    def test_aenergy_at(self):
+        # Insert hourly snapshots
+        self.h.write_sample("k", 0,    None, 100.0)
+        self.h.write_sample("k", 3700, None, 150.0)
+        self.h.write_sample("k", 7300, None, 220.0)
+        # Asking for ts within first hour returns first snapshot
+        self.assertEqual(self.h.aenergy_at("k", 0), 100.0)
+        # Asking exactly at second hour boundary returns that snapshot
+        self.assertEqual(self.h.aenergy_at("k", 3600), 150.0)
+        # Asking after the last snapshot returns None
+        self.assertIsNone(self.h.aenergy_at("k", 10000))
+
+    def test_query_power_raw(self):
+        self.h.write_sample("k", 60,  10.0, None, output=True)
+        self.h.write_sample("k", 70,  20.0, None, output=True)  # same minute
+        self.h.write_sample("k", 130, 30.0, None, output=False) # next minute
+        self.h.flush_pending_minutes(now=200)
+        rows = self.h.query_power_raw("k", 0, 200)
+        self.assertEqual(len(rows), 2)
+        # First row: minute 60, avg of 10 and 20 = 15, output=on, count=2
+        self.assertEqual(rows[0][0], 60)
+        self.assertAlmostEqual(rows[0][1], 15.0)
+        self.assertEqual(rows[0][2], 1)
+        self.assertEqual(rows[0][3], 2)
+        # Second: minute 120, single sample 30, output=off, count=1
+        self.assertEqual(rows[1][0], 120)
+        self.assertEqual(rows[1][2], 0)
+        self.assertEqual(rows[1][3], 1)
 
     def test_retention_zero_keeps_forever(self):
         h = history_mod.History(self.tmp / "h3.sqlite", retention_days=0)

@@ -181,6 +181,33 @@ class History:
             rows = cur.fetchall()
         return [(int(t), float(e)) for t, e in rows]
 
+    def query_power_raw(self, device: str, since_ts: int, until_ts: int
+                        ) -> list[tuple[int, float, int | None, int]]:
+        """Un-bucketed minute rows for the window. Used for CSV export."""
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT ts, avg_apower_w, output, sample_count FROM power_minute "
+                "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
+                (device, int(since_ts), int(until_ts)),
+            )
+            rows = cur.fetchall()
+        return [(int(t), float(w), int(o) if o is not None else None, int(c))
+                for t, w, o, c in rows]
+
+    def aenergy_at(self, device: str, target_ts: int) -> float | None:
+        """Cumulative aenergy.total (Wh) at the earliest snapshot >= target_ts.
+
+        Returns None if no snapshot at or after target_ts exists. Used to
+        compute "Wh consumed since T" via current_aenergy - aenergy_at(T).
+        """
+        with self._lock:
+            row = self._db.execute(
+                "SELECT aenergy_wh FROM energy_hour "
+                "WHERE device=? AND ts >= ? ORDER BY ts ASC LIMIT 1",
+                (device, int(target_ts)),
+            ).fetchone()
+        return float(row[0]) if row else None
+
     def query_events(self, device: str, since_ts: int, until_ts: int,
                      limit: int = 500) -> list[tuple[int, str, str, str]]:
         """Return [(ts, suffix, kind, payload), ...] for the window."""

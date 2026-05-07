@@ -63,6 +63,10 @@ class Engine:
     _states: dict[str, state_mod.DeviceState] = field(default_factory=dict)
     _thresholds: dict[tuple[str, str], _ThresholdState] = field(default_factory=dict)
     _topic_lookup: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # In-memory overrides for device.params (e.g. power_threshold_watts);
+    # surface in /apps snapshot, set via webxdc {action:"set_param"}. Lost
+    # on bot restart by design — persistence is via devices.json.
+    _param_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # --- lifecycle --------------------------------------------------------
 
@@ -157,9 +161,11 @@ class Engine:
     def _fire_threshold(self, device: Device, rule: ChatEventRule, value: Any) -> None:
         if not isinstance(value, (int, float)):
             return
-        # Resolve per-device thresholds (skip rule entirely if device omits them)
-        limit = device.params.get(rule.limit_param)
-        duration = device.params.get(rule.duration_param)
+        # Resolve per-device thresholds, with in-memory override taking
+        # priority over devices.json. Skip rule entirely if neither set.
+        overrides = self._param_overrides.get(device.name, {})
+        limit = overrides.get(rule.limit_param, device.params.get(rule.limit_param))
+        duration = overrides.get(rule.duration_param, device.params.get(rule.duration_param))
         if limit is None or duration is None:
             return
         ts_state = self._thresholds.setdefault((device.name, rule.field), _ThresholdState())
@@ -284,6 +290,7 @@ class Engine:
             "  /<device> on for 1h or if idle     # on now + auto-off (timer or idle)\n"
             "  /<device> auto-on at 7h | at 7h daily\n"
             "  /<device> cancel-auto-off | cancel-auto-on | cancel-schedule\n"
+            "  /<device> export 7d                — CSV of power + energy history\n"
             "  /list                — list devices visible to this chat\n"
             "  /apps                — (re)deliver webxdc control apps\n"
             "  /id                  — show this chat's id\n"
@@ -334,18 +341,59 @@ class Engine:
         for d in visible:
             st = self._states.get(d.name)
             jobs = self.scheduler.jobs_for_device(d.name)
-            devices_payload[d.name] = {
+            payload = {
                 "name": d.name,
                 "description": d.description,
                 "fields": dict(st.fields) if st else {},
                 "last_update_ts": st.last_update_ts if st else 0,
                 "scheduled_jobs": [j.to_snapshot() for j in jobs],
             }
+            if self.history is not None:
+                summary = self._energy_summary(d.name, payload["fields"].get("aenergy"))
+                if summary is not None:
+                    payload["energy"] = summary
+                # Surface device-level params (incl. any in-memory overrides)
+                # so the app can show + edit thresholds.
+                params = dict(d.params)
+                params.update(self._param_overrides.get(d.name, {}))
+                payload["params"] = params
+            devices_payload[d.name] = payload
         return {
             "class": class_name,
             "devices": devices_payload,
             "server_ts": int(time.time()),
         }
+
+    def _energy_summary(self, device_name: str,
+                        current_wh: float | None) -> dict[str, Any] | None:
+        """Wh consumed in standard intervals, computed from hourly snapshots.
+
+        Returns None if there's no current reading. Each kwh_* is None when
+        we don't yet have a snapshot at-or-after the interval start (e.g.
+        the bot was deployed mid-week, so kwh_this_week is unknown until
+        next week).
+        """
+        if current_wh is None or self.history is None:
+            return None
+        now = int(time.time())
+        intervals = (
+            ("kwh_last_hour",  now - 3600),
+            ("kwh_last_24h",   now - 86400),
+            ("kwh_last_7d",    now - 7 * 86400),
+            ("kwh_last_30d",   now - 30 * 86400),
+            ("kwh_today",      _local_midnight(now)),
+            ("kwh_this_week",  _local_week_start(now)),
+            ("kwh_this_month", _local_month_start(now)),
+        )
+        out: dict[str, Any] = {"current_total_wh": float(current_wh)}
+        for key, since in intervals:
+            base = self.history.aenergy_at(device_name, since)
+            if base is None:
+                out[key] = None
+            else:
+                wh = max(0.0, float(current_wh) - float(base))
+                out[key] = wh / 1000.0
+        return out
 
     # --- webxdc inbound (called by bot.py from RawEvent hook) ------------
 
@@ -365,6 +413,12 @@ class Engine:
         # History query: read-only; reply only to the requesting msgid.
         if action == "history":
             self._handle_history_request(chat_id, msgid, device_name, request)
+            return
+        if action == "events":
+            self._handle_events_request(chat_id, msgid, device_name, request)
+            return
+        if action == "set_param":
+            self._handle_set_param_request(chat_id, device_name, request)
             return
 
         if action == "cancel-auto-off" or action == "cancel-auto-on" or action == "cancel-schedule":
@@ -441,6 +495,72 @@ class Engine:
             }
         }
         self.webxdc.push_to_msgid(self.bot, self.accid, msgid, body)
+
+    def _handle_events_request(self, chat_id: int, msgid: int,
+                                device_name: str, request: dict[str, Any]) -> None:
+        if self.history is None or self.bot is None:
+            return
+        device = self.cfg.devices.get(device_name)
+        if device is None or not permissions.chat_can_see(
+                chat_id, device, self.allowed_chats):
+            return
+        try:
+            limit = max(1, min(int(request.get("limit", 50)), 200))
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            window_seconds = int(request.get("window_seconds", 7 * 86400))
+        except (TypeError, ValueError):
+            window_seconds = 7 * 86400
+        until_ts = int(time.time())
+        since_ts = until_ts - max(60, min(window_seconds, 31 * 86400))
+        rows = self.history.query_events(device_name, since_ts, until_ts, limit=limit)
+        body = {
+            "events": {
+                "device": device_name,
+                "since_ts": since_ts,
+                "until_ts": until_ts,
+                "rows": [
+                    {"ts": ts, "suffix": suffix, "kind": kind, "payload": payload[:512]}
+                    for ts, suffix, kind, payload in rows
+                ],
+            }
+        }
+        self.webxdc.push_to_msgid(self.bot, self.accid, msgid, body)
+
+    def _handle_set_param_request(self, chat_id: int, device_name: str,
+                                   request: dict[str, Any]) -> None:
+        device = self.cfg.devices.get(device_name)
+        if device is None or not permissions.chat_can_see(
+                chat_id, device, self.allowed_chats):
+            return
+        # Whitelist of params the app may tune at runtime.
+        param = str(request.get("param", "")).strip()
+        if param not in {"power_threshold_watts", "power_threshold_duration_s"}:
+            log.warning("rejecting set_param for %r (not in whitelist)", param)
+            return
+        raw = request.get("value")
+        try:
+            # Coerce to int/float depending on canonical type from devices.json.
+            cur = device.params.get(param)
+            if isinstance(cur, int) or param.endswith("_s"):
+                value = int(raw)
+            else:
+                value = float(raw)
+            if value < 0:
+                raise ValueError("negative")
+        except (TypeError, ValueError):
+            log.warning("rejecting set_param %s=%r (bad value)", param, raw)
+            return
+        self._param_overrides.setdefault(device_name, {})[param] = value
+        log.info("param override %s.%s=%r (in-memory; persists until restart)",
+                 device_name, param, value)
+        # Reset any active threshold latch so the new limit takes effect cleanly.
+        for key in [k for k in self._thresholds if k[0] == device_name]:
+            self._thresholds[key] = _ThresholdState()
+        # Push a fresh snapshot so the app sees the updated params field.
+        if self.bot:
+            self.webxdc.push_filtered(self.bot, self.accid, self.snapshot_for)
 
     # --- helpers ----------------------------------------------------------
 
@@ -558,6 +678,23 @@ class Engine:
 
 
 # --- module-level helpers -------------------------------------------------
+
+def _local_midnight(now_ts: int) -> int:
+    lt = time.localtime(now_ts)
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)))
+
+
+def _local_week_start(now_ts: int) -> int:
+    """Local-time midnight of the most recent Monday (ISO week)."""
+    midnight = _local_midnight(now_ts)
+    lt = time.localtime(midnight)
+    return midnight - lt.tm_wday * 86400
+
+
+def _local_month_start(now_ts: int) -> int:
+    lt = time.localtime(now_ts)
+    return int(time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1)))
+
 
 def _fmt_secs(s: int) -> str:
     if s < 60:

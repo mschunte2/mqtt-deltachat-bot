@@ -487,11 +487,91 @@ falls back to the 1.x API if `CallbackAPIVersion` isn't importable.
 - **No rate-limiting on chat output.** A flapping plug produces one
   on/off message per state push. Acceptable for v1.
 
+## webxdc app gotchas (caught the hard way)
+
+- **`<script src="webxdc.js">` is mandatory.** The messenger only injects
+  `window.webxdc` when index.html explicitly loads `webxdc.js` (a virtual
+  URL the messenger intercepts). Without that script tag, `window.webxdc`
+  is undefined and the picker stays empty even though the bot is pushing
+  status updates correctly. Took us a debug pane to catch it; index.html
+  has a comment-band reminding future devs.
+- **`/apps` must seed the new instance.** Webxdc status updates are
+  per-msgid; the bot's MQTT-driven push only fires on inbound messages.
+  Without an explicit `webxdc.push_filtered(...)` after `send_apps`, a
+  newly-installed app sees nothing until the next plug status update —
+  and Shelly's `status/switch:0` is non-retained, so a quiet plug means
+  a blank UI for minutes. The `_handle_apps` path calls push_filtered
+  right after recording the new msgid.
+- **bot.py needs `logging.basicConfig`.** deltabot-cli only attaches a
+  Rich handler to its own logger; without basicConfig at the top of
+  bot.py, every `mqtt_bot.engine`/`scheduler`/`mqtt`/`history` log call
+  is silently dropped. We hit this trying to debug the empty-picker bug.
+
+## History (SQLite time series)
+
+`history.py` owns a single SQLite file at
+`~/.config/<BOT_NAME>/history.sqlite`:
+
+- `power_minute(device, ts, avg_apower_w, sample_count, output)` —
+  one row per minute per device. `output` is the relay state
+  (0/1/NULL); used to colour the chart red on off-segments.
+- `energy_hour(device, ts, aenergy_wh)` — cumulative aenergy.total
+  snapshot at the top of each hour (latest sample within the hour
+  wins).
+- `events(device, ts, suffix, kind, payload)` — raw events from
+  `events/rpc` topics. `kind` is the JSON `method` field if present.
+
+Engine.on_mqtt_message writes a sample on every `apower` / `aenergy`
+update and writes to `events` for `events/rpc` traffic. Engine.set_bot
+calls history.flush_pending_minutes via the SIGTERM handler in bot.py
+(systemd sends SIGTERM on stop).
+
+`RETENTION_DAYS` env var: `0` means keep forever, `>0` prunes
+power_minute / energy_hour / events older than N days, evaluated
+once per day on the next write.
+
+## Webxdc protocol — additional message types
+
+Beyond the v1 device snapshot and request shapes, the engine accepts:
+
+- `{action: "history", window_seconds: N}` → response carries
+  `power_points: [[ts, w, output], ...]` (3-tuples, `output` is
+  0/1/null) plus `energy_points: [[ts, wh], ...]` (hourly snapshots).
+  The app downsamples energy_points client-side into per-bucket bars.
+- `{action: "events", window_seconds: N, limit: K}` → response carries
+  `rows: [{ts, suffix, kind, payload}, …]` from the events table.
+- `{action: "set_param", param: "power_threshold_watts", value: N}` →
+  in-memory override of `device.params[param]`. Whitelisted to
+  `power_threshold_watts` and `power_threshold_duration_s`. Lost on
+  bot restart by design — persistence is via devices.json.
+
+The snapshot now also includes a per-device `energy` block:
+`{kwh_last_hour, kwh_today, kwh_last_24h, kwh_this_week, kwh_last_7d,
+kwh_this_month, kwh_last_30d, current_total_wh}`. Each kwh_* is `null`
+until we have an `energy_hour` snapshot at-or-after the interval start
+(so on a fresh deploy, "this month" sits at null until the next
+month's first hour).
+
+## Chat command additions
+
+- `/<device> export 7d` — bot dumps power_minute + energy_hour for the
+  window to a CSV and sends as a chat attachment. Window accepts
+  `s/m/h/d` (the d unit was added for this).
+
 ## Provenance and history
 
 - 2026-05-07 v1 baseline — initial commit `10477fe`. 11 Python
   modules, ~2,830 LoC, 57 tests, single device class
   (`shelly_plug`), one webxdc app, full deployment scripts.
+- 2026-05-07 v1.1 — committed in same session. Added: SQLite-backed
+  history (per-minute power, hourly energy, events table) with
+  RETENTION_DAYS knob; segmented red/green chart with a 0-line for
+  off periods; energy summary (last hour through lifetime); per-bucket
+  kWh bars; recent-events viewer; in-memory power-threshold tuning
+  from the app; `/<dev> export Nd` CSV chat command; SIGTERM
+  shutdown hook to flush the in-minute buffer; basicConfig logging
+  fix; the `<script src=webxdc.js>` fix; `/help` and `/id` bypass the
+  allow-list; `/help` auto-posts on member-add. ~79 tests.
 - Designed iteratively in conversation. Notable course corrections:
   - Generic engine + class-as-data was chosen over a Shelly-specific
     bot, paying ~80 LoC up front to make adding a second device

@@ -63,12 +63,38 @@ mqtt-bot/
 /<device> auto-on at 7h           # next 07:00 local
 /<device> auto-on at 7h daily     # recurring
 /<device> cancel-auto-off | cancel-auto-on | cancel-schedule
+/<device> export 7d               # CSV (power_minute + energy_hour) attached to chat
 
 /list           list devices visible to this chat
 /apps           (re)deliver webxdc control apps
 /id             show this chat's id (permission-free, needed for setup)
-/help           the above
+/help           command reference (permission-free)
 ```
+
+## History (SQLite time series)
+
+The bot persists a per-minute power average and an hourly cumulative
+energy snapshot per device under `~/.config/<BOT_NAME>/history.sqlite`.
+This drives:
+
+- **Webxdc app charts** — line chart over the selected window (live 5
+  min / 6h / 12h / 24h / 31d). Off-periods render as a red 0-line so
+  they're visually distinguishable from low-but-on usage.
+- **kWh-per-bucket bars** — below the line chart, showing energy
+  consumed in each interval bucket (downsampled to ≤60 bars).
+- **Energy summary** — last hour, today, last 24h, this week, last 7d,
+  this month, last 30d, lifetime.
+- **`/<device> export Nd`** — dumps both tables as CSV.
+- **Recent events viewer** — disclosure panel in the app showing the
+  last ~50 plug events from the events/rpc topic.
+- **In-memory power-threshold tuning** — the app's "Tuning" panel can
+  set `power_threshold_watts` / `_duration_s` overrides; lost on
+  restart, re-edit `devices.json` for permanence.
+
+`RETENTION_DAYS` env var: `0` (default) keeps forever; `>0` prunes
+older rows once per day. Storage is small — ~3 MB per device per
+month at 1 sample/min plus ~70 KB per device per month for hourly
+snapshots.
 
 Multi-clause example: `/kitchen on for 1h or until used <2Wh in 10m`
 turns on, then off whichever fires first — a hard 1-hour cap *or* the

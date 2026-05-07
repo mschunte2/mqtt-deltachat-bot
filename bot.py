@@ -66,6 +66,7 @@ from appdirs import user_config_dir  # noqa: E402
 from deltachat2 import EventType, MsgData, events  # noqa: E402
 from deltabot_cli import BotCli  # noqa: E402
 
+import durations  # noqa: E402
 import engine as engine_mod  # noqa: E402
 import scheduler as sched_mod  # noqa: E402
 from history import History  # noqa: E402
@@ -82,6 +83,22 @@ webxdc = WebxdcIO(state_dir=STATE_DIR, devices_dir=DEVICES_DIR)
 _RETENTION_DAYS = int((os.environ.get("RETENTION_DAYS") or "0").strip() or "0")
 history = History(db_path=STATE_DIR / "history.sqlite",
                   retention_days=_RETENTION_DAYS)
+
+
+# Flush the in-memory minute buffer on clean shutdown so a `systemctl
+# stop` doesn't lose up to ~60s of un-flushed power samples per device.
+def _on_shutdown(*_a) -> None:
+    try:
+        history.close()
+    except Exception:
+        log.exception("history close failed")
+    sys.exit(0)
+
+
+import atexit  # noqa: E402
+import signal  # noqa: E402
+atexit.register(_on_shutdown)
+signal.signal(signal.SIGTERM, _on_shutdown)
 scheduler = sched_mod.Scheduler(on_fire=lambda *a, **kw: engine.on_fire(*a, **kw))
 mqtt = MqttClient(
     host=os.environ.get("MQTT_HOST", "127.0.0.1"),
@@ -279,6 +296,10 @@ def _on_new_message(bot, accid, event):
             bot.rpc.send_msg(accid, chatid, MsgData(text=msg_text))
         return
 
+    if verb == "export":
+        _handle_export(bot, accid, chatid, device_name, rest)
+        return
+
     if verb in _SCHEDULE_VERBS:
         device = cfg.devices.get(device_name)
         if device is None:
@@ -352,6 +373,66 @@ def _resolve_cancel_target(device_name: str, verb: str) -> str | None:
     if verb == "cancel-auto-on" and cls.auto_on:
         return cls.auto_on.command
     return None  # cancel-schedule: cancel all jobs for the device
+
+
+def _handle_export(bot, accid: int, chatid: int, device_name: str, rest: str) -> None:
+    """Dump power_minute + energy_hour for a device to a CSV attachment."""
+    import csv
+    import datetime as _dt
+    import tempfile
+
+    device = cfg.devices.get(device_name)
+    if device is None:
+        bot.rpc.send_msg(accid, chatid, MsgData(text=f"unknown device: {device_name}"))
+        return
+    window_str = (rest or "7d").strip()
+    try:
+        window_seconds = durations.parse(window_str)
+    except ValueError as ex:
+        bot.rpc.send_msg(accid, chatid, MsgData(text=f"bad duration: {ex}"))
+        return
+    until_ts = int(time.time())
+    since_ts = until_ts - window_seconds
+    power_rows = history.query_power_raw(device_name, since_ts, until_ts)
+    energy_rows = history.query_energy(device_name, since_ts, until_ts)
+
+    if not power_rows and not energy_rows:
+        bot.rpc.send_msg(accid, chatid,
+                         MsgData(text=f"no history yet for {device_name} ({window_str})"))
+        return
+
+    fd, path = tempfile.mkstemp(suffix=".csv", prefix=f"{device_name}-{window_str}-")
+    try:
+        with os.fdopen(fd, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["unix_ts", "iso_time", "device", "kind",
+                        "avg_apower_w", "output", "sample_count", "aenergy_wh"])
+            for ts, apower, output, count in power_rows:
+                w.writerow([
+                    ts, _dt.datetime.fromtimestamp(ts).isoformat(),
+                    device_name, "power_minute",
+                    f"{apower:.3f}",
+                    "" if output is None else output,
+                    count, "",
+                ])
+            for ts, aenergy in energy_rows:
+                w.writerow([
+                    ts, _dt.datetime.fromtimestamp(ts).isoformat(),
+                    device_name, "energy_hour",
+                    "", "", "", f"{aenergy:.3f}",
+                ])
+        bot.rpc.send_msg(
+            accid, chatid,
+            MsgData(file=path,
+                    text=f"{device_name} export · {window_str} · "
+                         f"{len(power_rows)} minute samples · "
+                         f"{len(energy_rows)} hourly snapshots"),
+        )
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _handle_apps(bot, accid: int, chatid: int) -> None:

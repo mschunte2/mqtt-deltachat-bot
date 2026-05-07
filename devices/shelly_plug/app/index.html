@@ -47,7 +47,49 @@
     <svg id="sparkline" viewBox="0 0 200 60" preserveAspectRatio="none"
          xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
     <div id="chart-foot" class="chart-foot"></div>
+    <div class="bars-header">kWh per bucket</div>
+    <svg id="bars" viewBox="0 0 200 36" preserveAspectRatio="none"
+         xmlns="http://www.w3.org/2000/svg" aria-hidden="true"></svg>
   </section>
+
+  <section class="energy">
+    <h3 class="section-title">Energy consumed</h3>
+    <div class="energy-grid">
+      <div><span class="energy-label">Last hour</span>
+           <span id="kwh-last-hour" class="energy-value">—</span></div>
+      <div><span class="energy-label">Today</span>
+           <span id="kwh-today" class="energy-value">—</span></div>
+      <div><span class="energy-label">Last 24h</span>
+           <span id="kwh-last-24h" class="energy-value">—</span></div>
+      <div><span class="energy-label">This week</span>
+           <span id="kwh-this-week" class="energy-value">—</span></div>
+      <div><span class="energy-label">Last 7d</span>
+           <span id="kwh-last-7d" class="energy-value">—</span></div>
+      <div><span class="energy-label">This month</span>
+           <span id="kwh-this-month" class="energy-value">—</span></div>
+      <div><span class="energy-label">Last 30d</span>
+           <span id="kwh-last-30d" class="energy-value">—</span></div>
+      <div><span class="energy-label">Lifetime</span>
+           <span id="kwh-total" class="energy-value">—</span></div>
+    </div>
+  </section>
+
+  <details class="recent-events">
+    <summary>Recent events</summary>
+    <div id="events-list" class="events-list">(loading…)</div>
+  </details>
+
+  <details class="tuning">
+    <summary>Tuning · power threshold</summary>
+    <form id="tune-form">
+      <label>Alert when power ≥
+        <input type="number" id="tune-watts" value="1500" min="0" step="10"> W</label>
+      <label>for at least
+        <input type="number" id="tune-secs"  value="30" min="1"> s</label>
+      <button type="button" id="tune-apply">Apply (in-memory)</button>
+      <small>Persistence requires editing devices.json on the bot host.</small>
+    </form>
+  </details>
 
   <details class="auto-off">
     <summary>
