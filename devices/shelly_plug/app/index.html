@@ -71,24 +71,7 @@
     </div>
   </section>
 
-  <details class="recent-events">
-    <summary>Recent events</summary>
-    <div id="events-list" class="events-list">(loading…)</div>
-  </details>
-
-  <details class="tuning">
-    <summary>Tuning · power threshold</summary>
-    <form id="tune-form">
-      <label>Alert when power ≥
-        <input type="number" id="tune-watts" value="1500" min="0" step="10"> W</label>
-      <label>for at least
-        <input type="number" id="tune-secs"  value="30" min="1"> s</label>
-      <button type="button" id="tune-apply">Apply (in-memory)</button>
-      <small>Persistence requires editing devices.json on the bot host.</small>
-    </form>
-  </details>
-
-  <details class="rules auto-off-rules">
+  <details class="rules auto-off-rules" open>
     <summary>
       <span>Auto-off rules</span>
       <span id="off-count" class="rule-count">(0)</span>
@@ -123,6 +106,23 @@
         at <input type="time" class="on-tod" value="07:00">
         <label class="sub"><input type="checkbox" class="on-tod-daily"> daily</label></label>
       <button type="button" class="add-rule-btn" data-action="on">Add auto-on rule</button>
+    </form>
+  </details>
+
+  <details class="recent-events">
+    <summary>Recent events</summary>
+    <div id="events-list" class="events-list">(loading…)</div>
+  </details>
+
+  <details class="tuning">
+    <summary>Tuning · power threshold</summary>
+    <form id="tune-form">
+      <label>Alert when power ≥
+        <input type="number" id="tune-watts" value="1500" min="0" step="10"> W</label>
+      <label>for at least
+        <input type="number" id="tune-secs"  value="30" min="1"> s</label>
+      <button type="button" id="tune-apply">Apply (in-memory)</button>
+      <small>Persistence requires editing devices.json on the bot host.</small>
     </form>
   </details>
 

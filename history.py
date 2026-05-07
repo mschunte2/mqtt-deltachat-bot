@@ -316,39 +316,44 @@ class History:
 
     def energy_consumed_in(self, device: str, since_ts: int, until_ts: int
                            ) -> tuple[float, int | None]:
-        """Wh consumed in the window. Prefers Shelly's authoritative
-        energy_minute table; falls back to apower integration over
-        power_minute when the window has no by_minute coverage.
+        """Wh consumed in the window — per-minute hybrid.
 
-        Returns (wh, earliest_ts) — earliest_ts is the start of the
-        oldest sample we actually have inside the window (None if the
-        window is empty).
+        For each minute in the window, prefer Shelly's authoritative
+        energy_minute reading; fall back to apower-integrated
+        power_minute when we don't have by_minute for that minute.
+        This matters because energy_minute coverage starts later than
+        power_minute (we only added it in a later release): an earlier
+        version that picked one source for the whole window would
+        return just the energy_minute slice, making "last 24h" identical
+        to "last hour" right after the upgrade.
+
+        Returns (wh, earliest_ts).
         """
         if self._closed or until_ts <= since_ts:
             return (0.0, None)
+        since, until = int(since_ts), int(until_ts)
         with self._lock:
-            authoritative = self._db.execute(
-                "SELECT SUM(energy_mwh) / 1000.0, MIN(ts) "
-                "FROM energy_minute "
+            em = dict(self._db.execute(
+                "SELECT ts, energy_mwh FROM energy_minute "
                 "WHERE device=? AND ts >= ? AND ts < ?",
-                (device, int(since_ts), int(until_ts)),
-            ).fetchone()
-        if authoritative and authoritative[0] is not None:
-            return (float(authoritative[0]),
-                    int(authoritative[1]) if authoritative[1] is not None else None)
-        # No by_minute coverage in this window (e.g. plug runs an old
-        # firmware that doesn't report it, or we deployed before any
-        # status arrived). Fall back to per-minute apower integration.
-        with self._lock:
-            row = self._db.execute(
-                "SELECT SUM(avg_apower_w) / 60.0, MIN(ts) "
-                "FROM power_minute "
+                (device, since, until),
+            ).fetchall())
+            pm = dict(self._db.execute(
+                "SELECT ts, avg_apower_w FROM power_minute "
                 "WHERE device=? AND ts >= ? AND ts < ?",
-                (device, int(since_ts), int(until_ts)),
-            ).fetchone()
-        wh = float(row[0]) if row and row[0] is not None else 0.0
-        earliest = int(row[1]) if row and row[1] is not None else None
-        return (wh, earliest)
+                (device, since, until),
+            ).fetchall())
+        if not em and not pm:
+            return (0.0, None)
+        total_wh = 0.0
+        all_minutes = em.keys() | pm.keys()
+        for ts in all_minutes:
+            if ts in em:
+                total_wh += em[ts] / 1000.0
+            else:
+                total_wh += pm[ts] / 60.0
+        earliest = min(all_minutes)
+        return (total_wh, earliest)
 
     def query_energy_minute(self, device: str, since_ts: int, until_ts: int
                              ) -> list[tuple[int, float]]:
