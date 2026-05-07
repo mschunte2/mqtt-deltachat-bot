@@ -594,6 +594,27 @@ month's first hour).
   every visible device. App grows a 30-day daily-energy bar chart.
   Threshold tuning from the app can now persist to `devices.json`
   via a `set_param` request with `persist: true`.
+- 2026-05-07 v1.4 — same-day. Rules persist to
+  `~/.config/<BOT_NAME>/rules.json`; load on startup re-arms recurring
+  TODs and drops expired one-shots. **Rehydrate from history**: the
+  engine backfills a consumed-rule's `_samples` deque (and an idle-rule's
+  `_below_since`) from `power_minute` immediately after
+  `scheduler.load_persisted()`, so a `systemctl restart` no longer
+  forces every rule to wait a fresh window. New chat surface:
+  `/<device> rules` and `/rules` (all visible devices), with single
+  rules inline and OR-combined rules rendered as bulleted multi-line
+  blocks. Webxdc handler routes `action="auto-off"` /
+  `action="auto-on"` straight to the scheduler instead of through
+  `dispatch_command` (the old code path errored "unknown action").
+  Trigger templates now spell out the rule that fired:
+  `{action_verb}` + `{threshold}` + `{duration_human}` /
+  `{window_human}`. App: 1-hour interval added to the chart-window
+  picker; window choice persists per-device via `localStorage`; chart
+  no longer stretches sparse data — x-axis bounds use the bot's
+  `since_ts`/`until_ts` (or now-5min..now in live mode). History
+  response carries an authoritative `total_wh` from
+  `energy_consumed_in` (so 1-hour windows no longer show 0.00 kWh
+  from the old energy_hour-delta computation). 105 tests.
 
 ## Performance + tuning
 

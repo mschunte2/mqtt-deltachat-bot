@@ -64,8 +64,10 @@ mqtt-bot/
 /<device> auto-on at 7h daily     # recurring
 /<device> cancel-auto-off | cancel-auto-on | cancel-schedule
 /<device> export 7d               # CSV (samples_raw + power_minute + energy_minute + energy_hour)
+/<device> rules                   # list this device's pending auto-off / auto-on rules
 
 /all on | off | toggle            # act on every device visible to this chat
+/rules          list pending rules across every visible device
 /list           list devices visible to this chat
 /apps           (re)deliver webxdc control apps
 /id             show this chat's id (permission-free, needed for setup)
@@ -137,6 +139,32 @@ Energy queries are a single SQL `SUM` over a per-minute hybrid
 (`energy_minute` first, `power_minute` integration as fallback for
 minutes without by_minute coverage). This stitches data from before
 v1.3 (when `energy_minute` was added) with newer rows seamlessly.
+
+## Persistence + restart recovery
+
+Two pieces of state survive `systemctl restart`:
+
+| File | Holds |
+|---|---|
+| `~/.config/<BOT_NAME>/rules.json` | every pending auto-off / auto-on rule |
+| `~/.config/<BOT_NAME>/history.sqlite` | the five tables above |
+| `~/.config/<BOT_NAME>/app_msgids.json` | which webxdc msgid is registered per chat per device class |
+
+On startup the scheduler:
+
+- **drops one-shot rules whose deadline elapsed during downtime** (firing
+  retroactively would surprise you),
+- **re-arms recurring time-of-day rules** to their next future occurrence,
+- **rehydrates consumed-rule sample buffers and idle-rule below-since
+  timestamps from `power_minute`**, so a rule like "off when used <5Wh in
+  10m" doesn't have to wait a fresh 10-minute window before it can fire
+  — if the actual last 10 minutes (in the database) already meet the
+  condition, it fires on the next status update.
+
+Threshold tuning from the app's "Save to devices.json" button writes the
+bot's own `devices.json` atomically (`.tmp` + `os.replace` after a
+`config.load` validation pass), so a corrupted edit can never replace the
+good file. In-memory `Apply` overrides are lost on restart by design.
 
 Multi-clause example: `/kitchen on for 1h or until used <2Wh in 10m`
 turns on, then off whichever fires first — a hard 1-hour cap *or* the

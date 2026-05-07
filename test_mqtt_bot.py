@@ -989,14 +989,16 @@ class TestEngineOnFire(unittest.TestCase):
             from scheduler import ScheduledJob
             e.scheduler.schedule(ScheduledJob(
                 device_name="kitchen", chat_id_origin=12, target_action="off",
-                rule_id="idle:5W:60s",
-                idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
+                rule_id="idle:5W:300s",
+                idle_field="apower", idle_threshold=5.0, idle_duration_s=300,
                 _below_since=None,
             ))
             e.rehydrate_rules_from_history()
             j = e.scheduler.jobs_for_device("kitchen")[0]
             self.assertIsNotNone(j._below_since)
             self.assertLess(j._below_since, now - 240)  # ≥4 min ago
+        finally:
+            e.history.close()
 
     def test_list_rules_unknown_device(self):
         e = _build_engine_with_class()
