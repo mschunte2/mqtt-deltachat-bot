@@ -316,16 +316,14 @@ class History:
 
     def energy_consumed_in(self, device: str, since_ts: int, until_ts: int
                            ) -> tuple[float, int | None]:
-        """Wh consumed in the window — per-minute hybrid.
+        """Wh consumed in the window — per-minute hybrid, aggregated in SQL.
 
-        For each minute in the window, prefer Shelly's authoritative
-        energy_minute reading; fall back to apower-integrated
-        power_minute when we don't have by_minute for that minute.
-        This matters because energy_minute coverage starts later than
-        power_minute (we only added it in a later release): an earlier
-        version that picked one source for the whole window would
-        return just the energy_minute slice, making "last 24h" identical
-        to "last hour" right after the upgrade.
+        For each minute in the window prefer the authoritative
+        energy_minute row (Shelly's own by_minute reading); only fall
+        back to power_minute (apower-integrated) for minutes that don't
+        appear in energy_minute. Done as one UNION ALL + SUM so SQLite
+        does the work — no row-by-row Python loop, ~constant memory
+        regardless of window size.
 
         Returns (wh, earliest_ts).
         """
@@ -333,27 +331,27 @@ class History:
             return (0.0, None)
         since, until = int(since_ts), int(until_ts)
         with self._lock:
-            em = dict(self._db.execute(
-                "SELECT ts, energy_mwh FROM energy_minute "
-                "WHERE device=? AND ts >= ? AND ts < ?",
-                (device, since, until),
-            ).fetchall())
-            pm = dict(self._db.execute(
-                "SELECT ts, avg_apower_w FROM power_minute "
-                "WHERE device=? AND ts >= ? AND ts < ?",
-                (device, since, until),
-            ).fetchall())
-        if not em and not pm:
+            row = self._db.execute(
+                "SELECT SUM(wh), MIN(ts) FROM ("
+                # Authoritative per-minute energy from Shelly
+                "  SELECT ts, energy_mwh / 1000.0 AS wh "
+                "    FROM energy_minute "
+                "   WHERE device=? AND ts>=? AND ts<? "
+                "  UNION ALL "
+                # Fallback: apower-integrated only where energy_minute is missing
+                "  SELECT pm.ts, pm.avg_apower_w / 60.0 AS wh "
+                "    FROM power_minute pm "
+                "   WHERE pm.device=? AND pm.ts>=? AND pm.ts<? "
+                "     AND NOT EXISTS ("
+                "       SELECT 1 FROM energy_minute em "
+                "        WHERE em.device=pm.device AND em.ts=pm.ts"
+                "     )"
+                ")",
+                (device, since, until, device, since, until),
+            ).fetchone()
+        if not row or row[0] is None:
             return (0.0, None)
-        total_wh = 0.0
-        all_minutes = em.keys() | pm.keys()
-        for ts in all_minutes:
-            if ts in em:
-                total_wh += em[ts] / 1000.0
-            else:
-                total_wh += pm[ts] / 60.0
-        earliest = min(all_minutes)
-        return (total_wh, earliest)
+        return (float(row[0]), int(row[1]) if row[1] is not None else None)
 
     def query_energy_minute(self, device: str, since_ts: int, until_ts: int
                              ) -> list[tuple[int, float]]:
