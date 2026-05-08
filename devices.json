@@ -5,14 +5,14 @@
       "name": "kaffeete",
       "class": "shelly_plug",
       "topic_prefix": "shellyplug-kaffeete",
-      "description": "Coffee machine",
+      "description": "Espressomaschine in der Küche",
       "allowed_chats": []
     },
     {
       "name": "km",
       "class": "shelly_plug",
       "topic_prefix": "shellyplug-km",
-      "description": "KM",
+      "description": "Bogenlampe in der Kulturmetzgerei",
       "allowed_chats": []
     }
   ]

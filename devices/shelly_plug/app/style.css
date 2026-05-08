@@ -37,6 +37,13 @@ header select {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+.device-desc {
+  font-size: 0.85rem;
+  color: #6e6e73;
+  margin: -2px 4px 8px;
+  min-height: 1.1em;
+}
+.device-desc:empty { display: none; }
 .refresh {
   border: 1px solid #d1d1d6;
   background: #fff;

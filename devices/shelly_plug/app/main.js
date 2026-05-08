@@ -7,6 +7,7 @@
 
 const STORAGE_KEY = 'latestSnapshot';
 const WINDOW_KEY = 'windowSeconds';
+const ACTIVE_KEY = 'activeDevice';
 
 const state = {
   active: null,
@@ -26,6 +27,12 @@ try {
   }
 } catch (_) { /* localStorage may be disabled; ignore */ }
 
+// Restore last-active device. Validated against the snapshot in render().
+try {
+  const saved = localStorage.getItem(ACTIVE_KEY);
+  if (saved) state.active = saved;
+} catch (_) { /* ignore */ }
+
 // Hydrate from cached snapshot if present, so the app renders before
 // any refresh roundtrip lands.
 try {
@@ -41,6 +48,7 @@ try {
 
 const $ = (id) => document.getElementById(id);
 const picker = $('device-picker');
+const deviceDesc = $('device-desc');
 const onlineDot = $('online-dot');
 const lastUpdate = $('last-update');
 const stateText = $('state-text');
@@ -139,6 +147,8 @@ document.querySelectorAll('.add-rule-btn').forEach(btn => {
 
 picker.addEventListener('change', () => {
   state.active = picker.value;
+  try { localStorage.setItem(ACTIVE_KEY, state.active); }
+  catch (_) { /* ignore */ }
   render();
 });
 
@@ -174,10 +184,14 @@ function render() {
   if (current.join() !== names.join()) {
     picker.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join('');
   }
+  // If the restored active device is no longer in the snapshot
+  // (renamed, removed), fall back to the first.
+  if (state.active && !names.includes(state.active)) state.active = null;
   if (!state.active && names.length) state.active = names[0];
   if (state.active) picker.value = state.active;
 
   const dev = activeDevice();
+  deviceDesc.textContent = (dev && dev.description) || '';
   if (!dev) {
     stateText.textContent = '—';
     statePower.textContent = '— W';
