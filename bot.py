@@ -151,11 +151,25 @@ def _save_rules() -> None:
 
 
 def _save_baselines() -> None:
-    """Atomic write of every twin's resettable-counter baseline.
-    Same file/dir pattern as rules.json; round-trips via _load_baselines
-    on startup."""
+    """Atomic write of every twin's per-device counter state:
+
+      - baseline_wh   user-set 'reset Counter' baseline (effective Wh)
+      - reset_at_ts   timestamp of the last user reset
+      - aenergy_offset_wh   per-plug hardware-counter-reset offset
+                            (auto-tracked by PlugTwin.on_mqtt)
+
+    Same file/dir pattern as rules.json; round-trips via
+    _load_baselines on startup. _save_baselines is called whenever the
+    user resets the Counter and whenever the bot detects a hardware
+    aenergy.total drop (so the offset survives a restart between the
+    reset event and the next graceful shutdown).
+    """
     data = {
-        t.name: {"baseline_wh": t.baseline_wh, "reset_at_ts": t.reset_at_ts}
+        t.name: {
+            "baseline_wh":       t.baseline_wh,
+            "reset_at_ts":       t.reset_at_ts,
+            "aenergy_offset_wh": t.aenergy_offset_wh,
+        }
         for t in registry.all()
     }
     try:
@@ -168,9 +182,9 @@ def _save_baselines() -> None:
 
 
 def _load_baselines() -> int:
-    """Restore each twin's baseline + reset_at_ts from baselines.json.
-    Drops entries for unknown devices (with a WARN summary, mirroring
-    the rules.load_into pattern). Returns the count restored."""
+    """Restore each twin's baseline state from baselines.json. Drops
+    entries for unknown devices (with a WARN summary, mirroring the
+    rules.load_into pattern). Returns the count restored."""
     if not BASELINES_PATH.exists():
         return 0
     try:
@@ -190,6 +204,7 @@ def _load_baselines() -> int:
         twin.set_baseline(
             float(entry.get("baseline_wh", 0.0) or 0.0),
             entry.get("reset_at_ts"),
+            aenergy_offset_wh=float(entry.get("aenergy_offset_wh", 0.0) or 0.0),
         )
         loaded += 1
     log.info("loaded %d baselines from %s", loaded, BASELINES_PATH)
@@ -220,7 +235,12 @@ def _publisher_broadcast(device_name: str | None = None) -> None:
 webxdc = WebxdcIO(state_dir=STATE_DIR, devices_dir=DEVICES_DIR)
 history = History(
     db_path=STATE_DIR / "history.sqlite",
-    retention_days=int((os.environ.get("RETENTION_DAYS") or "0").strip() or "0"),
+    retention_days=int(
+        (os.environ.get("RETENTION_DAYS") or "0").strip() or "0"
+    ),
+    samples_raw_retention_days=int(
+        (os.environ.get("SAMPLES_RAW_RETENTION_DAYS") or "0").strip() or "0"
+    ),
 )
 
 # Build one twin per device. TwinDeps wires up the side effects.
@@ -1079,8 +1099,17 @@ def _on_start(bot, _args):
     rules_mod.load_into(registry, RULES_PATH)
     _rehydrate_rules_from_history()
 
-    # Restore resettable-counter baselines.
+    # Restore resettable-counter baselines AND counter-reset offsets
+    # before any new MQTT data lands (so the first inbound write goes
+    # straight into the correct effective-Wh space).
     _load_baselines()
+
+    # Populate the fine-tier aenergy_minute table from samples_raw if
+    # this is a fresh deploy (or just upgraded to v0.2.2). Idempotent:
+    # repeats are no-ops thanks to INSERT OR IGNORE. Note that the
+    # backfill uses the RAW counter values from samples_raw (we don't
+    # try to retroactively apply offsets to historical rows).
+    history.backfill_aenergy_minute_from_samples()
 
     mqtt.start()
     sweeper.start()

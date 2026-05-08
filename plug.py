@@ -88,8 +88,20 @@ class PlugTwin:
         # Resettable counter: subtract baseline_wh from the plug's
         # hardware aenergy.total to produce kwh_since_reset. Bot.py
         # persists this across restarts via baselines.json.
+        # NOTE: baseline_wh is in EFFECTIVE-Wh space (post-offset),
+        # so it stays valid across hardware counter resets.
         self.baseline_wh: float = 0.0
         self.reset_at_ts: int | None = None
+        # Hardware counter-reset detection: every status update we
+        # compare the plug's reported aenergy.total against the last
+        # value we saw. If it dropped, increment the per-device
+        # offset by the drop amount. All downstream writes (and
+        # twin.fields["aenergy"]) use the effective value
+        # `raw + aenergy_offset_wh` so the lifetime time series is
+        # continuous across replacements / Switch.ResetCounters / etc.
+        # last_seen_aenergy_wh is RAW (the plug's report), not effective.
+        self.aenergy_offset_wh: float = 0.0
+        self.last_seen_aenergy_wh: float | None = None
         self._lock = threading.Lock()
 
     # --- inbound from MQTT ----------------------------------------------
@@ -103,6 +115,13 @@ class PlugTwin:
         if not updates:
             return
 
+        # Hardware counter-reset detection: if the plug's reported
+        # aenergy.total has gone backwards since we last saw it, bump
+        # our per-device offset by the drop and rewrite updates["aenergy"]
+        # to the effective value so everything downstream (twin.fields,
+        # write_aenergy_minute, energy_hour, snapshot) stays continuous.
+        reset_alert = self._detect_counter_reset_inplace(updates)
+
         now = int(time.time())
         prev: dict[str, Any] = {}
         with self._lock:
@@ -111,6 +130,11 @@ class PlugTwin:
             self.fields.update(updates)
             self.last_update_ts = now
             current_fields = dict(self.fields)
+
+        # Counter-reset side effects, outside the critical section.
+        if reset_alert is not None:
+            self.deps.save_baselines()
+            self.deps.post_to_chats(self.cfg, reset_alert)
 
         # Chat-event evaluation (touches threshold latches under the lock,
         # but emits messages outside it).
@@ -205,12 +229,61 @@ class PlugTwin:
         log.info("counter reset for %s (baseline_wh=%.1f)",
                  self.name, self.baseline_wh)
 
-    def set_baseline(self, baseline_wh: float, reset_at_ts: int | None) -> None:
-        """Restore baseline state from baselines.json on startup.
-        No save, no broadcast — bot.py orchestrates startup."""
+    def set_baseline(self, baseline_wh: float, reset_at_ts: int | None,
+                     aenergy_offset_wh: float = 0.0) -> None:
+        """Restore baseline + counter-reset offset state from
+        baselines.json on startup. No save, no broadcast — bot.py
+        orchestrates startup."""
         with self._lock:
             self.baseline_wh = float(baseline_wh)
             self.reset_at_ts = reset_at_ts
+            self.aenergy_offset_wh = float(aenergy_offset_wh)
+
+    def _detect_counter_reset_inplace(self, updates: dict[str, Any]
+                                      ) -> str | None:
+        """If `updates["aenergy"]` is lower than `last_seen_aenergy_wh`,
+        increment the per-device offset by the drop and overwrite
+        `updates["aenergy"]` with the effective (offset-adjusted) value
+        so the twin's fields + downstream history writes stay
+        continuous across hardware counter resets.
+
+        `last_seen_aenergy_wh` tracks RAW values (the plug's actual
+        report), so the next comparison continues to detect drops in
+        the plug's own counter.
+
+        Returns a chat-alert string when a reset was detected (caller
+        emits it after releasing the lock), or None.
+        """
+        raw = updates.get("aenergy")
+        if not isinstance(raw, (int, float)):
+            return None
+        raw = float(raw)
+        alert: str | None = None
+        with self._lock:
+            prev_raw = self.last_seen_aenergy_wh
+            if prev_raw is not None and raw < prev_raw:
+                drop = prev_raw - raw
+                self.aenergy_offset_wh += drop
+                log.warning(
+                    "plug %s: aenergy.total reset detected "
+                    "(was %.1f Wh, now %.1f Wh) — applying +%.1f Wh "
+                    "offset; cumulative offset now %.1f Wh",
+                    self.name, prev_raw, raw, drop,
+                    self.aenergy_offset_wh,
+                )
+                alert = (
+                    f"⚠️ {self.name}: hardware counter reset detected "
+                    f"(was {prev_raw / 1000:.2f} kWh, "
+                    f"now {raw / 1000:.2f} kWh). "
+                    f"Bot keeps the lifetime continuous via a "
+                    f"+{self.aenergy_offset_wh / 1000:.2f} kWh offset."
+                )
+            self.last_seen_aenergy_wh = raw
+            # Rewrite to effective so everything downstream (fields,
+            # history.write_sample's energy_hour write,
+            # write_aenergy_minute) sees the continuous value.
+            updates["aenergy"] = raw + self.aenergy_offset_wh
+        return alert
 
     def cancel(self, *, target_action: str | None = None,
                rule_id: str | None = None) -> list[rules_mod.ScheduledJob]:
@@ -554,10 +627,19 @@ class PlugTwin:
         h = self.deps.history
         if h is None:
             return
+        # write_sample handles power_minute (apower aggregation) and
+        # energy_hour (post-offset, since fields["aenergy"] is now
+        # effective). aenergy_minute is its sibling — same source value,
+        # 1 row per minute, post-offset, fine-tier for energy queries.
+        eff_aenergy = fields.get("aenergy")
         if "apower" in fields or "aenergy" in fields:
             h.write_sample(self.name, now,
-                           fields.get("apower"), fields.get("aenergy"),
+                           fields.get("apower"), eff_aenergy,
                            fields.get("output"))
+        if isinstance(eff_aenergy, (int, float)):
+            h.write_aenergy_minute(self.name, now, float(eff_aenergy))
+        # samples_raw stores the RAW plug counter (untouched by offset)
+        # so the CSV export and audit trail stay 1:1 with the plug.
         if suffix == "status/switch:0":
             try:
                 payload_obj = json.loads(
