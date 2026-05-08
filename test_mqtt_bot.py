@@ -1593,6 +1593,204 @@ class TestIntegrationRoutingChain(unittest.TestCase):
             self.assertIn("scheduled_jobs", dev)
 
 
+# --- baselines.json round-trip + legacy migration ---------------------
+
+class TestBaselinesPersistence(unittest.TestCase):
+    """The user-Counter state (baseline_wh, reset_at_ts) round-trips
+    through baselines.json. Hardware-counter-reset offsets are NOT
+    in this file in v0.2+; if a legacy `aenergy_offset_wh` entry
+    appears, it migrates to a single aenergy_offset_events row at
+    ts=0 (idempotent)."""
+
+    def setUp(self):
+        import baselines as baselines_mod
+        self.baselines_mod = baselines_mod
+        self.tmpdir = Path(tempfile.mkdtemp())
+        self.h = history_mod.History(self.tmpdir / "h.sqlite")
+        twin, _, _ = _build_twin()
+        # Wire the twin to the real History so legacy-offset migration
+        # can hit aenergy_offset_events.
+        twin.deps = plug_mod.TwinDeps(
+            mqtt_publish=lambda t, p: None, post_to_chats=lambda *a: None,
+            broadcast=lambda n=None: None, save_rules=lambda: None,
+            save_baselines=lambda: None, react=lambda *a: None,
+            history=self.h, client_id="test",
+        )
+        from twins import TwinRegistry as _Reg
+        self.registry = _Reg([twin])
+        self.path = self.tmpdir / "baselines.json"
+
+    def test_save_load_round_trip(self):
+        twin = self.registry.get("kitchen")
+        twin.set_baseline(baseline_wh=12345.6, reset_at_ts=1714000000)
+        self.baselines_mod.save(self.registry, self.path)
+        # Wipe in-memory state and reload.
+        twin.set_baseline(0.0, None)
+        n = self.baselines_mod.load_into(self.registry, self.h, self.path)
+        self.assertEqual(n, 1)
+        self.assertEqual(twin.baseline_wh, 12345.6)
+        self.assertEqual(twin.reset_at_ts, 1714000000)
+
+    def test_legacy_aenergy_offset_wh_migration(self):
+        # Hand-craft a baselines.json that an older bot version would
+        # have written: includes aenergy_offset_wh per device.
+        self.path.write_text(json.dumps({
+            "kitchen": {
+                "baseline_wh": 500.0,
+                "reset_at_ts": 1714000000,
+                "aenergy_offset_wh": 800.0,    # legacy field
+            }
+        }))
+        # No offset events yet.
+        with self.h._lock:
+            cnt = self.h._db.execute(
+                "SELECT COUNT(*) FROM aenergy_offset_events"
+            ).fetchone()[0]
+        self.assertEqual(cnt, 0)
+
+        n = self.baselines_mod.load_into(self.registry, self.h, self.path)
+        self.assertEqual(n, 1)
+        twin = self.registry.get("kitchen")
+        # Baseline + reset_at_ts loaded.
+        self.assertEqual(twin.baseline_wh, 500.0)
+        self.assertEqual(twin.reset_at_ts, 1714000000)
+        # Legacy offset migrated as a single ts=0 row.
+        with self.h._lock:
+            rows = list(self.h._db.execute(
+                "SELECT ts, delta_wh FROM aenergy_offset_events "
+                "WHERE device='kitchen' ORDER BY ts ASC"
+            ))
+        self.assertEqual(rows, [(0, 800.0)])
+        # Idempotent: a second load doesn't double-insert (ts=0 PK collides).
+        self.baselines_mod.load_into(self.registry, self.h, self.path)
+        with self.h._lock:
+            rows = list(self.h._db.execute(
+                "SELECT ts, delta_wh FROM aenergy_offset_events "
+                "WHERE device='kitchen' ORDER BY ts ASC"
+            ))
+        self.assertEqual(rows, [(0, 800.0)])
+        # And the offset is reflected in aenergy_at: a sample of 100 Wh
+        # at any ts becomes effective 100 + 800 = 900 Wh.
+        self.h.record_status("kitchen", 1714001000, {"aenergy": {"total": 100.0}})
+        self.assertEqual(self.h.aenergy_at("kitchen", 1714001000), 900.0)
+
+    def test_legacy_zero_offset_not_migrated(self):
+        # An aenergy_offset_wh of 0 (the common case for v0.2.2 users
+        # who never had a hardware reset) should NOT produce an event.
+        self.path.write_text(json.dumps({
+            "kitchen": {
+                "baseline_wh": 100.0, "reset_at_ts": None,
+                "aenergy_offset_wh": 0.0,
+            }
+        }))
+        self.baselines_mod.load_into(self.registry, self.h, self.path)
+        with self.h._lock:
+            cnt = self.h._db.execute(
+                "SELECT COUNT(*) FROM aenergy_offset_events"
+            ).fetchone()[0]
+        self.assertEqual(cnt, 0)
+
+    def test_unknown_device_warns_and_skips(self):
+        self.path.write_text(json.dumps({
+            "ghost": {"baseline_wh": 99.0, "reset_at_ts": None}
+        }))
+        with self.assertLogs("mqtt_bot.baselines", level="WARNING") as cap:
+            n = self.baselines_mod.load_into(self.registry, self.h, self.path)
+        self.assertEqual(n, 0)
+        self.assertTrue(any("ghost" in m for m in cap.output))
+
+
+# --- Cold-start end-to-end ---------------------------------------------
+#
+# Empty SQLite + empty baselines.json + a fresh PlugTwin. The first
+# MQTT status update should land in samples_raw, populate
+# twin.fields["aenergy"] (RAW), and result in a snapshot whose
+# Lifetime / Counter / kwh_today numbers are sourced via
+# history.aenergy_at (with no offsets recorded). This guards the
+# happy path that v0.2.x users hit on their first deploy.
+
+class TestColdStartIntegration(unittest.TestCase):
+    def test_first_status_update_produces_correct_snapshot(self):
+        # Real History (in a temp file), real PlugTwin, stubbed
+        # publisher / chat sinks. No baselines.json — we're cold-starting.
+        twin, calls, _ = _build_twin()
+        tmpdir = Path(tempfile.mkdtemp())
+        h = history_mod.History(tmpdir / "h.sqlite")
+        twin.deps = plug_mod.TwinDeps(
+            mqtt_publish=lambda t, p: None,
+            post_to_chats=lambda dev, txt: calls["posted"].append((dev.name, txt)),
+            broadcast=lambda n=None: calls["broadcasts"].append(n),
+            save_rules=lambda: None,
+            save_baselines=lambda: None,
+            react=lambda *a: None,
+            history=h,
+            client_id="test",
+        )
+
+        # Pre-state: empty samples_raw + no offset events.
+        with h._lock:
+            self.assertEqual(h._db.execute(
+                "SELECT COUNT(*) FROM samples_raw").fetchone()[0], 0)
+            self.assertEqual(h._db.execute(
+                "SELECT COUNT(*) FROM aenergy_offset_events").fetchone()[0], 0)
+
+        # Drive a single status update with all the typical fields.
+        twin.on_mqtt("status/switch:0", json.dumps({
+            "output": True, "apower": 42.0, "voltage": 230.0,
+            "aenergy": {"total": 12345.6},
+            "temperature": {"tC": 25.5},
+        }).encode())
+
+        # samples_raw populated with the RAW aenergy.
+        with h._lock:
+            row = h._db.execute(
+                "SELECT aenergy_total_wh FROM samples_raw "
+                "WHERE device='kitchen'"
+            ).fetchone()
+        self.assertEqual(row[0], 12345.6)
+
+        # No reset → no offset events.
+        with h._lock:
+            self.assertEqual(h._db.execute(
+                "SELECT COUNT(*) FROM aenergy_offset_events").fetchone()[0], 0)
+
+        # twin.fields["aenergy"] holds the RAW counter (effective
+        # is computed at read time via aenergy_at).
+        self.assertEqual(twin.fields["aenergy"], 12345.6)
+
+        # aenergy_at(now) returns the same RAW (no offsets to add).
+        eff = h.aenergy_at("kitchen", int(time.time()))
+        self.assertEqual(eff, 12345.6)
+
+        # Snapshot built via to_dict has Lifetime = 12345.6 (Wh) and
+        # kwh_since_reset == kwh_lifetime when no Counter reset has
+        # happened (baseline_wh defaults to 0).
+        snap = twin.to_dict()
+        self.assertIn("energy", snap)
+        self.assertEqual(snap["energy"]["current_total_wh"], 12345.6)
+        # Counter math: (12345.6 - 0) / 1000 = 12.3456 kWh.
+        self.assertAlmostEqual(snap["energy"]["kwh_since_reset"],
+                                12.3456, places=4)
+
+    def test_aenergy_at_returns_none_before_first_sample(self):
+        # Cold DB, no samples_raw rows yet — aenergy_at returns None,
+        # to_dict gracefully falls back to the in-memory raw field.
+        twin, _, _ = _build_twin()
+        tmpdir = Path(tempfile.mkdtemp())
+        h = history_mod.History(tmpdir / "h.sqlite")
+        twin.deps = plug_mod.TwinDeps(
+            mqtt_publish=lambda t, p: None, post_to_chats=lambda *a: None,
+            broadcast=lambda n=None: None, save_rules=lambda: None,
+            save_baselines=lambda: None, react=lambda *a: None,
+            history=h, client_id="test",
+        )
+        # No fields, no samples_raw — graceful empty.
+        self.assertIsNone(h.aenergy_at("kitchen", int(time.time())))
+        snap = twin.to_dict()
+        # current_total_wh is None when nothing's been seen yet.
+        self.assertIsNone(snap["energy"]["current_total_wh"])
+
+
 # Stub History used by the snapshot-contract test. Just enough of the
 # query API for build_for_chat to populate every key.
 class _FakeHistory:

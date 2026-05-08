@@ -301,14 +301,21 @@ No Python edits needed.
 ## Testing
 
 ```bash
-python3 test_mqtt_bot.py           # 84 unit tests (~3 s)
+python3 test_mqtt_bot.py           # 118 unit tests (~5 s)
 ```
 
 Coverage: `durations`, `templating`, `state` extraction, `permissions`,
 `rules` (parse_policy, integrate_wh, next_tod_deadline), `config` loader
 (validation paths), `PlugTwin` (on_mqtt edges + threshold + dispatch +
-schedule + cancel + tick_time + dormancy), `snapshot.build_for_chat`,
-`Publisher` (broadcast + push_unicast), and `TwinRegistry`.
+schedule + cancel + tick_time + dormancy + counter-reset detection),
+`snapshot.build_for_chat`, `Publisher` (broadcast + push_unicast),
+`TwinRegistry`, `History` (samples_raw + power_minute writes,
+`aenergy_at` with offset-event SUM, `record_offset_event` idempotency,
+`energy_consumed_in` straddling a reset event, baselines.json
+legacy-offset migration), and a cold-start integration test.
+
+CI: `.github/workflows/ci.yml` runs all of the above plus
+`bot.py --check-config` and `./build-xdc.sh` on every push.
 
 ## Known limitations
 
@@ -319,6 +326,8 @@ schedule + cancel + tick_time + dormancy), `snapshot.build_for_chat`,
   refresh; triggers (b)/(c) usually keep that under 5 min.
 
 ## Provenance
+
+Detailed change log lives in `CLAUDE.md` under "Provenance and history."
 
 Modeled on [`gatekeeper-bot`](../gatekeeper-bot) (Delta Chat ↔ BLE smart
 lock). The bot framework, webxdc plumbing, `app_msgids.json` pattern,

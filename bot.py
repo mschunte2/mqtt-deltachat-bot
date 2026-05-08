@@ -82,6 +82,7 @@ from appdirs import user_config_dir  # noqa: E402
 from deltachat2 import EventType, MsgData, events  # noqa: E402
 from deltabot_cli import BotCli  # noqa: E402
 
+import baselines as baselines_mod  # noqa: E402
 import durations  # noqa: E402
 import permissions  # noqa: E402
 import rules as rules_mod  # noqa: E402
@@ -151,81 +152,16 @@ def _save_rules() -> None:
 
 
 def _save_baselines() -> None:
-    """Atomic write of every twin's user-Counter state:
-
-      - baseline_wh   user-set 'reset Counter' baseline (effective Wh)
-      - reset_at_ts   timestamp of the last user reset
-
-    Hardware-counter-reset offsets are NOT in baselines.json — those
-    live in history.sqlite/aenergy_offset_events as a queryable log.
-    Same file/dir pattern as rules.json; round-trips via _load_baselines
-    on startup.
-    """
-    data = {
-        t.name: {
-            "baseline_wh": t.baseline_wh,
-            "reset_at_ts": t.reset_at_ts,
-        }
-        for t in registry.all()
-    }
-    try:
-        BASELINES_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = BASELINES_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        os.replace(tmp, BASELINES_PATH)
-    except Exception:
-        log.exception("persist baselines to %s failed", BASELINES_PATH)
+    """Persist every twin's user-Counter state to baselines.json.
+    Thin wrapper around baselines.save — the meat lives there so it
+    can be unit-tested without needing bot.py's module globals."""
+    baselines_mod.save(registry, BASELINES_PATH)
 
 
 def _load_baselines() -> int:
-    """Restore each twin's baseline state from baselines.json. Drops
-    entries for unknown devices (with a WARN summary, mirroring the
-    rules.load_into pattern). Returns the count restored.
-
-    Migration: older versions stored an `aenergy_offset_wh` field
-    here. If we see a non-zero one, we re-record it as a single
-    aenergy_offset_events row at ts=0 so cumulative SUMs going
-    forward still pick it up. Idempotent via INSERT OR IGNORE.
-    """
-    if not BASELINES_PATH.exists():
-        return 0
-    try:
-        data = json.loads(BASELINES_PATH.read_text())
-    except (OSError, json.JSONDecodeError):
-        log.exception("failed to read %s; skipping load", BASELINES_PATH)
-        return 0
-    loaded = 0
-    migrated_offsets = 0
-    unknown: list[str] = []
-    for name, entry in data.items():
-        twin = registry.get(name)
-        if twin is None:
-            unknown.append(name)
-            continue
-        if not isinstance(entry, dict):
-            continue
-        twin.set_baseline(
-            float(entry.get("baseline_wh", 0.0) or 0.0),
-            entry.get("reset_at_ts"),
-        )
-        loaded += 1
-        # Migrate any pre-existing aenergy_offset_wh from older
-        # baselines.json into history's aenergy_offset_events at ts=0.
-        legacy_offset = float(entry.get("aenergy_offset_wh", 0.0) or 0.0)
-        if legacy_offset > 0:
-            history.record_offset_event(name, 0, legacy_offset)
-            migrated_offsets += 1
-    log.info("loaded %d baselines from %s", loaded, BASELINES_PATH)
-    if migrated_offsets:
-        log.info("  migrated %d legacy aenergy_offset_wh into "
-                 "aenergy_offset_events (one row each at ts=0)",
-                 migrated_offsets)
-    if unknown:
-        log.warning("  baselines.json had entries for unknown device(s): %s — "
-                    "ignored. Edit %s to remove them or rename them to "
-                    "match devices.json.",
-                    ", ".join(sorted(unknown)), BASELINES_PATH)
-    return loaded
+    """Restore baselines.json on startup. Thin wrapper around
+    baselines.load_into."""
+    return baselines_mod.load_into(registry, history, BASELINES_PATH)
 
 
 def _publisher_broadcast(device_name: str | None = None) -> None:
