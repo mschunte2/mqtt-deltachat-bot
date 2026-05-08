@@ -36,6 +36,17 @@ import durations
 log = logging.getLogger("mqtt_bot.rules")
 
 
+# Rules loaded from rules.json on startup don't fire for this many
+# seconds. Without it, a rule like "off when used <300Wh in 1h"
+# whose condition is *already* satisfied by historical data fires
+# the instant rehydrate-from-history pre-fills its sample buffer —
+# i.e. before the user has had a chance to see the rule in the app
+# or change their mind. The grace period gives them a minute to
+# react. Runtime-scheduled rules (`/dev off if idle` from chat or
+# the app) leave `_loaded_at = 0` and are NOT subject to it.
+GRACE_PERIOD_S = 60
+
+
 # --- Defaults & data shapes ----------------------------------------------
 
 @dataclass(frozen=True)
@@ -113,6 +124,12 @@ class ScheduledJob:
     _samples: deque = field(default_factory=lambda: deque(maxlen=2000))
     _consumed_started_at: int = 0
 
+    # Set by load_into to int(time.time()) on every rule restored from
+    # rules.json. 0 for runtime-added rules. The twin's tick / state
+    # eval skips firing while now - _loaded_at < GRACE_PERIOD_S.
+    # Transient — NOT persisted via to_dict / from_dict.
+    _loaded_at: int = 0
+
     @classmethod
     def from_policy(
         cls,
@@ -153,6 +170,12 @@ class ScheduledJob:
 
     def has_time(self) -> bool:
         return self.deadline_ts is not None
+
+    def in_grace(self, now: int, grace_s: int = GRACE_PERIOD_S) -> bool:
+        """True for rules just loaded from rules.json that haven't
+        served their grace period yet. Runtime-added rules return
+        False (their _loaded_at stays 0)."""
+        return self._loaded_at != 0 and (now - self._loaded_at) < grace_s
 
     def has_idle(self) -> bool:
         return self.idle_field is not None
@@ -457,6 +480,11 @@ def load_into(registry, path: Path | str) -> int:
                 # one-shot timer/tod expired during downtime — drop
                 dropped_expired += 1
                 continue
+        # Stamp loaded-at so PlugTwin's tick honours the grace period
+        # before firing this rule (avoids the "rule disappears on
+        # restart because rehydrate-from-history insta-satisfies its
+        # condition" footgun).
+        job._loaded_at = now
         twin.add_persisted_rule(job)
         loaded += 1
     log.info("loaded %d persisted rules from %s", loaded, p)

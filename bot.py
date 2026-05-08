@@ -97,6 +97,7 @@ cli = BotCli(BOT_NAME)
 log = logging.getLogger("mqtt_bot")
 STATE_DIR = Path(user_config_dir(BOT_NAME))
 RULES_PATH = STATE_DIR / "rules.json"
+BASELINES_PATH = STATE_DIR / "baselines.json"
 
 CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", BOT_NAME)
 PUBLISH_INTERVAL_S = int(os.environ.get("PUBLISH_INTERVAL_S", "300"))
@@ -149,6 +150,57 @@ def _save_rules() -> None:
     sweeper.wake()
 
 
+def _save_baselines() -> None:
+    """Atomic write of every twin's resettable-counter baseline.
+    Same file/dir pattern as rules.json; round-trips via _load_baselines
+    on startup."""
+    data = {
+        t.name: {"baseline_wh": t.baseline_wh, "reset_at_ts": t.reset_at_ts}
+        for t in registry.all()
+    }
+    try:
+        BASELINES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = BASELINES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, BASELINES_PATH)
+    except Exception:
+        log.exception("persist baselines to %s failed", BASELINES_PATH)
+
+
+def _load_baselines() -> int:
+    """Restore each twin's baseline + reset_at_ts from baselines.json.
+    Drops entries for unknown devices (with a WARN summary, mirroring
+    the rules.load_into pattern). Returns the count restored."""
+    if not BASELINES_PATH.exists():
+        return 0
+    try:
+        data = json.loads(BASELINES_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        log.exception("failed to read %s; skipping load", BASELINES_PATH)
+        return 0
+    loaded = 0
+    unknown: list[str] = []
+    for name, entry in data.items():
+        twin = registry.get(name)
+        if twin is None:
+            unknown.append(name)
+            continue
+        if not isinstance(entry, dict):
+            continue
+        twin.set_baseline(
+            float(entry.get("baseline_wh", 0.0) or 0.0),
+            entry.get("reset_at_ts"),
+        )
+        loaded += 1
+    log.info("loaded %d baselines from %s", loaded, BASELINES_PATH)
+    if unknown:
+        log.warning("  baselines.json had entries for unknown device(s): %s — "
+                    "ignored. Edit %s to remove them or rename them to "
+                    "match devices.json.",
+                    ", ".join(sorted(unknown)), BASELINES_PATH)
+    return loaded
+
+
 def _publisher_broadcast(device_name: str | None = None) -> None:
     # Twins call this on every state edge. We resolve the class so the
     # publisher only pushes to apps of that class — a Tasmota toggle
@@ -177,6 +229,7 @@ _deps = TwinDeps(
     post_to_chats=_post_to_visible_chats,
     broadcast=_publisher_broadcast,
     save_rules=_save_rules,
+    save_baselines=_save_baselines,
     react=_react,
     history=history,
     client_id=CLIENT_ID,
@@ -339,6 +392,7 @@ def help_text(chat_id: int) -> str:
         "  /<device> on for 1h or if idle     # on now + auto-off (timer or idle)\n"
         "  /<device> auto-on at 7h | at 7h daily\n"
         "  /<device> cancel-auto-off | cancel-auto-on | cancel-schedule\n"
+        "  /<device> reset-counter            — zero the resettable kWh counter\n"
         "  /<device> export 7d                — CSV of power + energy history\n"
         "  /<device> rules                    — list this device's rules\n"
         "  /rules               — list rules for every visible device\n"
@@ -378,10 +432,15 @@ def handle_webxdc_request(chat_id: int, msgid: int,
     # instances in the chat will keep retrying until /apps replaces them.
     _KNOWN = ("on", "off", "toggle", "status",
               "auto-off", "auto-on",
-              "cancel-auto-off", "cancel-auto-on", "cancel-schedule")
+              "cancel-auto-off", "cancel-auto-on", "cancel-schedule",
+              "reset-counter")
     if action not in _KNOWN:
         log.debug("ignoring webxdc action %r (chat=%d msgid=%d)",
                   action, chat_id, msgid)
+        return
+
+    if action == "reset-counter":
+        _reset_counter(chat_id, device_name)
         return
 
     if action in ("cancel-auto-off", "cancel-auto-on", "cancel-schedule"):
@@ -496,6 +555,17 @@ def _defaults_from_section(section) -> rules_mod.PolicyDefaults:
             consumed_window_s=section.default_consumed_window_s,
         )
     return rules_mod.PolicyDefaults()
+
+
+def _reset_counter(chat_id: int, device_name: str) -> bool:
+    """Reset the resettable counter on a device. Auth + twin lookup +
+    twin.reset_counter(). Used by both the `/<dev> reset-counter`
+    chat command and the app's ↺ button."""
+    twin = registry.get(device_name)
+    if twin is None or not twin.can_chat_see(chat_id, ALLOWED_CHATS):
+        return False
+    twin.reset_counter()
+    return True
 
 
 def _refresh_chat(chat_id: int, only_class: str | None = None) -> int:
@@ -784,6 +854,18 @@ def _on_new_message(bot, accid, event):
             bot.rpc.send_msg(accid, chatid, MsgData(text=msg_text))
         return
 
+    if verb == "reset-counter" and not rest:
+        ok = _reset_counter(chatid, device_name)
+        if not ok:
+            bot.rpc.send_msg(accid, chatid,
+                             MsgData(text=f"unknown device or no permission: {device_name}"))
+            return
+        try:
+            bot.rpc.send_reaction(accid, msg.id, ["🆗"])
+        except Exception:
+            pass
+        return
+
     if verb == "export":
         _handle_export(bot, accid, chatid, device_name, rest)
         return
@@ -996,6 +1078,9 @@ def _on_start(bot, _args):
     # window before being able to fire.
     rules_mod.load_into(registry, RULES_PATH)
     _rehydrate_rules_from_history()
+
+    # Restore resettable-counter baselines.
+    _load_baselines()
 
     mqtt.start()
     sweeper.start()

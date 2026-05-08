@@ -59,13 +59,14 @@ class TwinDeps:
     has zero static imports of bot/mqtt/publisher/webxdc — those
     dependencies are wired up in bot.py at construction time.
     """
-    mqtt_publish:  Callable[[str, str], None]                 # (topic, payload)
-    post_to_chats: Callable[["Device", str], None]            # text → device.allowed_chats
-    broadcast:     Callable[[str], None]                      # device_name → publisher
-    save_rules:    Callable[[], None]                         # rules.json atomic save
-    react:         Callable[[int, str], None]                 # (msgid, emoji) for dispatch ack
-    history:       "Any"   # History | None — read inside snapshot, write inside on_mqtt
-    client_id:     str
+    mqtt_publish:    Callable[[str, str], None]                 # (topic, payload)
+    post_to_chats:   Callable[["Device", str], None]            # text → device.allowed_chats
+    broadcast:       Callable[[str], None]                      # device_name → publisher
+    save_rules:      Callable[[], None]                         # rules.json atomic save
+    save_baselines:  Callable[[], None]                         # baselines.json atomic save
+    react:           Callable[[int, str], None]                 # (msgid, emoji) for dispatch ack
+    history:         "Any"   # History | None — read inside snapshot, write inside on_mqtt
+    client_id:       str
 
 
 # --- the digital twin ----------------------------------------------------
@@ -84,6 +85,11 @@ class PlugTwin:
         # in v0.2), but we keep the attribute so the snapshot has a
         # stable shape.
         self.param_overrides: dict[str, Any] = {}
+        # Resettable counter: subtract baseline_wh from the plug's
+        # hardware aenergy.total to produce kwh_since_reset. Bot.py
+        # persists this across restarts via baselines.json.
+        self.baseline_wh: float = 0.0
+        self.reset_at_ts: int | None = None
         self._lock = threading.Lock()
 
     # --- inbound from MQTT ----------------------------------------------
@@ -185,6 +191,27 @@ class PlugTwin:
         self.deps.broadcast(self.name)
         return True, _format_schedule_ack(self.name, target_action, job)
 
+    def reset_counter(self) -> None:
+        """Snap baseline = current aenergy.total. The "Counter" row in
+        the app shows `aenergy - baseline_wh`, so this drops it back to
+        ~0. Non-destructive: the plug's own monotonic counter keeps
+        counting, history.sqlite is untouched. Triggered by both the
+        ↺ button in the app and the `/<dev> reset-counter` chat verb."""
+        with self._lock:
+            self.baseline_wh = float(self.fields.get("aenergy") or 0.0)
+            self.reset_at_ts = int(time.time())
+        self.deps.save_baselines()
+        self.deps.broadcast(self.name)
+        log.info("counter reset for %s (baseline_wh=%.1f)",
+                 self.name, self.baseline_wh)
+
+    def set_baseline(self, baseline_wh: float, reset_at_ts: int | None) -> None:
+        """Restore baseline state from baselines.json on startup.
+        No save, no broadcast — bot.py orchestrates startup."""
+        with self._lock:
+            self.baseline_wh = float(baseline_wh)
+            self.reset_at_ts = reset_at_ts
+
     def cancel(self, *, target_action: str | None = None,
                rule_id: str | None = None) -> list[rules_mod.ScheduledJob]:
         cancelled = self._remove_rules(target_action=target_action,
@@ -213,6 +240,13 @@ class PlugTwin:
             output = self.fields.get("output")
             for job in self.rules:
                 if job.deadline_ts is None or job.deadline_ts > now:
+                    survivors.append(job)
+                    continue
+                # Grace period for rules just loaded from rules.json:
+                # delay first fire so the user sees the rule in the
+                # app before it acts (avoids the rehydrate-insta-fire
+                # footgun).
+                if job.in_grace(now):
                     survivors.append(job)
                     continue
                 # Time-based rule has reached its deadline.
@@ -283,6 +317,8 @@ class PlugTwin:
                                   _power_history)
             payload["energy"] = _energy_summary(
                 self.deps.history, self.name, fields.get("aenergy"),
+                baseline_wh=self.baseline_wh,
+                reset_at_ts=self.reset_at_ts,
             )
             payload["daily_energy_wh"] = _daily_energy_wh(
                 self.deps.history, self.name,
@@ -388,6 +424,12 @@ class PlugTwin:
                     if job._samples:
                         job._samples.clear()
                     job._consumed_started_at = now
+                    survivors.append(job)
+                    continue
+                # Grace period for rules just loaded from rules.json:
+                # don't fire on the first tick after restart even if
+                # rehydrated history already satisfies the condition.
+                if job.in_grace(now):
                     survivors.append(job)
                     continue
                 fired = False

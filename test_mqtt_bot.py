@@ -566,6 +566,7 @@ def _build_twin(class_overrides=None, params=None, allowed_chats=(12,)):
         post_to_chats=lambda dev, txt: calls["posted"].append((dev.name, txt)),
         broadcast=lambda name=None: calls["broadcasts"].append(name),
         save_rules=lambda: calls.__setitem__("saves", calls["saves"] + 1),
+        save_baselines=lambda: calls.__setitem__("baseline_saves", calls.get("baseline_saves",0) + 1),
         react=lambda mid, e: calls["reactions"].append((mid, e)),
         history=None,
         client_id="tester",
@@ -1038,6 +1039,126 @@ class TestHistory(unittest.TestCase):
             h.close()
 
 
+# --- Resettable counter -----------------------------------------------
+
+class TestPlugTwinResetCounter(unittest.TestCase):
+    def test_reset_snaps_baseline_and_signals(self):
+        twin, calls, _ = _build_twin()
+        # Capture save_baselines() calls — _build_twin's deps already
+        # has it via the sed-injected lambda.
+        twin.fields["aenergy"] = 12345.6
+        twin.reset_counter()
+        self.assertEqual(twin.baseline_wh, 12345.6)
+        self.assertIsNotNone(twin.reset_at_ts)
+        self.assertGreaterEqual(calls.get("baseline_saves", 0), 1)
+        self.assertEqual(calls["broadcasts"][-1], "kitchen")
+
+    def test_reset_with_no_aenergy_yet_uses_zero(self):
+        twin, _, _ = _build_twin()
+        # No aenergy field → baseline = 0; subsequent values track lifetime.
+        twin.reset_counter()
+        self.assertEqual(twin.baseline_wh, 0.0)
+
+
+class TestKwhSinceResetMath(unittest.TestCase):
+    def test_baseline_subtracted_correctly(self):
+        from snapshot import _energy_summary
+        e = _energy_summary(_FakeHistory(), "x",
+                            current_wh=12345.0,
+                            baseline_wh=345.0,
+                            reset_at_ts=int(time.time()))
+        self.assertAlmostEqual(e["kwh_since_reset"], 12.0, places=6)
+        self.assertEqual(e["current_total_wh"], 12345.0)  # Lifetime untouched
+
+    def test_clamped_to_zero_on_rollover(self):
+        # Plug counter rollover or a stale baseline shouldn't show negative.
+        from snapshot import _energy_summary
+        e = _energy_summary(_FakeHistory(), "x",
+                            current_wh=10.0, baseline_wh=100.0,
+                            reset_at_ts=None)
+        self.assertEqual(e["kwh_since_reset"], 0.0)
+
+    def test_none_when_no_current_reading(self):
+        from snapshot import _energy_summary
+        e = _energy_summary(_FakeHistory(), "x",
+                            current_wh=None, baseline_wh=0.0,
+                            reset_at_ts=None)
+        self.assertIsNone(e["kwh_since_reset"])
+
+    def test_includes_kwh_last_365d(self):
+        from snapshot import _energy_summary
+        e = _energy_summary(_FakeHistory(), "x",
+                            current_wh=100.0, baseline_wh=0.0,
+                            reset_at_ts=None)
+        self.assertIn("kwh_last_365d", e)
+        self.assertEqual(set(e["kwh_last_365d"].keys()),
+                         {"kwh", "partial_since_ts"})
+
+
+# --- Grace period for rehydrated rules --------------------------------
+
+class TestGracePeriod(unittest.TestCase):
+    def test_loaded_rule_does_not_fire_during_grace(self):
+        twin, calls, _ = _build_twin()
+        twin.fields["output"] = True   # not dormant for off-rule
+        # Simulate a rule restored from rules.json: deadline already
+        # elapsed AND _loaded_at set to "now".
+        now = int(time.time())
+        job = sched.ScheduledJob(
+            device_name="kitchen", chat_id_origin=12, target_action="off",
+            deadline_ts=now - 5,            # would fire immediately
+            _time_mode="timer",
+            timer_seconds=600,
+            once=False,
+            _loaded_at=now,                  # within grace period
+        )
+        twin.add_persisted_rule(job)
+        twin.tick_time(now)
+        # No fire, rule survives.
+        self.assertEqual(calls["published"], [])
+        self.assertEqual(len(twin.rules), 1)
+
+    def test_loaded_rule_fires_after_grace(self):
+        twin, calls, _ = _build_twin()
+        twin.fields["output"] = True
+        now = int(time.time())
+        job = sched.ScheduledJob(
+            device_name="kitchen", chat_id_origin=12, target_action="off",
+            deadline_ts=now - 5, _time_mode="timer", timer_seconds=600,
+            once=False, _loaded_at=now,
+        )
+        twin.add_persisted_rule(job)
+        # Past the grace period.
+        twin.tick_time(now + sched.GRACE_PERIOD_S + 1)
+        self.assertEqual(len(calls["published"]), 1)
+
+    def test_runtime_scheduled_rule_fires_immediately(self):
+        # Counter-test: rules added via twin.schedule (not load_into)
+        # have _loaded_at == 0 and skip the grace gate entirely.
+        twin, calls, _ = _build_twin()
+        twin.fields["output"] = True
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=1), 12)
+        # Fast-forward past the deadline.
+        now = int(time.time()) + 5
+        twin.tick_time(now)
+        self.assertEqual(len(calls["published"]), 1)
+
+    def test_load_into_stamps_loaded_at(self):
+        # The persistence path sets _loaded_at; round-trip via save_all
+        # then load_into into a fresh twin and assert.
+        twin, _, _ = _build_twin()
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=600), 12)
+        from twins import TwinRegistry as _Reg
+        registry = _Reg([twin])
+        path = Path(tempfile.mkdtemp()) / "rules.json"
+        sched.save_all(registry, path)
+        # Wipe and reload.
+        twin.rules.clear()
+        sched.load_into(registry, path)
+        self.assertEqual(len(twin.rules), 1)
+        self.assertGreater(twin.rules[0]._loaded_at, 0)
+
+
 # --- Snapshot protocol contract -----------------------------------------
 #
 # Locks the bot↔app payload shape. A protocol drift on either side
@@ -1055,6 +1176,7 @@ class TestSnapshotContract(unittest.TestCase):
             post_to_chats=lambda *a: None,
             broadcast=lambda *a: None,
             save_rules=lambda: None,
+            save_baselines=lambda: None,
             react=lambda *a: None,
             history=_FakeHistory(),
             client_id="test",
@@ -1191,6 +1313,7 @@ class TestTasmotaClass(unittest.TestCase):
             post_to_chats=lambda dev, txt: self.calls["posted"].append(txt),
             broadcast=lambda n=None: self.calls["broadcasts"].append(n),
             save_rules=lambda: None,
+            save_baselines=lambda: None,
             react=lambda *a: None,
             history=None,
             client_id="test",
@@ -1313,6 +1436,7 @@ class TestIntegrationRoutingChain(unittest.TestCase):
                            self.publisher.broadcast(
                                name, only_class=_cls, force=True)),
                 save_rules=lambda: None,
+            save_baselines=lambda: None,
                 react=lambda *a: None,
                 history=None,
                 client_id="test",

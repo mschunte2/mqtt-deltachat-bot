@@ -45,7 +45,6 @@ const onlineDot = $('online-dot');
 const lastUpdate = $('last-update');
 const stateText = $('state-text');
 const statePower = $('state-power');
-const stateEnergy = $('state-energy');
 const sparkline = $('sparkline');
 const dailyBars = $('daily-bars');
 const dailyFoot = $('daily-foot');
@@ -70,6 +69,22 @@ $('btn-on').addEventListener('click', () => send({ action: 'on' }));
 $('btn-off').addEventListener('click', () => send({ action: 'off' }));
 $('btn-toggle').addEventListener('click', () => send({ action: 'toggle' }));
 $('btn-refresh').addEventListener('click', () => sendRefresh());
+
+// Counter reset — confirms before firing, then sends the action.
+// The bot stores baseline = current aenergy.total; the next snapshot
+// will show kwh_since_reset ~= 0.
+const btnReset = $('btn-reset');
+if (btnReset) {
+  btnReset.addEventListener('click', () => {
+    if (!state.active) return;
+    const ok = window.confirm(
+      `Reset the Counter for "${state.active}"? ` +
+      `(Lifetime stays unchanged. The bot stores the current ` +
+      `lifetime as a baseline; Counter starts back at 0.)`
+    );
+    if (ok) send({ action: 'reset-counter' });
+  });
+}
 
 function sendRefresh() {
   // Refresh is class-scoped (not device-scoped); the bot resolves the
@@ -195,8 +210,6 @@ function render() {
   }
   statePower.textContent =
     typeof f.apower === 'number' ? `${f.apower.toFixed(0)} W` : '— W';
-  stateEnergy.textContent =
-    typeof f.aenergy === 'number' ? `(${(f.aenergy / 1000).toFixed(2)} kWh)` : '';
 
   renderSparkline();
   renderDailyBars(dev);
@@ -332,10 +345,13 @@ function fmtIntervalEntry(entry) {
 function renderEnergySummary(dev) {
   const e = dev.energy;
   const set = (id, val) => { const el = $(id); if (el) el.textContent = val; };
+  const resetWhen = $('reset-when');
   if (!e) {
     ['kwh-last-hour','kwh-today','kwh-last-24h','kwh-this-week',
-     'kwh-last-7d','kwh-this-month','kwh-last-30d','kwh-total']
+     'kwh-last-7d','kwh-this-month','kwh-last-30d','kwh-last-365d',
+     'kwh-total','kwh-since-reset']
       .forEach(id => set(id, '—'));
+    if (resetWhen) resetWhen.textContent = '';
     return;
   }
   set('kwh-last-hour',  fmtIntervalEntry(e.kwh_last_hour));
@@ -345,8 +361,26 @@ function renderEnergySummary(dev) {
   set('kwh-last-7d',    fmtIntervalEntry(e.kwh_last_7d));
   set('kwh-this-month', fmtIntervalEntry(e.kwh_this_month));
   set('kwh-last-30d',   fmtIntervalEntry(e.kwh_last_30d));
+  set('kwh-last-365d',  fmtIntervalEntry(e.kwh_last_365d));
   set('kwh-total',
       e.current_total_wh != null ? fmtKwh(e.current_total_wh / 1000) : '—');
+  // Resettable counter — green to draw the eye, but the row sits at the
+  // bottom of the grid alongside Lifetime so the layout stays familiar.
+  set('kwh-since-reset',
+      typeof e.kwh_since_reset === 'number' ? fmtKwh(e.kwh_since_reset) : '—');
+  if (resetWhen) {
+    if (e.reset_at_ts) {
+      const age = Math.max(0, Math.floor(Date.now() / 1000) - e.reset_at_ts);
+      let when;
+      if (age < 60) when = `${age}s`;
+      else if (age < 3600) when = `${Math.round(age / 60)}min`;
+      else if (age < 86400) when = `${Math.round(age / 3600)}h`;
+      else when = `${Math.round(age / 86400)}d`;
+      resetWhen.textContent = `last reset: ${when} ago`;
+    } else {
+      resetWhen.textContent = 'never reset (Counter == Lifetime)';
+    }
+  }
 }
 
 function describeRule(j) {

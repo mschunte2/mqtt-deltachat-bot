@@ -161,6 +161,31 @@ header select {
 }
 .energy-label { color: #6b6b70; }
 .energy-value { font-variant-numeric: tabular-nums; font-weight: 500; }
+.reset-row {
+  display: flex !important;
+  align-items: center;
+  gap: 6px;
+}
+.reset-row .energy-value { flex: 1; text-align: right; }
+.reset-btn {
+  border: 1px solid #d1d1d6;
+  background: #fff;
+  border-radius: 6px;
+  width: 24px;
+  height: 24px;
+  font-size: 0.95rem;
+  cursor: pointer;
+  padding: 0;
+  color: #1c1c1e;
+  line-height: 1;
+}
+.reset-btn:active { background: #e5e5ea; }
+.reset-when {
+  font-size: 0.75rem;
+  color: #8e8e93;
+  margin-top: 6px;
+  text-align: right;
+}
 .rules {
   background: #fff;
   border-radius: 12px;

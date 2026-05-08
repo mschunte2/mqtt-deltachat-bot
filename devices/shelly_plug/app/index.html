@@ -24,7 +24,6 @@
     </div>
     <div class="metrics">
       <span id="state-power">— W</span>
-      <span id="state-energy"></span>
     </div>
   </section>
 
@@ -72,9 +71,17 @@
            <span id="kwh-this-month" class="energy-value">—</span></div>
       <div><span class="energy-label">Last 30d</span>
            <span id="kwh-last-30d" class="energy-value">—</span></div>
+      <div><span class="energy-label">Last 365d</span>
+           <span id="kwh-last-365d" class="energy-value">—</span></div>
       <div><span class="energy-label">Lifetime</span>
            <span id="kwh-total" class="energy-value">—</span></div>
+      <div class="reset-row">
+        <span class="energy-label">Counter</span>
+        <span id="kwh-since-reset" class="energy-value">—</span>
+        <button id="btn-reset" class="reset-btn" title="Reset counter">↺</button>
+      </div>
     </div>
+    <div id="reset-when" class="reset-when"></div>
   </section>
 
   <details class="rules auto-off-rules" open>

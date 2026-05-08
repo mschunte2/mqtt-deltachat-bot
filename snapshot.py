@@ -89,16 +89,24 @@ def _daily_energy_wh(history, device_name: str) -> list[tuple[int, float]]:
 
 
 def _energy_summary(history, device_name: str,
-                    current_wh: float | None) -> dict[str, Any]:
+                    current_wh: float | None,
+                    *,
+                    baseline_wh: float = 0.0,
+                    reset_at_ts: int | None = None) -> dict[str, Any]:
     """kWh consumed in standard intervals. Each interval reports a
     `partial_since_ts` when our oldest sample arrived noticeably later
-    than the requested start (app marks a `*` suffix)."""
+    than the requested start (app marks a `*` suffix).
+
+    `baseline_wh` and `reset_at_ts` come from the twin and drive the
+    new resettable Counter row in the app. Lifetime (current_total_wh)
+    stays alongside it — Lifetime never resets, Counter does."""
     now = int(time.time())
     intervals = (
         ("kwh_last_hour",  now - _HOUR),
         ("kwh_last_24h",   now - _DAY),
         ("kwh_last_7d",    now - 7 * _DAY),
         ("kwh_last_30d",   now - 30 * _DAY),
+        ("kwh_last_365d",  now - 365 * _DAY),
         ("kwh_today",      _local_midnight(now)),
         ("kwh_this_week",  _local_week_start(now)),
         ("kwh_this_month", _local_month_start(now)),
@@ -106,6 +114,14 @@ def _energy_summary(history, device_name: str,
     out: dict[str, Any] = {
         "current_total_wh":
             float(current_wh) if current_wh is not None else None,
+        # Counter = lifetime - baseline. None when we don't yet have a
+        # current reading; clamped to 0 so a one-time clock skew or a
+        # plug counter rollover doesn't show negative.
+        "kwh_since_reset": (
+            max(0.0, (float(current_wh) - float(baseline_wh)) / 1000.0)
+            if current_wh is not None else None
+        ),
+        "reset_at_ts": reset_at_ts,
     }
     PARTIAL_GAP = 90
     for key, since in intervals:
