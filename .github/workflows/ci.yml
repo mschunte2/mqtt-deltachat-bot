@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No pip install — the unit tests are stdlib-only, and
+      # bot.py --check-config short-circuits before its heavy
+      # imports (deltachat2, paho, appdirs).
+      - name: unit tests
+        run: python3 test_mqtt_bot.py
+
+      - name: --check-config
+        run: python3 bot.py --check-config
+
+      - name: build xdc
+        run: |
+          # zip is preinstalled on ubuntu-latest
+          ./build-xdc.sh
+
+      - name: webxdc app js syntax
+        run: |
+          for js in devices/*/app/*.js; do
+            [ -f "$js" ] || continue
+            node -c "$js"
+          done
+
+      - name: ensure no engine.py / scheduler.py regressed
+        run: |
+          # v0.2.0 deleted these. If they reappear, something has
+          # gone wrong in the refactor.
+          ! [ -f engine.py ]
+          ! [ -f scheduler.py ]
