@@ -37,16 +37,9 @@ def build_for_chat(chat_id: int, class_name: str,
                and t.can_chat_see(chat_id, allowed_chats)]
     if not visible:
         return None
-    # All visible twins share a class, so we can pick any to read
-    # class-level flags. cls is identical across the visible list.
-    cls_def = visible[0].cls
     return {
         "class": class_name,
         "server_ts": int(time.time()),
-        # Class-level flag: app surfaces button presses as chat info
-        # lines (see app/main.js for the (a)/(b) trade-off note).
-        # Defaults to False (silent).
-        "echo_actions_to_chat": bool(cls_def.echo_actions_to_chat),
         "devices": {t.name: t.to_dict() for t in visible},
     }
 

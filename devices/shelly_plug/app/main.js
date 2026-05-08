@@ -15,21 +15,6 @@ const state = {
   //                    scheduled_jobs, params, power_history: {minute, hour} } }
   devices: {},
   windowSeconds: 86400,
-  // Class-level flag (from snapshot.echo_actions_to_chat). When true,
-  // every action button passes a chat-info string to webxdc.sendUpdate
-  // so the chat shows e.g. "Alice: /kaffeete on" — useful in shared
-  // chats for "who pressed what" transparency. Default off (silent).
-  // The flag is configured per device class in `class.json` and
-  // arrives in every snapshot, so flipping it in config + restart
-  // takes effect on the next push.
-  //
-  // FUTURE OPTION (b): instead of an info string, emit an actual
-  // chat message with `webxdc.sendToChat({text: "/kaffeete on"})`.
-  // The bot would then route through its text-command path
-  // (_on_new_message → _parse_text_command). Decouples action
-  // delivery from the webxdc transport. Not implemented yet — see
-  // the plan in CLAUDE.md when revisiting.
-  echoActionsToChat: false,
 };
 
 // Restore last-chosen window from localStorage.
@@ -77,18 +62,7 @@ function send(req) {
   if (!state.active && req.action !== 'refresh') return;
   if (state.active) req.device = state.active;
   req.ts = Math.floor(Date.now() / 1000);
-  window.webxdc.sendUpdate({ payload: { request: req } }, _actionInfo(req));
-}
-
-// Format the optional info string for webxdc.sendUpdate's 2nd arg.
-// Empty when the class-level flag is off (silent — current default)
-// or when the action is internal (refresh). Otherwise mirror the
-// chat-command syntax users already know.
-function _actionInfo(req) {
-  if (!state.echoActionsToChat) return '';
-  if (req.action === 'refresh') return '';
-  const dev = req.device || '?';
-  return `/${dev} ${req.action}`;
+  window.webxdc.sendUpdate({ payload: { request: req } }, '');
 }
 
 $('btn-on').addEventListener('click', () => send({ action: 'on' }));
@@ -485,7 +459,6 @@ window.webxdc.setUpdateListener((update) => {
   if (!p || !p.devices) return;
   state.serverTs = p.server_ts || Math.floor(Date.now() / 1000);
   state.devices = p.devices;
-  state.echoActionsToChat = !!p.echo_actions_to_chat;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       server_ts: state.serverTs, devices: state.devices,

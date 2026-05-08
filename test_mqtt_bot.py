@@ -376,16 +376,12 @@ CLASS_JSON_OK = {
 
 
 class TestConfigLoad(unittest.TestCase):
-    def _setup(self, with_class=True, instance_overrides=None,
-               class_overrides=None):
+    def _setup(self, with_class=True, instance_overrides=None):
         tmp = Path(tempfile.mkdtemp())
         if with_class:
             cls_dir = tmp / "devices" / "tplug"
             cls_dir.mkdir(parents=True)
-            cls_def = json.loads(json.dumps(CLASS_JSON_OK))   # deep copy
-            if class_overrides:
-                cls_def.update(class_overrides)
-            (cls_dir / "class.json").write_text(json.dumps(cls_def))
+            (cls_dir / "class.json").write_text(json.dumps(CLASS_JSON_OK))
         else:
             (tmp / "devices").mkdir()
         instance = {
@@ -410,16 +406,6 @@ class TestConfigLoad(unittest.TestCase):
         d = c.devices["kitchen"]
         self.assertEqual(d.topic_prefix, "shellyplug-aaa")
         self.assertEqual(d.allowed_chats, (12,))
-        # Default for the optional flag is False when omitted.
-        self.assertFalse(c.classes["tplug"].echo_actions_to_chat)
-
-    def test_echo_actions_to_chat_opt_in(self):
-        # When `echo_actions_to_chat: true` is set in class.json,
-        # the parsed DeviceClass reflects it.
-        tmp = self._setup(class_overrides={"echo_actions_to_chat": True})
-        c = cfg_mod.load(devices_dir=tmp / "devices",
-                         instances_file=tmp / "devices.json")
-        self.assertTrue(c.classes["tplug"].echo_actions_to_chat)
 
     def test_no_classes(self):
         tmp = self._setup(with_class=False)
@@ -1294,15 +1280,10 @@ class TestSnapshotContract(unittest.TestCase):
         snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
         self.assertIsNotNone(snap)
         # Snapshot is at the top level of payload — NO `snapshot:` wrapper.
-        # The app reads `payload.devices`, `payload.server_ts`,
-        # `payload.echo_actions_to_chat`, etc.
-        self.assertEqual(set(snap.keys()),
-                         {"class", "server_ts", "echo_actions_to_chat",
-                          "devices"})
+        # The app reads `payload.devices`, `payload.server_ts`, etc.
+        self.assertEqual(set(snap.keys()), {"class", "server_ts", "devices"})
         self.assertEqual(snap["class"], "tplug")
         self.assertIsInstance(snap["server_ts"], int)
-        # Default for the test fixture is False (off).
-        self.assertEqual(snap["echo_actions_to_chat"], False)
 
     def test_per_device_keys(self):
         snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
@@ -1348,10 +1329,7 @@ class TestSnapshotContract(unittest.TestCase):
         # Single `payload` wrapper, snapshot keys at the top level
         # under it (NO extra `snapshot:` nesting).
         self.assertEqual(set(body.keys()), {"payload"})
-        # The required structural keys; class-level flags (like
-        # echo_actions_to_chat) may also be present.
-        for k in ("class", "server_ts", "devices"):
-            self.assertIn(k, body["payload"])
+        self.assertEqual(set(body["payload"].keys()), {"class", "server_ts", "devices"})
         self.assertIn("kitchen", body["payload"]["devices"])
 
 
@@ -1607,8 +1585,8 @@ class TestIntegrationRoutingChain(unittest.TestCase):
         self._route("tasmota_AB/stat/POWER", b"on")
         self.assertGreater(len(self.sent), 0)
         for chat_id, msgid, payload in self.sent:
-            for k in ("class", "server_ts", "devices"):
-                self.assertIn(k, payload)
+            self.assertEqual(set(payload.keys()),
+                             {"class", "server_ts", "devices"})
             self.assertIn("lamp", payload["devices"])
             dev = payload["devices"]["lamp"]
             self.assertIn("fields", dev)

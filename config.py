@@ -86,13 +86,6 @@ class DeviceClass:
     chat_events: tuple[ChatEventRule, ...]
     auto_off: AutoOffConfig | None
     auto_on: AutoOnConfig | None
-    # When true, app button presses pass an `info` string to
-    # webxdc.sendUpdate so the action surfaces as a small info line
-    # in chat (visible to every chat member). Useful in shared
-    # chats for "who pressed what" transparency. Default off; opt-in
-    # via `echo_actions_to_chat: true` in the class's class.json.
-    # See app/main.js for the (a)/(b) trade-off documented inline.
-    echo_actions_to_chat: bool = False
 
 
 # --- Device + Config ------------------------------------------------------
@@ -225,7 +218,6 @@ def _parse_class(name: str, raw: dict) -> DeviceClass:
         chat_events=events,
         auto_off=auto_off,
         auto_on=auto_on,
-        echo_actions_to_chat=bool(raw.get("echo_actions_to_chat", False)),
     )
 
 
