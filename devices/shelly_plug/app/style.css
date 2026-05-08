@@ -31,6 +31,24 @@ header select {
   text-align: center;
   font-size: 1.1rem;
 }
+.last-update {
+  font-size: 0.78rem;
+  color: #8e8e93;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.refresh {
+  border: 1px solid #d1d1d6;
+  background: #fff;
+  border-radius: 8px;
+  width: 36px;
+  height: 36px;
+  font-size: 1.1rem;
+  cursor: pointer;
+  padding: 0;
+  color: #1c1c1e;
+}
+.refresh:active { background: #e5e5ea; }
 .state-card {
   background: #fff;
   border-radius: 12px;
@@ -113,14 +131,10 @@ header select {
   height: 36px;
   display: block;
 }
-.tune-actions {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-#tune-save {
-  background: #e5e5ea !important;
-  color: #1c1c1e !important;
+#sparkline {
+  width: 100%;
+  height: 60px;
+  display: block;
 }
 .energy {
   background: #fff;
@@ -147,60 +161,6 @@ header select {
 }
 .energy-label { color: #6b6b70; }
 .energy-value { font-variant-numeric: tabular-nums; font-weight: 500; }
-.recent-events, .tuning {
-  background: #fff;
-  border-radius: 12px;
-  padding: 8px 12px;
-  margin-bottom: 8px;
-  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-}
-.recent-events summary, .tuning summary {
-  cursor: pointer;
-  padding: 6px 0;
-  font-weight: 500;
-}
-.events-list {
-  font-size: 0.8rem;
-  color: #444;
-  margin-top: 6px;
-  max-height: 200px;
-  overflow-y: auto;
-}
-.events-list .ev {
-  border-bottom: 1px solid #eee;
-  padding: 4px 0;
-}
-.events-list .ev .ts { color: #8e8e93; font-variant-numeric: tabular-nums; }
-.events-list .ev .kind { color: #007aff; font-weight: 500; margin-left: 6px; }
-#tune-form {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding-top: 6px;
-  font-size: 0.9rem;
-}
-#tune-form input[type="number"] {
-  width: 70px;
-  padding: 4px 6px;
-  border: 1px solid #d1d1d6;
-  border-radius: 6px;
-}
-#tune-form button {
-  align-self: flex-start;
-  padding: 6px 12px;
-  border: 0;
-  border-radius: 6px;
-  background: #007aff;
-  color: #fff;
-  cursor: pointer;
-  font-size: 0.9rem;
-}
-#tune-form small { color: #8e8e93; }
-#sparkline {
-  width: 100%;
-  height: 60px;
-  display: block;
-}
 .rules {
   background: #fff;
   border-radius: 12px;
@@ -286,23 +246,4 @@ header select {
   font-size: 0.85rem;
   color: #6b6b70;
   margin-left: 4px;
-}
-.actions {
-  display: flex;
-  gap: 8px;
-  margin-top: 6px;
-}
-.actions button {
-  padding: 8px 14px;
-  border: 0;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 0.95rem;
-}
-#btn-apply { background: #007aff; color: #fff; }
-#btn-cancel { background: #e5e5ea; color: #1c1c1e; }
-footer {
-  text-align: center;
-  color: #8e8e93;
-  margin-top: 8px;
 }

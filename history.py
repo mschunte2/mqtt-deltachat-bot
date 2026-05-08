@@ -1,14 +1,11 @@
-"""Time-series storage for power consumption + plug events.
+"""Time-series storage for power consumption.
 
-Single SQLite file under the bot's config dir. Three tables:
+Single SQLite file under the bot's config dir. Tables:
 
+  samples_raw   — every status/switch:0 captured verbatim
+  energy_minute — Shelly's authoritative aenergy.by_minute[] (mWh)
   power_minute  — average apower (W) per minute per device
-                  (every MQTT apower sample is buffered in-memory and
-                  flushed to one row when the minute boundary rolls over)
-  energy_hour   — cumulative aenergy.total (Wh) snapshot per hour per device
-                  (one row per (device, hour); replaces previous row in
-                  the same hour so the latest snapshot wins)
-  events        — raw plug events (e.g. NotifyStatus on events/rpc)
+  energy_hour   — cumulative aenergy.total (Wh) snapshot per hour
 
 Retention is configurable via RETENTION_DAYS:
   - 0       → keep forever
@@ -17,6 +14,10 @@ Retention is configurable via RETENTION_DAYS:
 Single shared connection guarded by a threading.Lock; writes serialize
 on the lock, which is fine for the few-writes-per-minute traffic this
 bot generates.
+
+(The `events` table was dropped in v0.2 — chat events are emitted
+live from PlugTwin and not persisted; the recent-events panel was
+removed from the app.)
 """
 
 from __future__ import annotations
@@ -81,16 +82,6 @@ CREATE TABLE IF NOT EXISTS energy_hour (
   PRIMARY KEY (device, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_energy_hour_ts ON energy_hour (ts);
-
-CREATE TABLE IF NOT EXISTS events (
-  device  TEXT    NOT NULL,
-  ts      INTEGER NOT NULL,
-  suffix  TEXT    NOT NULL,
-  kind    TEXT,
-  payload TEXT,
-  PRIMARY KEY (device, ts, suffix)
-);
-CREATE INDEX IF NOT EXISTS idx_events_ts ON events (ts);
 """
 
 
@@ -200,26 +191,6 @@ class History:
                         "(device, ts, energy_mwh) VALUES (?, ?, ?)",
                         (device, base + offset, val),
                     )
-            self._db.commit()
-
-    def write_event(self, device: str, ts: int, suffix: str, payload_text: str) -> None:
-        if self._closed:
-            return
-        kind = None
-        try:
-            decoded = json.loads(payload_text)
-            if isinstance(decoded, dict):
-                kind = decoded.get("method") or decoded.get("kind")
-                if isinstance(kind, str):
-                    kind = kind[:64]
-        except (json.JSONDecodeError, TypeError):
-            pass
-        with self._lock:
-            self._db.execute(
-                "INSERT OR REPLACE INTO events (device, ts, suffix, kind, payload) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (device, int(ts), suffix, kind, payload_text[:65536]),
-            )
             self._db.commit()
 
     def flush_pending_minutes(self, now: int | None = None) -> None:
@@ -425,21 +396,6 @@ class History:
             )
             return cur.fetchall()
 
-    def query_events(self, device: str, since_ts: int, until_ts: int,
-                     limit: int = 500) -> list[tuple[int, str, str, str]]:
-        """Return [(ts, suffix, kind, payload), ...] for the window."""
-        if self._closed:
-            return []
-        with self._lock:
-            cur = self._db.execute(
-                "SELECT ts, suffix, kind, payload FROM events "
-                "WHERE device=? AND ts >= ? AND ts < ? "
-                "ORDER BY ts DESC LIMIT ?",
-                (device, int(since_ts), int(until_ts), int(limit)),
-            )
-            rows = cur.fetchall()
-        return [(int(t), s, k or "", p or "") for t, s, k, p in rows]
-
     # --- internals -------------------------------------------------------
 
     def _buffer_apower(self, device: str, ts: int, apower: float,
@@ -514,7 +470,7 @@ class History:
         counts = {}
         with self._lock:
             for table in ("samples_raw", "power_minute", "energy_minute",
-                          "energy_hour", "events"):
+                          "energy_hour"):
                 counts[table] = self._db.execute(
                     f"DELETE FROM {table} WHERE ts < ?", (cutoff,)
                 ).rowcount

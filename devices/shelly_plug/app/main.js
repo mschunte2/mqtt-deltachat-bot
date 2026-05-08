@@ -1,30 +1,48 @@
 'use strict';
 
-const SAMPLES_MAX_AGE = 300;
-const SAMPLES_MAX_COUNT = 200;
+// One outbound message kind from the bot: a `snapshot` payload that
+// bundles everything we need to render. We cache the latest in
+// localStorage so a reload paints last-known state instantly, then
+// fire a refresh request. Window changes are render-only — no fetch.
+
+const STORAGE_KEY = 'latestSnapshot';
+const WINDOW_KEY = 'windowSeconds';
 
 const state = {
-  devices: {},
   active: null,
-  history: {},          // device -> [{ts, power}] live ring buffer (last 5 min, client-side)
-  historyWindow: 86400, // selected window in seconds; 0 = live
-  serverHistory: {},    // device -> { window_seconds, bucket_seconds, power_points, energy_points }
+  serverTs: 0,
+  // devices: { name: { fields, last_update_ts, energy, daily_energy_wh,
+  //                    scheduled_jobs, params, power_history: {minute, hour} } }
+  devices: {},
+  windowSeconds: 86400,
 };
 
-// Restore the last-chosen time window from localStorage (per-device UI
-// preference; doesn't sync to other chat members, which is the right
-// thing for a per-user view setting).
+// Restore last-chosen window from localStorage.
 try {
-  const saved = localStorage.getItem('windowSeconds');
+  const saved = localStorage.getItem(WINDOW_KEY);
   if (saved !== null) {
     const n = parseInt(saved, 10);
-    if (Number.isFinite(n) && n >= 0) state.historyWindow = n;
+    if (Number.isFinite(n) && n >= 3600) state.windowSeconds = n;
   }
-} catch (_e) { /* localStorage may be disabled; ignore */ }
+} catch (_) { /* localStorage may be disabled; ignore */ }
+
+// Hydrate from cached snapshot if present, so the app renders before
+// any refresh roundtrip lands.
+try {
+  const cached = localStorage.getItem(STORAGE_KEY);
+  if (cached) {
+    const obj = JSON.parse(cached);
+    if (obj && obj.devices) {
+      state.devices = obj.devices;
+      state.serverTs = obj.server_ts || 0;
+    }
+  }
+} catch (_) { /* corrupt cache: ignore */ }
 
 const $ = (id) => document.getElementById(id);
 const picker = $('device-picker');
 const onlineDot = $('online-dot');
+const lastUpdate = $('last-update');
 const stateText = $('state-text');
 const statePower = $('state-power');
 const stateEnergy = $('state-energy');
@@ -34,13 +52,6 @@ const dailyFoot = $('daily-foot');
 const chartMax = $('chart-max');
 const chartFoot = $('chart-foot');
 const windowPick = $('window-pick');
-const lastUpdate = $('last-update');
-const eventsList = $('events-list');
-const tuneWatts = $('tune-watts');
-const tuneSecs = $('tune-secs');
-const tuneApply = $('tune-apply');
-const tuneSave = $('tune-save');
-const tuneStatus = $('tune-status');
 const offCount = $('off-count');
 const onCount = $('on-count');
 const offRulesList = $('off-rules-list');
@@ -49,8 +60,8 @@ const onRulesList = $('on-rules-list');
 function activeDevice() { return state.devices[state.active] || null; }
 
 function send(req) {
-  if (!state.active) return;
-  req.device = state.active;
+  if (!state.active && req.action !== 'refresh') return;
+  if (state.active) req.device = state.active;
   req.ts = Math.floor(Date.now() / 1000);
   window.webxdc.sendUpdate({ payload: { request: req } }, '');
 }
@@ -58,13 +69,23 @@ function send(req) {
 $('btn-on').addEventListener('click', () => send({ action: 'on' }));
 $('btn-off').addEventListener('click', () => send({ action: 'off' }));
 $('btn-toggle').addEventListener('click', () => send({ action: 'toggle' }));
+$('btn-refresh').addEventListener('click', () => sendRefresh());
 
-// "Add rule" buttons: one per direction.
+function sendRefresh() {
+  // Refresh is class-scoped (not device-scoped); the bot resolves the
+  // class from the requesting msgid.
+  window.webxdc.sendUpdate({
+    payload: { request: { action: 'refresh', ts: Math.floor(Date.now() / 1000) } }
+  }, '');
+}
+
+// Add-rule buttons.
 function readRuleForm(direction) {
-  // direction is 'off' or 'on'. Returns the auto_off / auto_on payload.
   const root = document.querySelector(`.rule-form[data-action="${direction}"]`);
   if (!root) return null;
-  const mode = root.querySelector(`input[name="${direction}-mode"]:checked`).value;
+  const checked = root.querySelector(`input[name="${direction}-mode"]:checked`);
+  if (!checked) return null;
+  const mode = checked.value;
   const policy = {};
   if (mode === 'timer') {
     const mins = parseInt(root.querySelector(`.${direction}-timer-min`).value, 10) || 0;
@@ -104,94 +125,36 @@ document.querySelectorAll('.add-rule-btn').forEach(btn => {
 picker.addEventListener('change', () => {
   state.active = picker.value;
   render();
-  if (state.historyWindow > 0) requestHistory();
 });
 
 windowPick.addEventListener('change', () => {
-  state.historyWindow = parseInt(windowPick.value, 10) || 0;
-  try { localStorage.setItem('windowSeconds', String(state.historyWindow)); }
-  catch (_e) { /* ignore */ }
-  if (state.historyWindow > 0) requestHistory();
+  state.windowSeconds = parseInt(windowPick.value, 10) || 86400;
+  try { localStorage.setItem(WINDOW_KEY, String(state.windowSeconds)); }
+  catch (_) { /* ignore */ }
   renderSparkline();
 });
 
-// Pre-select the restored window in the <select> element BEFORE any
-// snapshot arrives, so the picker shows the persisted choice.
 if (windowPick) {
   const opt = Array.from(windowPick.options)
-    .find(o => o.value === String(state.historyWindow));
-  if (opt) windowPick.value = String(state.historyWindow);
+    .find(o => o.value === String(state.windowSeconds));
+  if (opt) windowPick.value = String(state.windowSeconds);
 }
 
-function requestHistory() {
-  if (!state.active || state.historyWindow <= 0) return;
-  window.webxdc.sendUpdate({
-    payload: {
-      request: {
-        device: state.active,
-        action: 'history',
-        window_seconds: state.historyWindow,
-        ts: Math.floor(Date.now() / 1000),
-      }
-    }
-  }, '');
-}
+// Click delegation for per-rule delete buttons.
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.delete-btn');
+  if (!btn) return;
+  const direction = btn.dataset.action;
+  const rid = btn.dataset.ruleId;
+  if (!rid) return;
+  const cancel_action = direction === 'off' ? 'cancel-auto-off' : 'cancel-auto-on';
+  send({ action: cancel_action, rule_id: rid });
+});
 
-function requestEvents() {
-  if (!state.active) return;
-  window.webxdc.sendUpdate({
-    payload: {
-      request: {
-        device: state.active,
-        action: 'events',
-        window_seconds: 7 * 86400,
-        limit: 50,
-        ts: Math.floor(Date.now() / 1000),
-      }
-    }
-  }, '');
-}
-
-const recentEventsEl = document.querySelector('details.recent-events');
-if (recentEventsEl) {
-  recentEventsEl.addEventListener('toggle', () => {
-    if (recentEventsEl.open) requestEvents();
-  });
-}
-
-function _sendTune(persist) {
-  if (!state.active) return;
-  const w = parseFloat(tuneWatts.value);
-  const s = parseInt(tuneSecs.value, 10);
-  if (!isFinite(w) || !isFinite(s)) return;
-  for (const [param, value] of [
-    ['power_threshold_watts', w],
-    ['power_threshold_duration_s', s],
-  ]) {
-    window.webxdc.sendUpdate({
-      payload: {
-        request: {
-          device: state.active, action: 'set_param',
-          param, value, persist: persist || undefined,
-          ts: Math.floor(Date.now() / 1000),
-        }
-      }
-    }, '');
-  }
-  if (tuneStatus) {
-    tuneStatus.textContent = persist
-      ? 'Saved to devices.json (will survive bot restart).'
-      : 'Applied (in-memory; lost on bot restart).';
-    setTimeout(() => { if (tuneStatus) tuneStatus.textContent = ''; }, 4000);
-  }
-}
-
-if (tuneApply) tuneApply.addEventListener('click', () => _sendTune(false));
-if (tuneSave)  tuneSave.addEventListener('click',  () => _sendTune(true));
+// --- Render -------------------------------------------------------------
 
 function render() {
   const names = Object.keys(state.devices).sort();
-  // Re-populate picker only when set changes
   const current = Array.from(picker.options).map(o => o.value);
   if (current.join() !== names.join()) {
     picker.innerHTML = names.map(n => `<option value="${n}">${n}</option>`).join('');
@@ -210,25 +173,103 @@ function render() {
   const f = dev.fields || {};
   onlineDot.textContent =
     f.online === true ? '🟢' : f.online === false ? '🔴' : '⚪';
-  if (typeof f.output === 'boolean') {
-    stateText.textContent = f.output ? 'ON' : 'OFF';
-  } else {
-    stateText.textContent = '?';
-  }
+  stateText.textContent =
+    typeof f.output === 'boolean' ? (f.output ? 'ON' : 'OFF') : '?';
   statePower.textContent =
     typeof f.apower === 'number' ? `${f.apower.toFixed(0)} W` : '— W';
   stateEnergy.textContent =
     typeof f.aenergy === 'number' ? `(${(f.aenergy / 1000).toFixed(2)} kWh)` : '';
 
-  if (dev.last_update_ts) {
-    const d = new Date(dev.last_update_ts * 1000);
-    lastUpdate.textContent = `last update: ${d.toLocaleTimeString()}`;
-  }
   renderSparkline();
-  renderRulesList(dev);
-  renderEnergySummary(dev);
-  renderTuningInputs(dev);
   renderDailyBars(dev);
+  renderEnergySummary(dev);
+  renderRulesList(dev);
+  renderAge();
+}
+
+function renderAge() {
+  if (!state.serverTs) { lastUpdate.textContent = '—'; return; }
+  const age = Math.max(0, Math.floor(Date.now() / 1000) - state.serverTs);
+  if (age < 60) lastUpdate.textContent = `${age}s ago`;
+  else if (age < 3600) lastUpdate.textContent = `${Math.round(age / 60)}min ago`;
+  else lastUpdate.textContent = `${Math.round(age / 3600)}h ago`;
+}
+
+function renderSparkline() {
+  const dev = activeDevice();
+  if (!dev || !dev.power_history) {
+    sparkline.innerHTML = ''; chartMax.textContent = '';
+    chartFoot.textContent = '(no data yet)';
+    return;
+  }
+  // Pick resolution based on window. ≤24h → minute, 31d → hour.
+  const useHour = state.windowSeconds >= 7 * 86400;
+  const series = useHour ? dev.power_history.hour : dev.power_history.minute;
+  if (!Array.isArray(series) || series.length < 2) {
+    sparkline.innerHTML = ''; chartMax.textContent = '';
+    chartFoot.textContent = '(no data in this window)';
+    return;
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const xMax = now;
+  const xMin = now - state.windowSeconds;
+  // Slice series to the window.
+  const pts = series.filter(p => p[0] >= xMin && p[0] <= xMax);
+  if (pts.length < 2) {
+    sparkline.innerHTML = ''; chartMax.textContent = '';
+    chartFoot.textContent = '(no data in this window)';
+    return;
+  }
+  const tSpan = Math.max(1, xMax - xMin);
+  const pMax = Math.max(1, ...pts.map(p => p[1]));
+  const W = 200, H = 60;
+  const yOff = H - 2;
+
+  const onSegs = [], offSegs = [], offlineSegs = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [t1, w1, o1] = pts[i];
+    const [t2] = pts[i + 1];
+    const x1 = ((t1 - xMin) / tSpan) * W;
+    const x2 = ((t2 - xMin) / tSpan) * W;
+    if (o1 === null) {
+      offlineSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
+    } else if (o1 === 0) {
+      offSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
+    } else {
+      const [, w2] = pts[i + 1];
+      const y1 = H - (w1 / pMax) * (H - 6) - 3;
+      const y2 = H - (w2 / pMax) * (H - 6) - 3;
+      onSegs.push(`M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)}`);
+    }
+  }
+  let svg = '';
+  if (offlineSegs.length) {
+    svg += `<path fill="none" stroke="#8e8e93" stroke-width="2"
+                  stroke-linecap="round" d="${offlineSegs.join(' ')}"/>`;
+  }
+  if (offSegs.length) {
+    svg += `<path fill="none" stroke="#ff3b30" stroke-width="2"
+                  stroke-linecap="round" d="${offSegs.join(' ')}"/>`;
+  }
+  if (onSegs.length) {
+    svg += `<path fill="none" stroke="#34c759" stroke-width="1.5"
+                  stroke-linecap="round" d="${onSegs.join(' ')}"/>`;
+  }
+  sparkline.innerHTML = svg;
+  chartMax.textContent = `max ${pMax.toFixed(0)} W`;
+  // Total kWh from energy summary if available, else integrate from points.
+  const e = dev.energy;
+  let kwh = null;
+  if (e) {
+    const map = {
+      3600: 'kwh_last_hour', 86400: 'kwh_last_24h',
+      [7 * 86400]: 'kwh_last_7d', [30 * 86400]: 'kwh_last_30d',
+    };
+    const key = map[state.windowSeconds];
+    if (key && e[key] && typeof e[key].kwh === 'number') kwh = e[key].kwh;
+  }
+  const tail = kwh !== null ? ` · ${kwh.toFixed(2)} kWh in window` : '';
+  chartFoot.textContent = `${pts.length} pts${tail}`;
 }
 
 function renderDailyBars(dev) {
@@ -239,12 +280,11 @@ function renderDailyBars(dev) {
     if (dailyFoot) dailyFoot.textContent = '';
     return;
   }
-  // days is [[ts, wh], …] oldest first.
   const W = 200, H = 36;
   const maxWh = Math.max(1, ...days.map(d => d[1]));
   const w = W / days.length;
   let totalWh = 0;
-  const rects = days.map(([ts, wh], i) => {
+  const rects = days.map(([_ts, wh], i) => {
     totalWh += wh;
     const h = (wh / maxWh) * (H - 2);
     return `<rect x="${(i * w).toFixed(2)}" y="${(H - h).toFixed(2)}" `
@@ -265,12 +305,9 @@ function fmtKwh(kwh) {
 }
 
 function fmtIntervalEntry(entry) {
-  // entry shape: {kwh, partial_since_ts | null} or legacy bare number.
   if (entry == null) return '—';
   if (typeof entry === 'number') return fmtKwh(entry);
   const text = fmtKwh(entry.kwh);
-  // Compact: a star indicates "data starts later than the window";
-  // verbose since-date suppressed by request.
   return entry.partial_since_ts ? text + '*' : text;
 }
 
@@ -294,123 +331,7 @@ function renderEnergySummary(dev) {
       e.current_total_wh != null ? fmtKwh(e.current_total_wh / 1000) : '—');
 }
 
-function renderTuningInputs(dev) {
-  const params = dev.params || {};
-  if (typeof params.power_threshold_watts === 'number'
-      && document.activeElement !== tuneWatts) {
-    tuneWatts.value = params.power_threshold_watts;
-  }
-  if (typeof params.power_threshold_duration_s === 'number'
-      && document.activeElement !== tuneSecs) {
-    tuneSecs.value = params.power_threshold_duration_s;
-  }
-}
-
-function renderEvents(rows) {
-  if (!eventsList) return;
-  if (!rows || !rows.length) {
-    eventsList.textContent = '(no events recorded yet)';
-    return;
-  }
-  eventsList.innerHTML = rows.slice(0, 50).map(r => {
-    const d = new Date(r.ts * 1000);
-    const stamp = d.toLocaleString();
-    const kind = r.kind || '(unknown)';
-    return `<div class="ev"><span class="ts">${stamp}</span>`
-         + `<span class="kind">${kind}</span></div>`;
-  }).join('');
-}
-
-function renderSparkline() {
-  // Live mode: client-side ring buffer (last 5 min).
-  // Window mode: server-pushed history (1h/6h/12h/24h/31d).
-  // The x-axis is anchored to the REQUESTED window, not the data span.
-  // So if you ask for 31d and only have 1d of data, the line shows on
-  // the right ~1/31 of the canvas — not stretched across.
-  let pts;        // [[ts, w, out|null], ...]
-  let footText = '';
-  let xMin, xMax; // x-axis bounds in unix seconds (REQUESTED window)
-  if (state.historyWindow === 0) {
-    const hist = (state.history[state.active] || []).slice();
-    pts = hist.map(s => [s.ts, s.power, s.out]);
-    xMax = Math.floor(Date.now() / 1000);
-    xMin = xMax - SAMPLES_MAX_AGE;
-    footText = pts.length ? `${pts.length} samples (live)` : '(live, waiting…)';
-  } else {
-    const sh = state.serverHistory[state.active];
-    if (!sh || !sh.power_points) {
-      pts = [];
-      footText = '(loading…)';
-    } else {
-      pts = sh.power_points;
-      xMin = (typeof sh.since_ts === 'number') ? sh.since_ts
-            : (pts.length ? pts[0][0] : Math.floor(Date.now() / 1000));
-      xMax = (typeof sh.until_ts === 'number') ? sh.until_ts
-            : (pts.length ? pts[pts.length - 1][0] : Math.floor(Date.now() / 1000));
-      // Authoritative total from the bot's hybrid energy_consumed_in
-      // (energy_minute first, power_minute fallback). Falls back to the
-      // older energy_hour delta for old responses without total_wh.
-      let totalWh;
-      if (typeof sh.total_wh === 'number') {
-        totalWh = sh.total_wh;
-      } else {
-        const e = sh.energy_points || [];
-        totalWh = e.length >= 2 ? (e[e.length - 1][1] - e[0][1]) : 0;
-      }
-      const bucketLabel = fmtSecs(sh.bucket_seconds || 60);
-      footText = pts.length
-        ? `${pts.length} pts · bucket ${bucketLabel} · ${(totalWh / 1000).toFixed(2)} kWh in window`
-        : '(no data in this window yet)';
-    }
-  }
-  if (pts.length < 2) {
-    sparkline.innerHTML = '';
-    chartMax.textContent = '';
-    chartFoot.textContent = footText;
-    return;
-  }
-  // tSpan is the WINDOW span, not the data span. So sparse data renders
-  // at its actual position, not stretched.
-  const tMin = xMin;
-  const tMax = xMax;
-  const tSpan = Math.max(1, tMax - tMin);
-  const pMax = Math.max(1, ...pts.map(p => p[1]));
-  const W = 200, H = 60;
-  const yOff = H - 2;  // baseline 0-line (for off segments)
-  // Build two paths: green (on / unknown) tracing apower; red flat baseline
-  // for off segments. Each segment connects pts[i] → pts[i+1] coloured by
-  // pts[i].output.
-  const onSegs = [];
-  const offSegs = [];
-  for (let i = 0; i < pts.length - 1; i++) {
-    const [t1, w1, o1] = pts[i];
-    const [t2, w2] = pts[i + 1];
-    const x1 = ((t1 - tMin) / tSpan) * W;
-    const x2 = ((t2 - tMin) / tSpan) * W;
-    if (o1 === 0) {
-      offSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
-    } else {
-      const y1 = H - (w1 / pMax) * (H - 6) - 3;
-      const y2 = H - (w2 / pMax) * (H - 6) - 3;
-      onSegs.push(`M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)}`);
-    }
-  }
-  let svg = '';
-  if (offSegs.length) {
-    svg += `<path fill="none" stroke="#ff3b30" stroke-width="2"
-                  stroke-linecap="round" d="${offSegs.join(' ')}"/>`;
-  }
-  if (onSegs.length) {
-    svg += `<path fill="none" stroke="#34c759" stroke-width="1.5"
-                  stroke-linecap="round" d="${onSegs.join(' ')}"/>`;
-  }
-  sparkline.innerHTML = svg;
-  chartMax.textContent = `max ${pMax.toFixed(0)} W`;
-  chartFoot.textContent = footText;
-}
-
 function describeRule(j) {
-  // Build a human description from a scheduled_jobs row.
   const parts = [];
   if (j.deadline_ts) {
     const remaining = Math.max(0, j.deadline_ts - Math.floor(Date.now() / 1000));
@@ -443,7 +364,6 @@ function renderRulesList(dev) {
   const onJobs  = jobs.filter(j => j.target_action === 'on');
   if (offCount) offCount.textContent = `(${offJobs.length})`;
   if (onCount)  onCount.textContent  = `(${onJobs.length})`;
-
   const renderInto = (ul, list, action) => {
     if (!ul) return;
     if (!list.length) {
@@ -469,18 +389,6 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-// Click delegation for the per-rule delete buttons (since the lists
-// are re-rendered on every snapshot, individual listeners would leak).
-document.addEventListener('click', (e) => {
-  const btn = e.target.closest('.delete-btn');
-  if (!btn) return;
-  const direction = btn.dataset.action;
-  const rid = btn.dataset.ruleId;
-  if (!rid) return;
-  const cancel_action = direction === 'off' ? 'cancel-auto-off' : 'cancel-auto-on';
-  send({ action: cancel_action, rule_id: rid });
-});
-
 function fmtSecs(s) {
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.round(s / 60)}m`;
@@ -489,51 +397,31 @@ function fmtSecs(s) {
   return m ? `${h}h${m}m` : `${h}h`;
 }
 
-function appendSample(name, ts, power, output) {
-  if (typeof power !== 'number') return;
-  const h = (state.history[name] = state.history[name] || []);
-  if (h.length && h[h.length - 1].ts === ts) return;  // dedup same-second pushes
-  // output: true → 1, false → 0, anything else → null (unknown)
-  const out = output === true ? 1 : output === false ? 0 : null;
-  h.push({ ts, power, out });
-  const cutoff = ts - SAMPLES_MAX_AGE;
-  while (h.length && h[0].ts < cutoff) h.shift();
-  if (h.length > SAMPLES_MAX_COUNT) h.splice(0, h.length - SAMPLES_MAX_COUNT);
-}
+// --- Inbound -----------------------------------------------------------
 
 window.webxdc.setUpdateListener((update) => {
   const p = update.payload;
-  if (!p) return;
-  // History response.
-  if (p.history && p.history.device) {
-    state.serverHistory[p.history.device] = p.history;
-    renderSparkline();
-    return;
-  }
-  // Events response.
-  if (p.events && p.events.device) {
-    if (p.events.device === state.active) renderEvents(p.events.rows);
-    return;
-  }
-  // Regular snapshot.
-  if (!p.devices) return;
-  state.devices = p.devices;
-  const ts = p.server_ts || Math.floor(Date.now() / 1000);
-  for (const [name, dev] of Object.entries(p.devices)) {
-    if (dev.fields && typeof dev.fields.apower === 'number') {
-      appendSample(name, ts, dev.fields.apower, dev.fields.output);
-    }
-  }
+  if (!p || !p.snapshot) return;
+  const snap = p.snapshot;
+  state.serverTs = snap.server_ts || Math.floor(Date.now() / 1000);
+  state.devices = snap.devices || {};
+  // Persist for fast hydration on reload.
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      server_ts: state.serverTs, devices: state.devices,
+    }));
+  } catch (_) { /* ignore quota / disabled */ }
   render();
-  // First time we know which device is active → kick off history fetch.
-  if (state.active && state.historyWindow > 0
-      && !state.serverHistory[state.active]) {
-    requestHistory();
-  }
 }, 0);
 
-// keep countdowns live
+// On first paint render whatever we hydrated from localStorage, then
+// fire one refresh request to pull fresh data from the bot.
+render();
+sendRefresh();
+
+// Live age + countdown updates.
 setInterval(() => {
+  renderAge();
   const dev = activeDevice();
   if (dev) renderRulesList(dev);
 }, 1000);

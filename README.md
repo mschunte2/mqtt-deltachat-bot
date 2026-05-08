@@ -18,14 +18,18 @@ dropping in a new `devices/<class>/` directory, no Python edits.
 
 ```
 mqtt-bot/
-├── bot.py                         # Delta Chat hooks; thin glue
-├── engine.py                      # generic engine (dispatch, on_message, threshold detector, snapshots)
-├── scheduler.py                   # action scheduler (timer / TOD / idle / consumed); auto-off + auto-on
+├── bot.py                         # Delta Chat hooks + routing glue + construction
+├── plug.py                        # PlugTwin — digital twin per device
+├── twins.py                       # TwinRegistry — dict + reverse topic lookup
+├── rules.py                       # ScheduledJob/Policy + parse_policy + sweeper + persistence
+├── snapshot.py                    # build_for_chat — single outbound assembly
+├── publisher.py                   # Publisher — single outbound stream
 ├── config.py                      # devices.json + devices/*/class.json loader
-├── state.py                       # state cache + field extraction (json_path, bool_text)
+├── state.py                       # state-field extraction (json_path, bool_text)
 ├── permissions.py                 # global ALLOWED_CHATS + per-device allow-list
 ├── mqtt_client.py                 # paho wrapper (daemon thread, auto-resubscribe)
-├── webxdc_io.py                   # app_msgids.json + per-chat filtered push
+├── webxdc_io.py                   # app_msgids.json + send_apps + push_to_msgid
+├── history.py                     # SQLite time series (samples_raw, power_minute, energy_*)
 ├── durations.py                   # parse "30m" / "1h30m"
 ├── templating.py                  # {key} substitution that leaves JSON braces alone
 ├── devices/                       # device-class components (auto-discovered)
@@ -45,7 +49,7 @@ mqtt-bot/
 ├── init-from-backup.sh            # one-shot: import a Delta Chat profile tar from .env/
 ├── install-systemd-unit.sh        # render+enable+start the systemd unit
 ├── systemd-unit/deltabot.service.template
-└── test_mqtt_bot.py               # stdlib unittest, 57 tests
+└── test_mqtt_bot.py               # stdlib unittest, 84 tests
 ```
 
 ## Chat commands
@@ -82,23 +86,17 @@ direction coexist and fire independently — adding `/<dev> off if idle 5W
 
 ## History (SQLite time series)
 
-The bot persists a per-minute power average and an hourly cumulative
-energy snapshot per device under `~/.config/<BOT_NAME>/history.sqlite`.
-This drives:
+The bot persists per-device time series under
+`~/.config/<BOT_NAME>/history.sqlite`. This drives:
 
-- **Webxdc app charts** — line chart over the selected window (live 5
-  min / 6h / 12h / 24h / 31d). Off-periods render as a red 0-line so
-  they're visually distinguishable from low-but-on usage.
-- **kWh-per-bucket bars** — below the line chart, showing energy
-  consumed in each interval bucket (downsampled to ≤60 bars).
+- **Webxdc app charts** — line chart over the selected window
+  (1h / 6h / 12h / 24h / 31d). Three colors: green = on,
+  red = off, **grey = offline** (no `power_minute` row for that
+  bucket — gap-filled by the snapshot builder).
+- **30-day daily-energy bars** below the line chart.
 - **Energy summary** — last hour, today, last 24h, this week, last 7d,
   this month, last 30d, lifetime.
-- **`/<device> export Nd`** — dumps both tables as CSV.
-- **Recent events viewer** — disclosure panel in the app showing the
-  last ~50 plug events from the events/rpc topic.
-- **In-memory power-threshold tuning** — the app's "Tuning" panel can
-  set `power_threshold_watts` / `_duration_s` overrides; lost on
-  restart, re-edit `devices.json` for permanence.
+- **`/<device> export Nd`** — dumps the time series tables as CSV.
 
 `RETENTION_DAYS` env var: `0` (default) keeps forever; `>0` prunes
 older rows once per day. Storage is small — ~3 MB per device per
@@ -133,7 +131,6 @@ that's ~63 MB / month / device.
 | `energy_minute` | Authoritative energy in **mWh** per minute | extracted from Shelly's `aenergy.by_minute[1..2]`; idempotent |
 | `power_minute` | Per-minute average `apower` (W) | aggregated client-side from samples |
 | `energy_hour` | Cumulative `aenergy.total` snapshot per hour | latest sample within the hour wins |
-| `events` | Plug events (firmware, cloud connect, etc.) | from `events/rpc` |
 
 Energy queries are a single SQL `SUM` over a per-minute hybrid
 (`energy_minute` first, `power_minute` integration as fallback for
@@ -147,24 +144,23 @@ Two pieces of state survive `systemctl restart`:
 | File | Holds |
 |---|---|
 | `~/.config/<BOT_NAME>/rules.json` | every pending auto-off / auto-on rule |
-| `~/.config/<BOT_NAME>/history.sqlite` | the five tables above |
+| `~/.config/<BOT_NAME>/history.sqlite` | the four tables above |
 | `~/.config/<BOT_NAME>/app_msgids.json` | which webxdc msgid is registered per chat per device class |
 
-On startup the scheduler:
+On startup `rules.load_into(registry, ...)`:
 
 - **drops one-shot rules whose deadline elapsed during downtime** (firing
   retroactively would surprise you),
 - **re-arms recurring time-of-day rules** to their next future occurrence,
 - **rehydrates consumed-rule sample buffers and idle-rule below-since
-  timestamps from `power_minute`**, so a rule like "off when used <5Wh in
-  10m" doesn't have to wait a fresh 10-minute window before it can fire
-  — if the actual last 10 minutes (in the database) already meet the
-  condition, it fires on the next status update.
+  timestamps from `power_minute`** (via `bot._rehydrate_rules_from_history`),
+  so a rule like "off when used <5Wh in 10m" doesn't have to wait a
+  fresh 10-minute window before it can fire — if the actual last 10
+  minutes (in the database) already meet the condition, it fires on
+  the next status update.
 
-Threshold tuning from the app's "Save to devices.json" button writes the
-bot's own `devices.json` atomically (`.tmp` + `os.replace` after a
-`config.load` validation pass), so a corrupted edit can never replace the
-good file. In-memory `Apply` overrides are lost on restart by design.
+Threshold tuning is via `devices.json` + `systemctl restart` (the
+in-app Tuning UI was removed in v0.2 to keep the surface area small).
 
 Multi-clause example: `/kitchen on for 1h or until used <2Wh in 10m`
 turns on, then off whichever fires first — a hard 1-hour cap *or* the
@@ -305,27 +301,26 @@ No Python edits needed.
 ## Testing
 
 ```bash
-python3 test_mqtt_bot.py           # 57 unit tests (~13 ms)
+python3 test_mqtt_bot.py           # 84 unit tests (~3 s)
 ```
 
 Coverage: `durations`, `templating`, `state` extraction, `permissions`,
-`scheduler` (parse, integrate, deadline, idle ticks, cancel), `config`
-loader (validation paths), and `engine` integration (dispatch, threshold
-detector, on_fire callback, snapshot filtering).
+`rules` (parse_policy, integrate_wh, next_tod_deadline), `config` loader
+(validation paths), `PlugTwin` (on_mqtt edges + threshold + dispatch +
+schedule + cancel + tick_time + dormancy), `snapshot.build_for_chat`,
+`Publisher` (broadcast + push_unicast), and `TwinRegistry`.
 
 ## Known limitations
 
-- `engine._states` is read/written from MQTT thread + scheduler thread
-  without an explicit lock. Python's GIL makes our access pattern (one
-  writer, one reader-of-snapshots) safe in practice; revisit if races
-  ever surface.
-- Bot restart drops pending auto-off/auto-on jobs (in-memory only).
-  Documented behaviour, not a bug.
+- Bot restart re-arms recurring rules and drops expired one-shots, but
+  events that occurred during downtime are not retroactively replayed.
 - No live config reload — edit `devices.json` then `systemctl restart`.
+- The app shows a stale `data Ns ago` timestamp until the next push or
+  refresh; triggers (b)/(c) usually keep that under 5 min.
 
 ## Provenance
 
 Modeled on [`gatekeeper-bot`](../gatekeeper-bot) (Delta Chat ↔ BLE smart
 lock). The bot framework, webxdc plumbing, `app_msgids.json` pattern,
-and systemd template are derived from it; the engine and scheduler are
-new.
+and systemd template are derived from it; the digital-twin core
+(`plug.py` + `twins.py` + `snapshot.py` + `publisher.py`) is new.

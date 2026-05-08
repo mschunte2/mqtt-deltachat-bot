@@ -5,8 +5,7 @@
 
   "subscribe": [
     {"suffix": "online",          "format": "text"},
-    {"suffix": "status/switch:0", "format": "json"},
-    {"suffix": "events/rpc",      "format": "json", "optional": true}
+    {"suffix": "status/switch:0", "format": "json"}
   ],
 
   "commands": {

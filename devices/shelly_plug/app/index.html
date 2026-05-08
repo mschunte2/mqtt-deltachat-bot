@@ -13,6 +13,8 @@
   <header>
     <select id="device-picker" aria-label="device"></select>
     <span id="online-dot" class="dot"></span>
+    <span id="last-update" class="last-update" title="data age">—</span>
+    <button id="btn-refresh" class="refresh" title="Refresh">⟳</button>
   </header>
 
   <section class="state-card">
@@ -36,7 +38,6 @@
     <div class="chart-header">
       <span>Power</span>
       <select id="window-pick" aria-label="time window">
-        <option value="0">live (5 min)</option>
         <option value="3600">1 hour</option>
         <option value="21600">6 hours</option>
         <option value="43200">12 hours</option>
@@ -117,30 +118,6 @@
       <button type="button" class="add-rule-btn" data-action="on">Add auto-on rule</button>
     </form>
   </details>
-
-  <details class="recent-events">
-    <summary>Recent events</summary>
-    <div id="events-list" class="events-list">(loading…)</div>
-  </details>
-
-  <details class="tuning">
-    <summary>Tuning · power threshold</summary>
-    <form id="tune-form">
-      <label>Alert when power ≥
-        <input type="number" id="tune-watts" value="1500" min="0" step="10"> W</label>
-      <label>for at least
-        <input type="number" id="tune-secs"  value="30" min="1"> s</label>
-      <div class="tune-actions">
-        <button type="button" id="tune-apply">Apply (in-memory)</button>
-        <button type="button" id="tune-save">Save to devices.json</button>
-      </div>
-      <small id="tune-status"></small>
-    </form>
-  </details>
-
-  <footer>
-    <small id="last-update">no data yet</small>
-  </footer>
 
   <script src="main.js"></script>
 </body>

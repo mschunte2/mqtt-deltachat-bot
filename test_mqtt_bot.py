@@ -17,7 +17,7 @@ sys.path.insert(0, str(HERE))
 import config as cfg_mod
 import durations
 import permissions
-import scheduler as sched
+import rules as sched
 import state as state_mod
 import templating
 
@@ -460,318 +460,15 @@ class TestParseAllowedChats(unittest.TestCase):
     def test_whitespace(self):
         self.assertEqual(cfg_mod.parse_allowed_chats(" 12 , 34 ,, "), {12, 34})
 
-
-# --- Scheduler integration: timer fires + cancel by manual action --------
-
-class TestSchedulerJob(unittest.TestCase):
-    def test_cancel_returns_jobs(self):
-        fires = []
-        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
-        job = sched.ScheduledJob(
-            device_name="kitchen", chat_id_origin=12, target_action="off",
-            deadline_ts=int(time.time()) + 3600, _time_mode="timer",
-        )
-        s.schedule(job)
-        cancelled = s.cancel("kitchen", target_action="off")
-        self.assertEqual(len(cancelled), 1)
-        # second cancel returns empty
-        self.assertEqual(s.cancel("kitchen", target_action="off"), [])
-
-    def test_cancel_only_matching_action(self):
-        s = sched.Scheduler(on_fire=lambda *a: None)
-        s.schedule(sched.ScheduledJob(
-            device_name="kitchen", chat_id_origin=12, target_action="off",
-            deadline_ts=int(time.time()) + 3600))
-        s.schedule(sched.ScheduledJob(
-            device_name="kitchen", chat_id_origin=12, target_action="on",
-            deadline_ts=int(time.time()) + 3600))
-        # cancel only "off" should leave the "on" job alone
-        cancelled = s.cancel("kitchen", target_action="off")
-        self.assertEqual(len(cancelled), 1)
-        remaining = s.jobs_for_device("kitchen")
-        self.assertEqual(len(remaining), 1)
-        self.assertEqual(remaining[0].target_action, "on")
-
-    def test_multiple_rules_per_device_action(self):
-        # Schedule three different auto-off rules; they should all coexist.
-        s = sched.Scheduler(on_fire=lambda *a: None)
-        d = sched.PolicyDefaults(idle_field="apower", idle_threshold=5,
-                                  idle_duration_s=60,
-                                  consumed_field="apower",
-                                  consumed_threshold_wh=5,
-                                  consumed_window_s=600)
-        now = int(time.time())
-        for clause in ("for 30m", "if idle 10W 60s", "if idle 5Wh in 5m"):
-            policy = sched.parse_policy(clause, d)
-            s.schedule(sched.ScheduledJob.from_policy(
-                policy, "kitchen", chat_id_origin=12,
-                target_action="off", now=now,
-            ))
-        jobs = s.jobs_for_device("kitchen")
-        self.assertEqual(len(jobs), 3)
-        # All distinct rule_ids
-        rids = {j.rule_id for j in jobs}
-        self.assertEqual(len(rids), 3)
-
-    def test_re_adding_identical_rule_replaces(self):
-        s = sched.Scheduler(on_fire=lambda *a: None)
-        d = sched.PolicyDefaults()
-        now = int(time.time())
-        for _ in range(3):
-            p = sched.parse_policy("for 30m", d)
-            s.schedule(sched.ScheduledJob.from_policy(
-                p, "kitchen", 12, "off", now,
-            ))
-        # Same content → same rule_id → only one job
-        self.assertEqual(len(s.jobs_for_device("kitchen")), 1)
-
-    def test_cancel_by_rule_id(self):
-        s = sched.Scheduler(on_fire=lambda *a: None)
-        d = sched.PolicyDefaults()
-        now = int(time.time())
-        p1 = sched.parse_policy("for 30m", d)
-        p2 = sched.parse_policy("at 18h", d)
-        s.schedule(sched.ScheduledJob.from_policy(p1, "k", 12, "off", now))
-        s.schedule(sched.ScheduledJob.from_policy(p2, "k", 12, "off", now))
-        rid_to_keep = s.jobs_for_device("k")[0].rule_id
-        rid_to_drop = s.jobs_for_device("k")[1].rule_id
-        cancelled = s.cancel("k", target_action="off", rule_id=rid_to_drop)
-        self.assertEqual(len(cancelled), 1)
-        remaining = s.jobs_for_device("k")
-        self.assertEqual(len(remaining), 1)
-        self.assertEqual(remaining[0].rule_id, rid_to_keep)
-
-    def test_persist_round_trip(self):
-        # Schedule a few rules → close → reopen → all restored.
-        path = Path(tempfile.mkdtemp()) / "rules.json"
-        s1 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
-        d = sched.PolicyDefaults()
-        for clause in ("for 1h", "if idle 5W 60s", "at 7h daily"):
-            policy = sched.parse_policy(clause, d)
-            s1.schedule(sched.ScheduledJob.from_policy(
-                policy, "kitchen", 12, "off", int(time.time()),
-            ))
-        self.assertTrue(path.exists())
-
-        # Fresh scheduler with same path — should pick up the rules.
-        s2 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
-        loaded = s2.load_persisted()
-        self.assertEqual(loaded, 3)
-        self.assertEqual(len(s2.jobs_for_device("kitchen")), 3)
-        # Recurring TOD survives.
-        rules = s2.jobs_for_device("kitchen")
-        self.assertTrue(any(j.recurring_tod for j in rules))
-
-    def test_parse_once_keyword(self):
-        d = sched.PolicyDefaults()
-        for clause in ("if idle once", "once if idle", "for 30m once",
-                       "once at 18h", "if idle 5W 60s once"):
-            p = sched.parse_policy(clause, d)
-            self.assertTrue(p.once, f"failed for clause {clause!r}")
-        # Without "once": default recurring (False)
-        p = sched.parse_policy("if idle 5W 60s", d)
-        self.assertFalse(p.once)
-
-    def test_recurring_idle_rule_re_arms(self):
-        # Without `once`, an idle rule re-arms after firing.
-        fires = []
-        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
-        now = int(time.time())
-        s.schedule(sched.ScheduledJob(
-            device_name="k", chat_id_origin=1, target_action="off",
-            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
-            once=False,
-        ))
-        # Drive below threshold until first fire (output=True so not dormant).
-        s.tick("k", {"apower": 1.0, "output": True}, now=now)
-        s.tick("k", {"apower": 1.0, "output": True}, now=now + 65)
-        self.assertEqual(len(fires), 1)
-        # Job should still be there (recurring).
-        self.assertEqual(len(s.jobs_for_device("k")), 1)
-        # Drive again — should fire again.
-        s.tick("k", {"apower": 1.0, "output": True}, now=now + 130)
-        s.tick("k", {"apower": 1.0, "output": True}, now=now + 195)
-        self.assertEqual(len(fires), 2)
-
-    def test_once_idle_rule_self_deletes(self):
-        fires = []
-        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
-        now = int(time.time())
-        s.schedule(sched.ScheduledJob(
-            device_name="k", chat_id_origin=1, target_action="off",
-            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
-            once=True,
-        ))
-        s.tick("k", {"apower": 1.0, "output": True}, now=now)
-        s.tick("k", {"apower": 1.0, "output": True}, now=now + 65)
-        self.assertEqual(len(fires), 1)
-        # Once-rule is gone after firing.
-        self.assertEqual(len(s.jobs_for_device("k")), 0)
-
-    def test_dormant_when_already_in_target(self):
-        # An off-rule does nothing while the device is already off.
-        fires = []
-        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
-        now = int(time.time())
-        s.schedule(sched.ScheduledJob(
-            device_name="k", chat_id_origin=1, target_action="off",
-            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
-        ))
-        # output=False → dormant; the below-threshold readings should NOT
-        # build up _below_since.
-        s.tick("k", {"apower": 1.0, "output": False}, now=now)
-        s.tick("k", {"apower": 1.0, "output": False}, now=now + 65)
-        s.tick("k", {"apower": 1.0, "output": False}, now=now + 200)
-        self.assertEqual(fires, [])
-        # Once the device flips on, the rule starts evaluating fresh.
-        s.tick("k", {"apower": 1.0, "output": True}, now=now + 1000)
-        s.tick("k", {"apower": 1.0, "output": True}, now=now + 1070)
-        self.assertEqual(len(fires), 1)
-
-    def test_migration_old_rules_default_once(self):
-        # Pre-v1.5 rules.json had no `once` field and one-shot was the
-        # default for non-recurring rules. Loader should preserve that.
-        path = Path(tempfile.mkdtemp()) / "rules.json"
-        path.write_text(json.dumps({"jobs": [
-            # Old non-recurring rule (no `once`, no `recurring_tod`)
-            {"device_name": "k", "chat_id_origin": 1, "target_action": "off",
-             "rule_id": "consumed:5Wh:600s", "deadline_ts": None,
-             "consumed_field": "apower", "consumed_threshold_wh": 5.0,
-             "consumed_window_s": 600},
-            # Old recurring TOD
-            {"device_name": "k", "chat_id_origin": 1, "target_action": "on",
-             "rule_id": "tod:0700d", "deadline_ts": 9999999999,
-             "time_of_day": [7, 0], "recurring_tod": True,
-             "_time_mode": "tod"},
-        ]}))
-        s = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
-        s.load_persisted()
-        jobs = {j.rule_id: j for j in s.jobs_for_device("k")}
-        # Old non-recurring → once=True (preserved)
-        self.assertTrue(jobs["consumed:5Wh:600s"].once)
-        # Old recurring TOD → once=False (was already recurring)
-        self.assertFalse(jobs["tod:0700d"].once)
-
-    def test_persist_drops_expired_oneshots(self):
-        path = Path(tempfile.mkdtemp()) / "rules.json"
-        s1 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
-        # Manually schedule a one-shot timer with a deadline in the past.
-        old = sched.ScheduledJob(
-            device_name="k", chat_id_origin=1, target_action="off",
-            rule_id="timer:60",
-            deadline_ts=int(time.time()) - 7200,  # 2h ago
-            _time_mode="timer",
-        )
-        s1.schedule(old)
-        s2 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
-        loaded = s2.load_persisted()
-        self.assertEqual(loaded, 0)  # expired one-shot dropped
-        self.assertEqual(len(s2.jobs_for_device("k")), 0)
-
-    def test_persist_rearms_expired_recurring_tod(self):
-        path = Path(tempfile.mkdtemp()) / "rules.json"
-        s1 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
-        old = sched.ScheduledJob(
-            device_name="k", chat_id_origin=1, target_action="on",
-            rule_id="tod:0700d",
-            deadline_ts=int(time.time()) - 3600,  # passed
-            time_of_day=(7, 0), recurring_tod=True, _time_mode="tod",
-        )
-        s1.schedule(old)
-        s2 = sched.Scheduler(on_fire=lambda *a: None, persist_path=path)
-        s2.load_persisted()
-        rules = s2.jobs_for_device("k")
-        self.assertEqual(len(rules), 1)
-        # Re-armed to the future.
-        self.assertGreater(rules[0].deadline_ts, int(time.time()))
-
-    def test_derive_rule_id_distinguishes_different_policies(self):
-        d = sched.PolicyDefaults()
-        a = sched.parse_policy("for 30m", d)
-        b = sched.parse_policy("for 60m", d)
-        c = sched.parse_policy("for 30m", d)  # same as a
-        self.assertNotEqual(sched.derive_rule_id(a), sched.derive_rule_id(b))
-        self.assertEqual(sched.derive_rule_id(a), sched.derive_rule_id(c))
-
-    def test_idle_fires_when_below_for_long_enough(self):
-        fires = []
-        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
-        now = int(time.time())
-        job = sched.ScheduledJob(
-            device_name="kitchen", chat_id_origin=12, target_action="off",
-            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
-        )
-        s.schedule(job)
-        # First tick at t0: power 1 → just below; below_since set to now
-        s.tick("kitchen", {"apower": 1.0}, now=now)
-        self.assertEqual(fires, [])
-        # Tick 30s later: still below, but only 30s elapsed
-        s.tick("kitchen", {"apower": 1.0}, now=now + 30)
-        self.assertEqual(fires, [])
-        # Tick 70s later: 70 >= 60 → fires
-        s.tick("kitchen", {"apower": 1.0}, now=now + 70)
-        self.assertEqual(len(fires), 1)
-        device, chat, target, mode, ctx = fires[0]
-        self.assertEqual(device, "kitchen")
-        self.assertEqual(target, "off")
-        self.assertEqual(mode, "idle")
-
-    def test_idle_fire_includes_threshold_and_duration_human(self):
-        fires = []
-        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
-        now = int(time.time())
-        s.schedule(sched.ScheduledJob(
-            device_name="k", chat_id_origin=1, target_action="off",
-            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
-        ))
-        s.tick("k", {"apower": 1.0}, now=now)
-        s.tick("k", {"apower": 1.0}, now=now + 65)
-        self.assertEqual(len(fires), 1)
-        _, _, _, _, ctx = fires[0]
-        self.assertEqual(ctx["threshold"], 5.0)
-        self.assertEqual(ctx["seconds"], 65)
-        self.assertEqual(ctx["duration_human"], "1m5s")
-
-    def test_consumed_fire_includes_threshold_and_window_human(self):
-        fires = []
-        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
-        now = int(time.time())
-        s.schedule(sched.ScheduledJob(
-            device_name="k", chat_id_origin=1, target_action="off",
-            consumed_field="apower", consumed_threshold_wh=5.0,
-            consumed_window_s=120, _consumed_started_at=now - 200,
-        ))
-        # apower=1 W constant for 120s ≈ 0.033 Wh, well below 5 Wh
-        s.tick("k", {"apower": 1.0}, now=now)
-        s.tick("k", {"apower": 1.0}, now=now + 1)
-        self.assertEqual(len(fires), 1)
-        _, _, _, _, ctx = fires[0]
-        self.assertEqual(ctx["threshold"], 5.0)
-        self.assertEqual(ctx["seconds"], 120)
-        self.assertEqual(ctx["window_human"], "2m")
-
-    def test_idle_resets_when_above(self):
-        fires = []
-        s = sched.Scheduler(on_fire=lambda *a: fires.append(a))
-        now = int(time.time())
-        s.schedule(sched.ScheduledJob(
-            device_name="k", chat_id_origin=1, target_action="off",
-            idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
-        ))
-        s.tick("k", {"apower": 1.0}, now=now)
-        s.tick("k", {"apower": 100.0}, now=now + 30)  # spike — resets
-        s.tick("k", {"apower": 1.0}, now=now + 60)    # 60s still not enough since reset
-        self.assertEqual(fires, [])
-
-
-# --- engine integration ---------------------------------------------------
+# --- PlugTwin / Publisher / snapshot integration ------------------------
 #
-# These tests stub deltachat2.MsgData (engine imports it at module level)
-# so we don't need the real package installed. We also use stub objects
-# for bot.rpc, mqtt, webxdc, scheduler so we can observe what the engine
-# tries to do without any network or thread.
+# We stub deltachat2.MsgData here so plug.py + bot.py imports don't fail
+# without the real package installed. The tests below stub the four
+# side-effecting callables (mqtt_publish, post_to_chats, broadcast,
+# react) and feed inputs into the twin directly.
 
-import types as _types
+import logging  # noqa: E402
+import types as _types  # noqa: E402
 
 _deltachat_stub = _types.ModuleType("deltachat2")
 class _MsgData:
@@ -781,455 +478,328 @@ class _MsgData:
 _deltachat_stub.MsgData = _MsgData
 sys.modules.setdefault("deltachat2", _deltachat_stub)
 
-import engine as engine_mod  # noqa: E402  (after sys.modules patch)
+import plug as plug_mod  # noqa: E402
+import publisher as publisher_mod  # noqa: E402
+import snapshot as snap_mod  # noqa: E402
+from twins import TwinRegistry  # noqa: E402
 
 
-class _StubMqtt:
-    def __init__(self):
-        self.published: list[tuple[str, str]] = []
-    def publish(self, topic, payload, qos=0, retain=False):
-        self.published.append((topic, payload))
+# --- Class fixture: same shape config.load() produces from class.json ---
+
+CLASS_JSON_OK = {
+    "name": "tplug",
+    "app_id": "tplug",
+    "description": "test plug",
+    "subscribe": [
+        {"suffix": "online", "format": "text"},
+        {"suffix": "status/switch:0", "format": "json"},
+    ],
+    "commands": {
+        "on":  {"suffix": "command/switch:0", "payload": "on"},
+        "off": {"suffix": "command/switch:0", "payload": "off"},
+    },
+    "state_fields": {
+        "online":  {"from_suffix": "online", "extract": "bool_text"},
+        "output":  {"from_suffix": "status/switch:0", "json_path": "output"},
+        "apower":  {"from_suffix": "status/switch:0", "json_path": "apower"},
+        "aenergy": {"from_suffix": "status/switch:0",
+                    "json_path": "aenergy.total"},
+    },
+    "chat_events": [
+        {"type": "on_change", "field": "output",
+         "values": {"true": "💡 {name} ON", "false": "💡 {name} OFF"}},
+        {"type": "threshold", "field": "apower",
+         "limit_param": "power_threshold_watts",
+         "duration_param": "power_threshold_duration_s",
+         "above": "⚠️ {name} {value:.0f}W for {seconds}s",
+         "below": "✅ {name} cleared"},
+    ],
+    "auto_off": {
+        "command": "off",
+        "default_idle_field": "apower",
+        "default_idle_threshold": 5.0,
+        "default_idle_duration": 60,
+        "default_consumed_field": "apower",
+        "default_consumed_threshold_wh": 5.0,
+        "default_consumed_window_s": 600,
+        "trigger_messages": {
+            "timer": "🕐 {name} timer", "tod": "📅 {name} {hh}:{mm}",
+            "idle": "💤 {name} idle", "consumed": "🔋 {name} consumed",
+            "cancelled_manual": "↩️ {name} cancelled",
+        },
+    },
+    "auto_on": {
+        "command": "on",
+        "trigger_messages": {
+            "tod": "📅 {name} on at {hh}:{mm}",
+            "cancelled_manual": "↩️ {name} on-cancelled",
+        },
+    },
+}
 
 
-class _StubWebxdc:
-    def __init__(self):
-        self.pushes = 0
-    def push_filtered(self, *_a, **_kw):
-        self.pushes += 1
-    def class_for_msgid(self, *_a):
-        return None
-
-
-class _StubScheduler:
-    """Mirror the real Scheduler's keying: (device, target_action, rule_id)
-    so parallel rules with distinct rule_ids coexist in the stub the same
-    way they do in production."""
-    def __init__(self):
-        self._jobs: dict[tuple[str, str, str], object] = {}
-        self.cancel_calls: list[tuple[str, str | None]] = []
-    def schedule(self, job):
-        rid = getattr(job, "rule_id", None) or "default"
-        self._jobs[(job.device_name, job.target_action, rid)] = job
-    def cancel(self, device_name, target_action=None, rule_id=None):
-        self.cancel_calls.append((device_name, target_action))
-        out = []
-        for k in list(self._jobs.keys()):
-            if k[0] != device_name:
-                continue
-            if target_action is not None and k[1] != target_action:
-                continue
-            if rule_id is not None and k[2] != rule_id:
-                continue
-            out.append(self._jobs.pop(k))
-        return out
-    def jobs_for_device(self, device_name):
-        return [j for k, j in self._jobs.items() if k[0] == device_name]
-    def all_jobs(self):
-        return list(self._jobs.values())
-    def tick(self, *_a, **_kw):
-        pass
-
-
-class _StubBotRpc:
-    def __init__(self):
-        self.sent: list[tuple[int, str]] = []
-        self.reactions: list[tuple[int, list[str]]] = []
-    def send_msg(self, _accid, chat_id, msg):
-        self.sent.append((chat_id, msg.text))
-    def send_reaction(self, _accid, msgid, emojis):
-        self.reactions.append((msgid, emojis))
-
-
-class _StubBot:
-    def __init__(self):
-        self.rpc = _StubBotRpc()
-        self.logger = logging.getLogger("test")
-
-
-import logging  # noqa: E402
-from pathlib import Path as _P  # noqa: E402
-
-
-def _build_engine_with_class(class_overrides=None, device_overrides=None):
-    """Build an Engine wired to stubs against a temp config dir."""
-    tmp = _P(tempfile.mkdtemp())
-    cls_def = json.loads(json.dumps(CLASS_JSON_OK))  # deep copy
+def _build_twin(class_overrides=None, params=None, allowed_chats=(12,)):
+    """Build a single PlugTwin against an in-memory class+device config
+    and a stub TwinDeps. Returns (twin, calls), where calls is a dict
+    that records all side-effect invocations."""
+    cls_def = json.loads(json.dumps(CLASS_JSON_OK))
     if class_overrides:
         cls_def.update(class_overrides)
+    tmp = Path(tempfile.mkdtemp())
     cls_dir = tmp / "devices" / "tplug"
     cls_dir.mkdir(parents=True)
     (cls_dir / "class.json").write_text(json.dumps(cls_def))
-    instance = {
-        "devices": [{
-            "name": "kitchen", "class": "tplug",
-            "topic_prefix": "p/kitchen", "allowed_chats": [12],
-            "power_threshold_watts": 1500,
-            "power_threshold_duration_s": 30,
-        }],
-    }
-    if device_overrides:
-        instance["devices"][0].update(device_overrides)
-    (tmp / "devices.json").write_text(json.dumps(instance))
-    cfg = cfg_mod.load(devices_dir=tmp / "devices",
-                       instances_file=tmp / "devices.json")
-    e = engine_mod.Engine(
-        cfg=cfg,
-        allowed_chats={12},
-        mqtt=_StubMqtt(),
-        webxdc=_StubWebxdc(),
-        scheduler=_StubScheduler(),
-        client_id="bot",
+    instance = {"devices": [{
+        "name": "kitchen", "class": "tplug",
+        "topic_prefix": "p/kitchen",
+        "allowed_chats": list(allowed_chats),
+        **(params or {}),
+    }]}
+    inst_path = tmp / "devices.json"
+    inst_path.write_text(json.dumps(instance))
+    cfg = cfg_mod.load(devices_dir=tmp / "devices", instances_file=inst_path)
+
+    calls = {"published": [], "posted": [], "broadcasts": [],
+             "saves": 0, "reactions": []}
+    deps = plug_mod.TwinDeps(
+        mqtt_publish=lambda t, p: calls["published"].append((t, p)),
+        post_to_chats=lambda dev, txt: calls["posted"].append((dev.name, txt)),
+        broadcast=lambda name=None: calls["broadcasts"].append(name),
+        save_rules=lambda: calls.__setitem__("saves", calls["saves"] + 1),
+        react=lambda mid, e: calls["reactions"].append((mid, e)),
+        history=None,
+        client_id="tester",
     )
-    e.set_bot(_StubBot(), accid=1)
-    return e
+    twin = plug_mod.PlugTwin(
+        cls=cfg.classes["tplug"], cfg=cfg.devices["kitchen"], deps=deps,
+    )
+    return twin, calls, cfg
 
 
-class TestEngineDispatch(unittest.TestCase):
-    def test_unknown_device(self):
-        e = _build_engine_with_class()
-        ok, msg = e.dispatch_command(12, "ghost", "on")
-        self.assertFalse(ok)
-        self.assertIn("unknown", msg)
+# --- on_mqtt: state extraction, on_change, threshold ---------------------
 
-    def test_permission_denied_for_chat_not_in_device_list(self):
-        e = _build_engine_with_class()
-        ok, msg = e.dispatch_command(99, "kitchen", "on")
-        self.assertFalse(ok)
-        self.assertEqual(msg, "permission denied")
+class TestPlugTwinOnMqtt(unittest.TestCase):
+    def test_on_change_fires_post_and_broadcast(self):
+        twin, calls, _ = _build_twin()
+        # First arrival: prev=None, new=False — that IS a transition, so
+        # on_change fires (good — boot-up shows initial state in chat).
+        twin.on_mqtt("status/switch:0", json.dumps({"output": False}).encode())
+        self.assertEqual(twin.fields.get("output"), False)
+        self.assertEqual(calls["broadcasts"][-1], "kitchen")
 
-    def test_unknown_action(self):
-        e = _build_engine_with_class()
-        ok, msg = e.dispatch_command(12, "kitchen", "explode")
+        # Re-deliver same value → no edge, no broadcast.
+        broadcasts_before = len(calls["broadcasts"])
+        twin.on_mqtt("status/switch:0", json.dumps({"output": False}).encode())
+        self.assertEqual(len(calls["broadcasts"]), broadcasts_before)
+
+        # Flip → on_change fires and broadcasts.
+        twin.on_mqtt("status/switch:0", json.dumps({"output": True}).encode())
+        self.assertEqual(twin.fields["output"], True)
+        self.assertIn(("kitchen", "💡 kitchen ON"), calls["posted"])
+        self.assertEqual(calls["broadcasts"][-1], "kitchen")
+
+    def test_threshold_above_then_below(self):
+        twin, calls, _ = _build_twin(params={
+            "power_threshold_watts": 100,
+            "power_threshold_duration_s": 1,
+        })
+        # First sample above: latches above_since.
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 200}).encode())
+        # No fire yet because duration not met.
+        self.assertFalse(any("⚠" in t for _, t in calls["posted"]))
+        time.sleep(1.5)
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 200}).encode())
+        # Above duration: above-template should have fired.
+        self.assertTrue(any("⚠" in t for _, t in calls["posted"]))
+        # Now drop below threshold — below-template fires.
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 50}).encode())
+        self.assertTrue(any("✅" in t for _, t in calls["posted"]))
+
+
+# --- dispatch: publish + cancel + react + broadcast ----------------------
+
+class TestPlugTwinDispatch(unittest.TestCase):
+    def test_dispatch_publishes_and_broadcasts(self):
+        twin, calls, _ = _build_twin()
+        ok, msg = twin.dispatch("on", source_msgid=42)
+        self.assertTrue(ok)
+        self.assertEqual(calls["published"], [("p/kitchen/command/switch:0", "on")])
+        self.assertEqual(calls["reactions"], [(42, "🆗")])
+        self.assertEqual(calls["broadcasts"], ["kitchen"])
+
+    def test_dispatch_unknown_action(self):
+        twin, calls, _ = _build_twin()
+        ok, msg = twin.dispatch("blender")
         self.assertFalse(ok)
         self.assertIn("unknown action", msg)
+        self.assertEqual(calls["published"], [])
 
-    def test_publish_on_success(self):
-        e = _build_engine_with_class()
-        ok, _ = e.dispatch_command(12, "kitchen", "on")
+    def test_dispatch_cancels_same_direction_pending_rule(self):
+        twin, calls, _ = _build_twin()
+        # Schedule an auto-off, then dispatch off manually.
+        policy = sched.ScheduledPolicy(timer_seconds=1800)
+        twin.schedule("off", policy, chat_id_origin=12)
+        self.assertEqual(len(twin.rules), 1)
+        calls["broadcasts"].clear()
+        calls["posted"].clear()
+        ok, _ = twin.dispatch("off")
         self.assertTrue(ok)
-        self.assertEqual(e.mqtt.published, [("p/kitchen/command/switch:0", "on")])
+        self.assertEqual(len(twin.rules), 0)  # cancelled
+        self.assertTrue(any("cancelled" in t for _, t in calls["posted"]))
 
-    def test_template_substitution(self):
-        e = _build_engine_with_class()
-        ok, _ = e.dispatch_command(12, "kitchen", "status")
+
+# --- schedule + cancel ---------------------------------------------------
+
+class TestPlugTwinSchedule(unittest.TestCase):
+    def test_schedule_appends_to_rules(self):
+        twin, calls, _ = _build_twin()
+        policy = sched.ScheduledPolicy(timer_seconds=600)
+        ok, msg = twin.schedule("off", policy, chat_id_origin=12)
         self.assertTrue(ok)
-        topic, payload = e.mqtt.published[0]
-        self.assertEqual(topic, "p/kitchen/rpc")
-        self.assertIn('"src":"bot"', payload)
+        self.assertEqual(len(twin.rules), 1)
+        self.assertEqual(calls["saves"], 1)
+        self.assertEqual(calls["broadcasts"], ["kitchen"])
 
-    def test_manual_off_cancels_pending_auto_off(self):
-        e = _build_engine_with_class()
-        # Pre-seed a fake auto-off job
-        from scheduler import ScheduledJob
-        e.scheduler.schedule(ScheduledJob(
-            device_name="kitchen", chat_id_origin=12, target_action="off",
-            deadline_ts=int(time.time()) + 600,
-        ))
-        e.dispatch_command(12, "kitchen", "off")
-        # cancel should have been called for action="off"
-        self.assertEqual(e.scheduler.cancel_calls,
-                         [("kitchen", "off")])
-        # cancellation chat message should have been posted
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertTrue(any("cancelled" in (t or "").lower() for t in sent),
-                        f"expected cancelled message; got {sent}")
+    def test_schedule_replaces_same_rule_id(self):
+        twin, _, _ = _build_twin()
+        # Same policy → same rule_id → replace.
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=600), 12)
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=600), 12)
+        self.assertEqual(len(twin.rules), 1)
 
+    def test_schedule_keeps_distinct_rule_ids(self):
+        twin, _, _ = _build_twin()
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=600), 12)
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=1800), 12)
+        self.assertEqual(len(twin.rules), 2)
 
-class TestEngineThreshold(unittest.TestCase):
-    def test_threshold_fires_after_sustained_above(self):
-        e = _build_engine_with_class()
-        device = e.cfg.devices["kitchen"]
-        # Drive power above threshold for >= duration via repeated on_message.
-        # We simulate two updates: first sets above_since, second exceeds duration.
-        cls = e.cfg.device_class(device)
-        # Seed via on_mqtt_message — pretend the plug published a status JSON.
-        topic = "p/kitchen/status/switch:0"
-        e.on_mqtt_message(topic, json.dumps({"output": True, "apower": 2000}).encode())
-        # Inject above_since back in time so the second message exceeds duration.
-        ts = e._thresholds[("kitchen", "apower")]
-        ts.above_since = int(time.time()) - 31  # > 30s threshold duration
-        e.on_mqtt_message(topic, json.dumps({"output": True, "apower": 2100}).encode())
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertTrue(any("drew" in (t or "") for t in sent),
-                        f"expected ⚠️ drew message; got {sent}")
-
-    def test_threshold_clears(self):
-        e = _build_engine_with_class()
-        topic = "p/kitchen/status/switch:0"
-        # Trip the alert
-        e.on_mqtt_message(topic, json.dumps({"apower": 2000}).encode())
-        e._thresholds[("kitchen", "apower")].above_since = int(time.time()) - 31
-        e.on_mqtt_message(topic, json.dumps({"apower": 2100}).encode())
-        self.assertTrue(e._thresholds[("kitchen", "apower")].active)
-        # Drop below
-        e.on_mqtt_message(topic, json.dumps({"apower": 5}).encode())
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertTrue(any("cleared" in (t or "") for t in sent),
-                        f"expected ✅ cleared message; got {sent}")
-        self.assertFalse(e._thresholds[("kitchen", "apower")].active)
+    def test_cancel_filters(self):
+        twin, _, _ = _build_twin()
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=600), 12)
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=1800), 12)
+        cancelled = twin.cancel(target_action="off")
+        self.assertEqual(len(cancelled), 2)
+        self.assertEqual(twin.rules, [])
 
 
-class TestEngineOnFire(unittest.TestCase):
-    def test_on_fire_publishes_and_posts(self):
-        e = _build_engine_with_class()
-        e.on_fire("kitchen", chat_id_origin=12,
-                  target_action="off", mode="timer", ctx={})
-        self.assertEqual(e.mqtt.published, [("p/kitchen/command/switch:0", "off")])
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertTrue(any("auto-off (timer)" in (t or "") for t in sent),
-                        f"expected timer message; got {sent}")
+# --- tick_time: deadline → fire / re-arm / drop --------------------------
 
-    def test_on_fire_idle_uses_idle_template(self):
-        e = _build_engine_with_class()
-        e.on_fire("kitchen", chat_id_origin=12, target_action="off",
-                  mode="idle", ctx={"value": 1.5, "seconds": 60, "field": "apower"})
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertTrue(any("auto-off (idle" in (t or "") for t in sent),
-                        f"expected idle message; got {sent}")
+class TestPlugTwinTickTime(unittest.TestCase):
+    def test_one_shot_fires_and_drops(self):
+        twin, calls, _ = _build_twin()
+        twin.fields["output"] = True   # not dormant for off-rule
+        policy = sched.ScheduledPolicy(timer_seconds=1, once=True)
+        twin.schedule("off", policy, 12)
+        twin.tick_time(int(time.time()) + 5)  # past the deadline
+        self.assertEqual(twin.rules, [])
+        self.assertIn(("p/kitchen/command/switch:0", "off"), calls["published"])
+        self.assertTrue(any("🕐" in t for _, t in calls["posted"]))
 
-    def test_on_fire_publishes_even_when_already_in_target_state(self):
-        # In OR-combined parallel rules, every fire should be visible.
-        # Republish + chat message even if cached output already matches —
-        # the user wants confirmation that each rule independently tripped.
-        e = _build_engine_with_class()
-        e._states["kitchen"].set("output", False)  # already off
-        e.on_fire("kitchen", chat_id_origin=12, target_action="off",
-                  mode="idle", ctx={"value": 0.1, "seconds": 60, "field": "apower"})
-        self.assertEqual(len(e.mqtt.published), 1)
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertTrue(any("auto-off" in (t or "").lower() for t in sent))
+    def test_recurring_timer_rearms(self):
+        twin, _, _ = _build_twin()
+        twin.fields["output"] = True
+        policy = sched.ScheduledPolicy(timer_seconds=1, once=False)
+        twin.schedule("off", policy, 12)
+        deadline_before = twin.rules[0].deadline_ts
+        twin.tick_time(int(time.time()) + 5)
+        # Same rule still present, deadline pushed forward.
+        self.assertEqual(len(twin.rules), 1)
+        self.assertGreater(twin.rules[0].deadline_ts, deadline_before)
 
-    def test_list_rules_renders_pending_jobs(self):
-        e = _build_engine_with_class()
-        # Schedule two single-clause rules + one OR-combined rule.
-        from scheduler import ScheduledJob, parse_policy
-        d = sched.PolicyDefaults()
-        for clause in ("for 30m", "if idle 5W 60s",
-                       "for 1h or if idle 5W 60s"):
-            policy = parse_policy(clause, d)
-            e.scheduler.schedule(ScheduledJob.from_policy(
-                policy, "kitchen", 12, "off", int(time.time()),
-            ))
-        text = e.list_rules(12, "kitchen")
-        self.assertIn("kitchen:", text)
-        # Single-clause stays inline (no stray "or").
-        self.assertIn("off in", text)
-        self.assertIn("off when apower<5W", text)
-        self.assertNotIn("off or when", text)
-        # OR-combined gets the bulleted multi-line treatment.
-        self.assertIn("off:", text)
-        self.assertIn("  - in", text)
-        self.assertIn("  - when apower<5W", text)
+    def test_dormant_rule_skips_fire_but_rearms(self):
+        twin, calls, _ = _build_twin()
+        twin.fields["output"] = False  # already off → off-rule dormant
+        policy = sched.ScheduledPolicy(timer_seconds=1, once=False)
+        twin.schedule("off", policy, 12)
+        twin.tick_time(int(time.time()) + 5)
+        self.assertEqual(len(twin.rules), 1)         # rearmed
+        self.assertEqual(calls["published"], [])     # but did not fire
 
-    def test_list_rules_empty(self):
-        e = _build_engine_with_class()
-        text = e.list_rules(12)
-        self.assertIn("no rules", text)
 
-    def test_rehydrate_consumed_rule_from_history(self):
-        e = _build_engine_with_class()
-        e.history = history_mod.History(
-            Path(tempfile.mkdtemp()) / "h.sqlite", retention_days=0)
-        try:
-            now = int(time.time())
-            # Fill power_minute with a quiet last 30 min (avg 1 W per minute).
-            for i in range(30):
-                e.history._db.execute(
-                    "INSERT INTO power_minute (device, ts, avg_apower_w, sample_count) "
-                    "VALUES ('kitchen', ?, 1.0, 1)",
-                    (now - (30 - i) * 60,),
-                )
-            e.history._db.commit()
-            # Schedule a consumed rule (would need the full window to elapse
-            # before being able to fire under the original logic).
-            from scheduler import ScheduledJob
-            e.scheduler.schedule(ScheduledJob(
-                device_name="kitchen", chat_id_origin=12, target_action="off",
-                rule_id="consumed:200Wh:1800s",
-                consumed_field="apower", consumed_threshold_wh=200.0,
-                consumed_window_s=1800,
-                _consumed_started_at=now,  # as if loaded from disk
-            ))
-            e.rehydrate_rules_from_history()
-            # The job's _samples should now hold ~30 entries and
-            # _consumed_started_at should have been backdated to the oldest
-            # sample, so integrate_wh can evaluate immediately on next tick.
-            jobs = e.scheduler.jobs_for_device("kitchen")
-            self.assertEqual(len(jobs), 1)
-            j = jobs[0]
-            self.assertGreaterEqual(len(j._samples), 25)  # close to 30
-            self.assertLess(j._consumed_started_at, now - 1500)
-        finally:
-            e.history.close()
+# --- snapshot.build_for_chat --------------------------------------------
 
-    def test_rehydrate_idle_rule_backdates_below_since(self):
-        e = _build_engine_with_class()
-        e.history = history_mod.History(
-            Path(tempfile.mkdtemp()) / "h.sqlite", retention_days=0)
-        try:
-            now = int(time.time())
-            # 5 minutes of low power → idle rule should backdate _below_since.
-            for i in range(5):
-                e.history._db.execute(
-                    "INSERT INTO power_minute (device, ts, avg_apower_w, sample_count) "
-                    "VALUES ('kitchen', ?, 0.5, 1)",
-                    (now - (5 - i) * 60,),
-                )
-            e.history._db.commit()
-            from scheduler import ScheduledJob
-            e.scheduler.schedule(ScheduledJob(
-                device_name="kitchen", chat_id_origin=12, target_action="off",
-                rule_id="idle:5W:300s",
-                idle_field="apower", idle_threshold=5.0, idle_duration_s=300,
-                _below_since=None,
-            ))
-            e.rehydrate_rules_from_history()
-            j = e.scheduler.jobs_for_device("kitchen")[0]
-            self.assertIsNotNone(j._below_since)
-            self.assertLess(j._below_since, now - 240)  # ≥4 min ago
-        finally:
-            e.history.close()
+class TestSnapshot(unittest.TestCase):
+    def test_visible_devices_only(self):
+        twin, _, cfg = _build_twin(allowed_chats=(12,))
+        registry = TwinRegistry([twin])
 
-    def test_list_rules_unknown_device(self):
-        e = _build_engine_with_class()
-        text = e.list_rules(12, "ghost")
-        self.assertIn("unknown device", text)
+        # Chat 12 sees the device.
+        out = snap_mod.build_for_chat(12, "tplug", registry, set())
+        self.assertIn("kitchen", out["devices"])
 
-    def test_handle_webxdc_auto_off_does_not_dispatch(self):
-        # The "Add auto-off rule" button sends action="auto-off" with the
-        # policy in a sibling key. Earlier engine routed this through
-        # dispatch_command which errored "unknown action: auto-off"
-        # because auto-off isn't a class command. The fix special-cases
-        # auto-off / auto-on before dispatch.
-        e = _build_engine_with_class()
-        # Pretend the chat already has a registered webxdc instance.
-        class _W:
-            def class_for_msgid(self, *_a):
-                return "tplug"
-            def push_filtered(self, *a, **k):
-                pass
-            def push_to_msgid(self, *a, **k):
-                return True
-        e.webxdc = _W()
-        e.handle_webxdc_request(
-            chat_id=12, msgid=99,
-            request={
-                "device": "kitchen", "action": "auto-off",
-                "auto_off": {"timer_seconds": 1800},
-            },
+        # Chat 99 does not.
+        self.assertIsNone(snap_mod.build_for_chat(99, "tplug", registry, set()))
+
+    def test_unknown_class_returns_none(self):
+        twin, _, _ = _build_twin()
+        registry = TwinRegistry([twin])
+        self.assertIsNone(snap_mod.build_for_chat(12, "nope", registry, set()))
+
+
+# --- Publisher ----------------------------------------------------------
+
+class TestPublisher(unittest.TestCase):
+    def test_broadcast_iterates_msgid_map(self):
+        sent = []
+        builds = []
+
+        def fake_build(chat, cls):
+            builds.append((chat, cls))
+            return {"class": cls, "devices": {}, "server_ts": 0}
+
+        msgids = {12: {"tplug": 1001}, 14: {"tplug": 2002}}
+        pub = publisher_mod.Publisher(
+            build=fake_build,
+            msgids=lambda: msgids,
+            send=lambda c, m, p: (sent.append((c, m, p)), True)[1],
+            interval_s=300,
         )
-        # No error message should have been posted (the old bug surfaced
-        # "unknown action: auto-off" here).
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertFalse(any("unknown action" in (t or "") for t in sent),
-                         f"got error message; sent={sent}")
-        # And the rule should be in the scheduler.
-        jobs = e.scheduler.jobs_for_device("kitchen")
-        self.assertEqual(len(jobs), 1)
-        self.assertEqual(jobs[0].target_action, "off")
-        self.assertEqual(jobs[0].deadline_ts is not None, True)
+        pub.broadcast()
+        self.assertEqual(builds, [(12, "tplug"), (14, "tplug")])
+        self.assertEqual([(c, m) for c, m, _ in sent], [(12, 1001), (14, 2002)])
 
-    def test_on_fire_threads_action_verb_into_template(self):
-        # Build a class with a template that uses {action_verb} + {threshold}
-        # + {duration_human} so we can prove the enriched ctx flows.
-        cls = json.loads(json.dumps(CLASS_JSON_OK))
-        cls["auto_off"]["trigger_messages"]["consumed"] = (
-            "{name} consumed {value:.2f} Wh < {threshold:.1f} Wh "
-            "in last {window_human}; {action_verb}"
+    def test_push_unicast_skips_when_build_returns_none(self):
+        sent = []
+        pub = publisher_mod.Publisher(
+            build=lambda c, cl: None,
+            msgids=lambda: {},
+            send=lambda c, m, p: (sent.append((c, m, p)), True)[1],
+            interval_s=300,
         )
-        e = _build_engine_with_class(class_overrides=cls)
-        e.on_fire("kitchen", chat_id_origin=12, target_action="off",
-                  mode="consumed",
-                  ctx={"value": 3.21, "threshold": 5.0, "seconds": 600,
-                       "window_human": "10m", "field": "apower"})
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertTrue(
-            any("3.21 Wh < 5.0 Wh in last 10m; switching off" in (t or "")
-                for t in sent),
-            f"expected enriched consumed message; got {sent}")
+        ok = pub.push_unicast(12, 1001, "tplug")
+        self.assertFalse(ok)
+        self.assertEqual(sent, [])
 
 
-class TestEngineSnapshot(unittest.TestCase):
-    def test_snapshot_for_visible_chat(self):
-        e = _build_engine_with_class()
-        snap = e.snapshot_for(12, "tplug")
-        self.assertIsNotNone(snap)
-        self.assertEqual(snap["class"], "tplug")
-        self.assertIn("kitchen", snap["devices"])
+# --- TwinRegistry --------------------------------------------------------
 
-    def test_snapshot_filters_invisible_chat(self):
-        e = _build_engine_with_class()
-        # chat 99 is not in ALLOWED_CHATS and not in device.allowed_chats
-        self.assertIsNone(e.snapshot_for(99, "tplug"))
+class TestTwinRegistry(unittest.TestCase):
+    def test_find_by_topic(self):
+        twin, _, _ = _build_twin()
+        registry = TwinRegistry([twin])
+        found = registry.find_by_topic("p/kitchen/status/switch:0")
+        self.assertIsNotNone(found)
+        self.assertIs(found[0], twin)
+        self.assertEqual(found[1], "status/switch:0")
 
-    def test_snapshot_includes_params_when_history_present(self):
-        e = _build_engine_with_class()
-        e.history = history_mod.History(
-            Path(tempfile.mkdtemp()) / "h.sqlite", retention_days=0)
-        try:
-            snap = e.snapshot_for(12, "tplug")
-            params = snap["devices"]["kitchen"].get("params") or {}
-            self.assertEqual(params.get("power_threshold_watts"), 1500)
-        finally:
-            e.history.close()
+    def test_find_unknown_topic(self):
+        twin, _, _ = _build_twin()
+        registry = TwinRegistry([twin])
+        self.assertIsNone(registry.find_by_topic("nope/whatever"))
+
+    def test_visible_to_filters(self):
+        twin, _, _ = _build_twin(allowed_chats=(12,))
+        registry = TwinRegistry([twin])
+        self.assertEqual(len(registry.visible_to(12, set())), 1)
+        self.assertEqual(len(registry.visible_to(99, set())), 0)
 
 
-class TestEngineSetParam(unittest.TestCase):
-    def _make(self):
-        e = _build_engine_with_class()
-        # The webxdc class lookup is short-circuited; engine's set_param
-        # path runs without it.
-        e.webxdc = _StubWebxdc()
-        return e
-
-    def test_override_applied(self):
-        e = self._make()
-        e._handle_set_param_request(
-            12, "kitchen",
-            {"param": "power_threshold_watts", "value": 200},
-        )
-        self.assertEqual(
-            e._param_overrides["kitchen"]["power_threshold_watts"], 200)
-
-    def test_override_rejects_unknown_param(self):
-        e = self._make()
-        e._handle_set_param_request(
-            12, "kitchen", {"param": "nope", "value": 42})
-        self.assertNotIn("kitchen", e._param_overrides)
-
-    def test_override_rejects_negative(self):
-        e = self._make()
-        e._handle_set_param_request(
-            12, "kitchen",
-            {"param": "power_threshold_watts", "value": -5})
-        self.assertNotIn("kitchen", e._param_overrides)
-
-    def test_override_overrides_threshold_evaluation(self):
-        e = self._make()
-        # Override to a low limit so a small power triggers the rule.
-        e._handle_set_param_request(
-            12, "kitchen",
-            {"param": "power_threshold_watts", "value": 50},
-        )
-        e._handle_set_param_request(
-            12, "kitchen",
-            {"param": "power_threshold_duration_s", "value": 1},
-        )
-        # Run two on_mqtt_message calls with apower=100 across the duration
-        topic = "p/kitchen/status/switch:0"
-        e.on_mqtt_message(topic, json.dumps({"output": True, "apower": 100}).encode())
-        ts_state = e._thresholds[("kitchen", "apower")]
-        ts_state.above_since = int(time.time()) - 5  # past the 1s threshold
-        e.on_mqtt_message(topic, json.dumps({"output": True, "apower": 100}).encode())
-        sent = [t for _, t in e.bot.rpc.sent]
-        self.assertTrue(any("drew" in (t or "") for t in sent),
-                        f"expected ⚠️ drew message; got {sent}")
-
-
-# --- history -------------------------------------------------------------
+# --- History (must come after the deltachat2 stub) ----------------------
 
 import history as history_mod  # noqa: E402
-
 
 class TestHistory(unittest.TestCase):
     def setUp(self):
@@ -1293,18 +863,6 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(rows[0][0], 0)
         self.assertEqual(rows[1][0], 3600)
 
-    def test_write_event_extracts_method(self):
-        self.h.write_event("k", 100, "events/rpc",
-                           '{"method":"NotifyStatus","params":{}}')
-        rows = self.h.query_events("k", 0, 1000)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][2], "NotifyStatus")  # kind
-
-    def test_write_event_handles_bad_json(self):
-        self.h.write_event("k", 100, "events/rpc", "not json")
-        rows = self.h.query_events("k", 0, 1000)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][2], "")  # kind is empty for non-JSON
 
     def test_query_power_downsamples(self):
         # Insert 240 minutes of data, ask for 60 points → bucket ≥ 240s

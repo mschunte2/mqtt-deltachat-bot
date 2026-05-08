@@ -1,13 +1,15 @@
-"""Webxdc app delivery + per-instance state pushing.
+"""Webxdc app delivery + msgid registry.
 
 Owns:
   - app_msgids.json (atomic load/save):  chat_id -> {class_name -> msgid}
   - /apps onboarding flow                (send fresh xdc, retract withdrawn)
-  - per-chat filtered status updates     (broadcast snapshots tailored
-                                          to each chat's visible devices)
+  - push_to_msgid                        (low-level webxdc status update)
 
-Not pure: writes files, calls bot.rpc. The engine and bot.py are the
-only callers.
+Snapshot fan-out (was push_filtered) moved to publisher.py + snapshot.py
+in v0.2 — this module is now just the registry + transport.
+
+Not pure: writes files, calls bot.rpc. The bot routing layer and
+publisher are the only callers.
 """
 
 from __future__ import annotations
@@ -15,7 +17,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable
 from pathlib import Path
 
 log = logging.getLogger("mqtt_bot.webxdc")
@@ -155,25 +156,9 @@ class WebxdcIO:
             log.warning("push to msgid=%d failed: %s", msgid, ex)
             return False
 
-    def push_filtered(
-        self,
-        bot,
-        accid: int,
-        snapshot_for: Callable[[int, str], dict | None],
-    ) -> int:
-        """For every (chat, class), build a snapshot via snapshot_for and
-        push as a webxdc status update. Returns count of successful pushes.
-        """
-        pushed = 0
-        for chat_id, apps in list(self._map.items()):
-            for cls, msgid in apps.items():
-                snap = snapshot_for(chat_id, cls)
-                if snap is None:
-                    continue
-                dev_count = len(snap.get("devices", {})) if isinstance(snap, dict) else 0
-                ok = self.push_to_msgid(bot, accid, msgid, snap)
-                log.debug("push chat=%d class=%s msgid=%d devices=%d ok=%s",
-                          chat_id, cls, msgid, dev_count, ok)
-                if ok:
-                    pushed += 1
-        return pushed
+    def map_snapshot(self) -> dict[int, dict[str, int]]:
+        """Return a defensive copy of the (chat_id → {class → msgid}) map.
+        Used by Publisher.broadcast — taking a copy means the broadcast
+        loop doesn't hold the registry while we send (which can take
+        ~ms per push)."""
+        return {chat: dict(apps) for chat, apps in self._map.items()}

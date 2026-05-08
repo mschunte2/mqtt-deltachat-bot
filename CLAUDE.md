@@ -22,59 +22,65 @@ smart lock). The bot framework, webxdc plumbing, `app_msgids.json`
 pattern, and systemd template are derived from it; the engine,
 scheduler, and component layout are new.
 
-## Architecture
+## Architecture (v0.2 — digital twin)
 
 ```
-                    ┌──────────────────────────────────────────────┐
-                    │ devices/<class>/class.json   (auto-discovered)│
-                    │   subscribe, commands, state_fields,           │
-                    │   chat_events, auto_off, auto_on               │
-                    └──────────────────────────────────────────────┘
-                                          │ load + validate at startup
-                                          ▼
-Delta Chat ──┬── /<device> <verb> [clause] ──────────┐
-             │                                       │
-             └── webxdc {request:{device,action,...}}─┤
-                                                     ▼
-                                              dispatch_command()
-                                                • visibility check
-                                                • action whitelist
-                                                • render payload template
-                                                     │
-                                                     ▼
-                                       mqtt.publish(<prefix>/<suffix>, payload)
-
-                  ┌── on connect: subscribe per device for each class.subscribe ──┐
-                  └────────────────────────────────────────────────────────────────┘
-                                                     │
-                                                     ▼
-                                              on_mqtt_message()
-                                              (topic → device,suffix)
-                                                     │
-                              ┌──────────────────────┼──────────────────────┐
-                              ▼                      ▼                      ▼
-                      extract per                 evaluate              tick scheduler
-                      state_fields                chat_events           (idle/consumed)
-                      → update cache              → post msgs           → fire on_off
-                                                     │
-                                                     ▼
-                                       push_filtered to webxdc instances
-                                       (per-chat filtered snapshot)
+   ┌────────────────────────────────────────────────────────┐
+   │  MQTT backend  (mqtt_client.py)                        │
+   │  inbound:  topic → twins.find_by_topic → twin.on_mqtt  │
+   │  outbound: twin.dispatch / twin.tick_time → publish    │
+   └─────────────────────────┬──────────────────────────────┘
+                             │ updates / commands
+                             ▼
+   ┌────────────────────────────────────────────────────────┐
+   │  Digital twins  (plug.py · one PlugTwin per device)    │
+   │  ground truth: fields, rules, threshold latches        │
+   │  behaviours:   on_mqtt, dispatch, schedule, cancel,    │
+   │                tick_time, snapshot                     │
+   └─────────────────────────┬──────────────────────────────┘
+                             │ snapshots
+                             ▼
+   ┌────────────────────────────────────────────────────────┐
+   │  Publisher  (publisher.py)  — single outbound stream   │
+   │  broadcast(): for every (chat, class) in webxdc msgid  │
+   │               registry → snapshot.build_for_chat → push│
+   │  push_unicast(): refresh button + /apps onboarding     │
+   │  daemon thread: every PUBLISH_INTERVAL_S seconds       │
+   └────────────────────────────────────────────────────────┘
 ```
+
+The single source of truth for each plug's state is its `PlugTwin`.
+All inbound MQTT, all rule evaluation (idle/consumed inline,
+timer/tod via the sweeper), and all outbound dispatch live as twin
+methods. The Publisher is the only outbound pipeline; nothing else
+sends webxdc status updates. Chat-event text emission goes through
+a single `_post_to_visible_chats` helper in `bot.py`.
+
+External toggles (other chat user, second app instance, physical
+button on the plug) all come back as `status/switch:0` echoes —
+`twin.on_mqtt` detects the prev≠new edge and broadcasts. The twin
+never trusts a command it sent; only the plug's MQTT echo updates
+state.
 
 ## Module layout and design rules
 
 ```
-bot.py                  — Delta Chat hooks; thin glue
-engine.py               — generic engine (dispatch, on_message, threshold, snapshots)
-scheduler.py            — action scheduler (timer/tod/idle/consumed)
-config.py               — devices.json + devices/*/class.json loader
-state.py                — DeviceState + extraction (json_path, bool_text)
-permissions.py          — global + per-device allow-list
-mqtt_client.py          — paho wrapper (daemon thread, auto-resubscribe)
-webxdc_io.py            — app_msgids.json + per-chat filtered push
-durations.py            — parse "30m" / "1h30m"
-templating.py           — {key} substitution that leaves JSON braces alone
+bot.py          — Delta Chat hooks + routing glue + construction
+plug.py         — PlugTwin (digital twin per device); on_mqtt,
+                  dispatch, schedule, cancel, tick_time, snapshot
+twins.py        — TwinRegistry (dict + reverse topic lookup)
+rules.py        — ScheduledJob/Policy/Defaults; parse_policy;
+                  RulesSweeper daemon; rules.json persistence
+snapshot.py     — single function build_for_chat
+publisher.py    — Publisher class (the only outbound stream)
+config.py       — devices.json + devices/*/class.json loader
+state.py        — DeviceState + extraction (json_path, bool_text)
+permissions.py  — global + per-device allow-list
+mqtt_client.py  — paho wrapper (daemon thread, auto-resubscribe)
+webxdc_io.py    — app_msgids.json + send_apps + push_to_msgid
+history.py      — SQLite time series
+durations.py    — parse "30m" / "1h30m"
+templating.py   — {key} substitution that leaves JSON braces alone
 ```
 
 ### Design rules to keep when extending
@@ -82,15 +88,22 @@ templating.py           — {key} substitution that leaves JSON braces alone
 - **No module imports `bot.py`.** Dependency flow is downward only.
 - **No module-level mutable state outside dataclass fields each module
   owns.** `bot.py` constructs the objects and passes them in.
+- **PlugTwin owns all per-device state.** No engine cache, no
+  scheduler cache. The twin is the digital twin; everything reads
+  from it.
+- **Single outbound assembly point** — `snapshot.build_for_chat` is
+  the only function that produces an app payload. **Single outbound
+  pipeline** — `Publisher` is the only thing that pushes to apps.
 - **Pure functions** in `state.py`, `templating.py`, `durations.py`,
   `permissions.py`, `config.py` — easy to test, no I/O.
 - **Side effects** confined to `mqtt_client.py`, `webxdc_io.py`,
-  `scheduler.py` (its thread), and `bot.py` (Delta Chat RPC).
+  `rules.py` (its sweeper thread), `publisher.py` (its daemon),
+  `history.py`, and `bot.py` (Delta Chat RPC).
 - **One class per file** when classes appear; small free functions
   otherwise. No deep inheritance.
-- The Python module dependency graph is intentionally a DAG. If you
-  find yourself wanting a cycle (e.g. engine importing bot), restructure
-  via a callback or constructor injection.
+- The Python module dependency graph is intentionally a DAG. Twins
+  receive their dependencies as injected callables (`TwinDeps`) so
+  they don't import bot/mqtt/webxdc/publisher.
 
 ## Component encapsulation: `devices/<class>/`
 
@@ -178,142 +191,118 @@ trigger messages.
 single function answering "is this chat allowed to operate this device".
 Use it everywhere — never duplicate the check inline.
 
-## Engine internals
+## PlugTwin (per-device digital twin)
 
-### Subscription planner
+`PlugTwin` lives in `plug.py`. One instance per `Device`. Owns:
 
-At construction time, `Engine.__post_init__` builds a reverse lookup
-`_topic_lookup: dict[topic_str, (device_name, suffix)]` from
-every device × every `class.subscribe` entry. `subscriptions_for()`
-returns its keys. `on_mqtt_message(topic, payload)` does an O(1)
-lookup. Re-subscribed on every paho `on_connect` so reconnects work
-without manual intervention.
+- `fields: dict[str, Any]` — current state (online, output, apower, …)
+- `last_update_ts: int`
+- `rules: list[ScheduledJob]`
+- `threshold_latches: dict[str, ThresholdLatch]`
+- a `threading.Lock()` guarding all of the above
 
-### State cache
+Side-effecting collaborators are injected as plain callables in
+`TwinDeps` (`mqtt_publish`, `post_to_chats`, `broadcast`,
+`save_rules`, `react`, `history`, `client_id`). The twin doesn't
+import bot/mqtt/webxdc/publisher — keeps the dep graph a clean DAG.
 
-`Engine._states: dict[device_name, DeviceState]`. Each `DeviceState`
-holds `fields: dict[str, Any]` (latest extracted values) and
-`last_update_ts`. State fields are typed implicitly (whatever the
-JSONPath / bool_text extraction produces).
+### Methods
 
-**Concurrency:** read/written from the MQTT thread (on_mqtt_message)
-and read from the scheduler thread (snapshot_for, jobs_for_device).
-No explicit lock; we rely on the GIL and the access pattern (one writer,
-one reader of snapshot copies). Acceptable for v1 — revisit if races
-ever surface.
+- `on_mqtt(suffix, payload)` (MQTT thread): extract → update fields →
+  evaluate `chat_events` (on_change + threshold) → tick state-based
+  rules (idle / consumed) → write history → call `broadcast(name)`
+  if any state edge fired.
+- `dispatch(action, source_msgid?)` (DC handler thread): validate
+  action → publish → cancel same-direction pending rules + post
+  cancelled_manual → react 🆗 → broadcast.
+- `schedule(target_action, policy, chat_origin)`: build ScheduledJob;
+  replace any rule with the same `(target_action, rule_id)`; save +
+  broadcast.
+- `cancel(target_action?, rule_id?)`: filter+remove rules; save +
+  broadcast if any removed.
+- `tick_time(now)` (sweeper thread): fire rules whose deadline has
+  elapsed; skip-but-re-arm dormant rules; drop one-shots; save +
+  broadcast.
+- `next_deadline()`: smallest pending deadline; sweeper uses it.
+- `to_dict()`: per-device payload included in the outbound snapshot.
+- `can_chat_see(chat_id, allowed_chats)`: permission gate.
 
-### Chat-event rules
+### Chat-event rules (defined per class in `class.json`)
 
-Two types, defined per device class in `class.json`:
+- **on_change**: post a chat message when a state field transitions
+  (`prev != new`). Boolean values are coerced to `"true"`/`"false"`
+  for template lookup. Unknown value → no template → silent.
+- **threshold**: per-field latch. Above limit for ≥ duration → fires
+  `above`. Drop below → fires `below` and resets. Limit + duration
+  come from the *device*'s `params`; if omitted the rule is silently
+  disabled for that device.
 
-- **on_change**: post a chat message when a state field transitions.
-  Fires only when `prev != new`. The message template is keyed by
-  the new value (e.g. `"true": "💡 ON"`). Boolean values are coerced to
-  string `"true"`/`"false"` for the lookup. **Renders an empty string
-  for unknown values** — silent if a state arrives that the rule
-  doesn't have a template for.
+### State edges that broadcast
 
-- **threshold**: per (device, field) state machine in `_thresholds`.
-  When value ≥ limit for ≥ duration, fires `above` once. When value
-  falls below, fires `below` and resets. The limit and duration are
-  pulled from the *device*'s `params` (e.g. `power_threshold_watts`),
-  not the class — so each device tunes its own thresholds. If the
-  device omits these knobs, the rule is silently disabled for that
-  device. Documented; not an error.
+Every chat-event fire triggers `deps.broadcast(name)`. Plus:
+schedule/cancel/tick_time each broadcast on success. Power-metric
+noise (apower wiggling without crossing a threshold) does NOT
+broadcast — handled by the periodic timer instead.
 
-### Dispatch flow
+### State-based dormancy
 
-`engine.dispatch_command(chat_id, device_name, action, source_msgid)`:
+A rule whose target state already matches the device's `output`
+field is dormant: it does not fire on tick (state-based or
+time-based) and its transient counters are reset. `off`-rule on a
+plug that's already off → silent. When the plug flips back, the
+counter starts fresh.
 
-1. Validate device exists and chat can see it; validate `action ∈ class.commands`.
-2. Render the command's `payload` template via `templating.render`,
-   with `client_id` substituted; this is what `<prefix>/<cmd.suffix>`
-   gets published with.
-3. **Manual-override cancellation:** call `scheduler.cancel(device_name,
-   target_action=action)` to drop any pending job whose `target_action`
-   matches. Only same-direction jobs are cancelled — a manual `off`
-   does NOT clear a pending auto-on (the user's morning timer should
-   still fire). For each cancelled job, post the class's
-   `cancelled_manual` template to visible chats.
-4. React on the source message with 🆗 (text path only).
+## Rules subsystem (`rules.py`)
 
-### on_fire callback (scheduler → engine)
+### Policies (any subset can be active per rule)
 
-When the scheduler trips, it calls `engine.on_fire(device_name,
-chat_id_origin, target_action, mode, ctx)`:
-
-1. Resolve `target_action` to a class command and publish.
-2. Look up the matching auto_off OR auto_on `trigger_messages`
-   section by matching `section.command` against `target_action`.
-3. Render the section's `mode` template with ctx (includes `name`,
-   `value`, `seconds`, `field`, `hh`, `mm` where applicable).
-4. Post to visible chats only (per-device `allowed_chats`).
-
-### snapshot_for callback (webxdc_io → engine)
-
-`engine.snapshot_for(chat_id, class_name)` returns the payload
-pushed to a single (chat, class) webxdc instance, or None to skip.
-Builds a `{class, devices: {<name>: {fields, scheduled_jobs, ...}},
-server_ts}` shape from the state cache + scheduler jobs, filtered
-to devices visible to this chat. Returning None when nothing is
-visible (skip the push). The webxdc app keeps its own client-side
-power history; we don't ship a sample buffer.
-
-## Scheduler internals
-
-### Policies (any subset can be active per job)
-
-- **timer:** `deadline_ts` (now + N seconds), one-shot.
-- **time_of_day (`tod`):** next HH:MM in local time. With
-  `recurring_tod=True`, re-arms to next day after firing. Uses
-  `time.mktime` with `tm_isdst=-1` so DST transitions resolve correctly
-  via calendar dates rather than `+86400` arithmetic.
+- **timer:** `deadline_ts = now + timer_seconds`, one-shot or
+  recurring (default).
+- **time_of_day (`tod`):** next HH:MM in local time. Uses
+  `time.mktime` with `tm_isdst=-1` so DST transitions resolve via
+  calendar dates rather than `+86400` arithmetic.
 - **idle:** `state[idle_field] < idle_threshold` for ≥
-  `idle_duration_s`. Pull-driven: `tick()` checks after each state
-  field update. Falls back to None when the field isn't a number;
-  resets `_below_since` when value rises above threshold.
-- **consumed:** `integral(state[field]·dt)` over the last `window_s` <
-  `threshold_wh`. Pull-driven via `tick()`. Maintains a per-job sample
-  deque trimmed to the window. Only evaluated AFTER the window has
-  been populated (now ≥ `_consumed_started_at + window_s`); otherwise
-  scheduling `until used <5Wh in 10m` would fire instantly because
-  zero samples = zero Wh.
+  `idle_duration_s`. Evaluated inline by `twin.on_mqtt` after every
+  state update.
+- **consumed:** `integral(field·dt)` over last `window_s` <
+  `threshold_wh`. Evaluated inline by `twin.on_mqtt`. Only fires
+  after the window has been populated (now ≥ `_consumed_started_at +
+  window_s`); zero samples ≠ "below threshold".
 
-Time-based policies are mutually exclusive within one job (timer XOR
-tod). Idle and consumed can each appear at most once. All policies
+Time-based policies are mutually exclusive within one rule (timer
+XOR tod). Idle and consumed can each appear at most once. Policies
 combine OR-wise — whichever fires first wins.
 
-### Jobs map
+### `RulesSweeper`
 
-`Scheduler._jobs: dict[(device_name, target_action), ScheduledJob]`.
+Single daemon thread. Each iteration:
 
-Keying by `(device, target_action)` lets a single device hold both a
-pending auto-on AND a pending auto-off concurrently (the morning-on
-+ evening-off use case). Cancellation by action is selective.
+1. Compute `min(twin.next_deadline() for twin in registry.all())`.
+2. Sleep until that timestamp, or until `wake()` is called (e.g. on
+   schedule/cancel).
+3. Call `twin.tick_time(now)` on every twin.
 
-### Daemon thread + wake event
+The sweeper is not in the MQTT path — state-based rules are
+evaluated inline in `twin.on_mqtt`.
 
-A single daemon thread sleeps until `min(deadline_ts)` across all
-time-based jobs. `_wake: threading.Event` is set on every
-`schedule()` and `cancel()` so the thread re-evaluates immediately.
-The loop has two lock-protected passes inside one wakeup:
+### `once` flag — fire-and-delete vs. recurring
 
-1. Pass 1: detect time-based fires, re-arm recurring TODs, drop
-   one-shot fired jobs.
-2. Pass 2: collect the next deadline from surviving jobs.
-
-Then it fires (outside the lock) and waits.
-
-Idle/consumed checks don't wake the thread; they happen in `tick()`,
-which runs in whichever thread called it (typically the MQTT thread
-via `engine.on_mqtt_message`).
+Default since v0.1.5: rules persist across fires. `once: True` opts
+into one-shot. Recurring rules re-arm per policy: TOD → next
+occurrence; timer → `now + timer_seconds`; idle → `_below_since`
+reset; consumed → samples cleared, window restart.
 
 ### Persistence
 
-**None.** Bot restart drops all pending jobs. Documented behaviour, not
-a bug. Adding persistence is a single-file `_jobs.json` change but
-brings replay-on-restart edge cases (does an idle job fired during the
-outage need a "fired retroactively" message?). Defer until someone asks.
+`rules.py` writes a flat list of `ScheduledJob` dicts to
+`~/.config/<BOT_NAME>/rules.json` atomically (`.tmp` + `os.replace`).
+Each `ScheduledJob` carries its `device_name`; load dispatches each
+to the matching twin via `twin.add_persisted_rule(...)`.
+
+On startup, expired one-shots are dropped, recurring TODs re-arm to
+the next occurrence, and `bot._rehydrate_rules_from_history()`
+backfills consumed/idle evaluation buffers from `power_minute` so
+restart doesn't force a fresh window.
 
 ## Templating
 
@@ -348,37 +337,55 @@ to preserve this behaviour. Don't switch to format_map "for simplicity".
 ```
 
 The bot validates `action` against `class.commands` (for the direct
-verbs) or treats it as a schedule keyword. Optional `auto_off` /
-`auto_on` keys carry an inline policy object that the engine assembles
-into a `ScheduledPolicy` after the direct action runs. Keys
-recognised inside `auto_off`/`auto_on`: `timer_seconds` (int),
-`time_of_day` ([h,m] list), `recurring_tod` (bool), `idle` (object
-with `field`/`threshold`/`duration_s`), `consumed` (object with
-`field`/`threshold_wh`/`window_s`). Any subset → OR-combined.
+verbs) or treats it as a schedule keyword (`auto-off`/`auto-on`/
+`cancel-*`/`refresh`). Optional `auto_off` / `auto_on` keys carry an
+inline policy object that gets assembled into a `ScheduledPolicy`
+after the direct action runs. Keys recognised inside `auto_off`/
+`auto_on`: `timer_seconds` (int), `time_of_day` ([h,m] list),
+`recurring_tod` (bool), `idle` (object with `field`/`threshold`/
+`duration_s`), `consumed` (object with `field`/`threshold_wh`/
+`window_s`), `once` (bool). Any subset → OR-combined.
 
-### bot → app (snapshot)
+`refresh` is class-scoped (no `device` field needed): the bot
+resolves the class from the requesting msgid and replies with a
+`push_unicast` snapshot.
+
+Legacy actions (`history`, `events`, `set_param`) are silently
+dropped post-v0.2 — users `/apps` to upgrade to a build that no
+longer emits them.
+
+### bot → app (single message kind: `snapshot`)
 
 ```json
-{"payload": {
+{"payload": {"snapshot": {
    "class": "shelly_plug",
+   "server_ts": 1714000000,
    "devices": {
      "kitchen": {
        "name": "kitchen",
        "description": "Kitchen counter",
        "fields": {"online": true, "output": false, "apower": 0.0, ...},
        "last_update_ts": 1714000000,
-       "scheduled_jobs": [{"target_action": "off", "deadline_ts": ...,
-                            "time_of_day": null, "idle": null, "consumed": null}]
+       "energy": { "kwh_last_hour": ..., "current_total_wh": ... },
+       "daily_energy_wh": [[ts, wh] ... 30],
+       "scheduled_jobs": [{"target_action": "off", "deadline_ts": ...}],
+       "params": { "power_threshold_watts": 1500, ... },
+       "power_history": {
+         "minute": [[ts, w, 1|0|null] ... 1440],
+         "hour":   [[ts, w, 1|0|null] ...  744]
+       }
      }
-   },
-   "server_ts": 1714000000
-}}
+   }
+}}}
 ```
 
-Pushed on every inbound MQTT message that updates state. The app
-keeps a local power-history ring buffer (last 5 min, ~60-200 samples)
-for the sparkline; the bot does **not** ship history — the app
-accumulates its own.
+Pushed on (a) state edges, (b) periodic timer
+(`PUBLISH_INTERVAL_S`, default 300 s), (c) refresh button,
+(d) `/apps` onboarding. The app caches the latest snapshot in
+`localStorage` and renders all chart windows from it — no on-demand
+fetches. `output` in `power_history` is `1|0|null`; `null` means the
+plug had no `power_minute` row for that bucket → app paints grey
+(offline).
 
 ### `/apps` onboarding
 
@@ -518,39 +525,33 @@ falls back to the 1.x API if `CallbackAPIVersion` isn't importable.
 - `energy_hour(device, ts, aenergy_wh)` — cumulative aenergy.total
   snapshot at the top of each hour (latest sample within the hour
   wins).
-- `events(device, ts, suffix, kind, payload)` — raw events from
-  `events/rpc` topics. `kind` is the JSON `method` field if present.
+`PlugTwin.on_mqtt` writes a sample on every `apower` / `aenergy`
+update and writes raw status to `samples_raw`. The SIGTERM handler
+in `bot.py` calls `history.flush_pending_minutes` so an interrupted
+minute isn't lost.
 
-Engine.on_mqtt_message writes a sample on every `apower` / `aenergy`
-update and writes to `events` for `events/rpc` traffic. Engine.set_bot
-calls history.flush_pending_minutes via the SIGTERM handler in bot.py
-(systemd sends SIGTERM on stop).
+`RETENTION_DAYS` env var: `0` means keep forever, `>0` prunes all
+tables older than N days, evaluated once per day on the next write.
 
-`RETENTION_DAYS` env var: `0` means keep forever, `>0` prunes
-power_minute / energy_hour / events older than N days, evaluated
-once per day on the next write.
+(The `events` table was dropped in v0.2 — chat events are emitted
+live from `PlugTwin._fire_on_change` / `_fire_threshold` and not
+persisted; the app's recent-events panel was removed.)
 
-## Webxdc protocol — additional message types
+## Snapshot energy + history blocks
 
-Beyond the v1 device snapshot and request shapes, the engine accepts:
+Each device payload includes:
 
-- `{action: "history", window_seconds: N}` → response carries
-  `power_points: [[ts, w, output], ...]` (3-tuples, `output` is
-  0/1/null) plus `energy_points: [[ts, wh], ...]` (hourly snapshots).
-  The app downsamples energy_points client-side into per-bucket bars.
-- `{action: "events", window_seconds: N, limit: K}` → response carries
-  `rows: [{ts, suffix, kind, payload}, …]` from the events table.
-- `{action: "set_param", param: "power_threshold_watts", value: N}` →
-  in-memory override of `device.params[param]`. Whitelisted to
-  `power_threshold_watts` and `power_threshold_duration_s`. Lost on
-  bot restart by design — persistence is via devices.json.
-
-The snapshot now also includes a per-device `energy` block:
-`{kwh_last_hour, kwh_today, kwh_last_24h, kwh_this_week, kwh_last_7d,
-kwh_this_month, kwh_last_30d, current_total_wh}`. Each kwh_* is `null`
-until we have an `energy_hour` snapshot at-or-after the interval start
-(so on a fresh deploy, "this month" sits at null until the next
-month's first hour).
+- `energy: {kwh_last_hour, kwh_today, kwh_last_24h, kwh_this_week,
+  kwh_last_7d, kwh_this_month, kwh_last_30d, current_total_wh}` —
+  each kWh entry is `{kwh, partial_since_ts}`; `partial_since_ts` is
+  set when our oldest sample arrived noticeably later than the
+  requested start (app marks a `*` suffix).
+- `daily_energy_wh: [[ts, wh] * 30]` — last 30 days of daily totals
+  for the bar chart.
+- `power_history: {minute, hour}` — two pre-aggregated series the
+  app picks between based on the chart window. Buckets without a
+  `power_minute` row gap-fill as `[ts, 0, null]` → grey on the
+  chart (offline).
 
 ## Chat command additions
 
@@ -560,8 +561,28 @@ month's first hour).
 
 ## Provenance and history
 
-- 2026-05-07 v1 baseline — initial commit `10477fe`. 11 Python
-  modules, ~2,830 LoC, 57 tests, single device class
+(Note: pre-v0.2 releases were originally tagged v1.x; renumbered
+during the v0.2.0 refactor to reflect the project's actual maturity
+as 0.x.)
+
+- 2026-05-08 **v0.2.0 — digital-twin refactor**. `engine.py` and
+  `scheduler.py` deleted. New: `plug.py` (PlugTwin per device),
+  `twins.py` (TwinRegistry), `snapshot.py` (single
+  `build_for_chat`), `publisher.py` (single outbound stream),
+  `rules.py` (renamed scheduler; slimmed to sweeper + parser +
+  persistence). All per-device state lives on the twin.
+  Publisher pushes on (a) state edges, (b) periodic
+  `PUBLISH_INTERVAL_S`, (c) refresh button, (d) `/apps`. App
+  becomes standalone after a snapshot — window switching is
+  render-only. Three-color chart (green/red/grey) reuses the
+  existing `output: 1|0|null` convention. Symmetric propagation:
+  external toggles (other chat user, second app, physical button)
+  all show up via the same MQTT echo path. Dropped: `set_param`
+  + Tuning UI; `events` SQLite table + Recent-events twistie;
+  `history`/`events`/`set_param` webxdc actions; live-5min chart
+  window. Net: roughly −500 lines across the repo. 84 tests.
+- 2026-05-07 v0.1.5 — rules persist forever by default; opt-in
+  `once` for fire-and-delete
   (`shelly_plug`), one webxdc app, full deployment scripts.
 - 2026-05-07 v1.1 — committed in same session. Added: SQLite-backed
   history (per-minute power, hourly energy, events table) with
@@ -650,17 +671,21 @@ month's first hour).
 
 The app is a single page; sections from top to bottom:
 
-1. Header — device picker + online dot
+1. Header — device picker + online dot + "data Ns ago" timestamp +
+   refresh button
 2. State card — current ON/OFF + apower + aenergy
 3. On / Off / Toggle buttons
-4. Power chart (live or windowed) with daily-energy bars below
+4. Power chart (1h / 6h / 12h / 24h / 31d) with daily-energy bars
+   below. Three colors: green = on, red = off, grey = offline. The
+   smallest window is 1 h (live 5 min was dropped in v0.2; the
+   header timestamp is the real-time indicator instead).
 5. Energy consumed (8-row grid)
 6. Auto-off rules (open by default — most-used surface)
 7. Auto-on rules
-8. Recent events (collapsed; on-open fetches last 50)
-9. Tuning · power threshold (Apply = in-memory; Save = persists
-   to devices.json on the bot host)
-10. Footer
+
+The "Recent events" twistie and "Tuning · power threshold" section
+were removed in v0.2. Per-device threshold tuning is now via
+`devices.json` + restart; chat events appear in chat as before.
 
 ## Icon
 
