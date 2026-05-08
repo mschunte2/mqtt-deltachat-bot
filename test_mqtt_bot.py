@@ -812,12 +812,12 @@ class TestHistory(unittest.TestCase):
 
     def test_write_sample_buffers_until_minute_rolls(self):
         # All samples in the same minute → not yet flushed
-        self.h.write_sample("kaffeete", 1000, 5.0, None, output=True)
-        self.h.write_sample("kaffeete", 1010, 15.0, None, output=True)
+        self.h.write_sample("kaffeete", 1000, 5.0, output=True)
+        self.h.write_sample("kaffeete", 1010, 15.0, output=True)
         bucket, pts = self.h.query_power("kaffeete", 0, 2000)
         self.assertEqual(pts, [])
         # Cross minute boundary → previous minute flushes
-        self.h.write_sample("kaffeete", 1080, 100.0, None, output=True)
+        self.h.write_sample("kaffeete", 1080, 100.0, output=True)
         bucket, pts = self.h.query_power("kaffeete", 0, 2000)
         self.assertEqual(len(pts), 1)
         self.assertEqual(pts[0][0], 960)  # 1000 // 60 * 60
@@ -825,52 +825,35 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(pts[0][2], 1)  # output=on
 
     def test_output_off_persisted(self):
-        self.h.write_sample("k", 100, 0.0, None, output=False)
-        self.h.write_sample("k", 110, 0.1, None, output=False)
+        self.h.write_sample("k", 100, 0.0, output=False)
+        self.h.write_sample("k", 110, 0.1, output=False)
         self.h.flush_pending_minutes(now=200)
         _, pts = self.h.query_power("k", 0, 200)
         self.assertEqual(len(pts), 1)
         self.assertEqual(pts[0][2], 0)  # output=off
 
     def test_output_unknown_when_never_reported(self):
-        self.h.write_sample("k", 100, 5.0, None)  # no output kwarg
+        self.h.write_sample("k", 100, 5.0)  # no output kwarg
         self.h.flush_pending_minutes(now=200)
         _, pts = self.h.query_power("k", 0, 200)
         self.assertEqual(len(pts), 1)
         self.assertIsNone(pts[0][2])  # output unknown
 
     def test_flush_pending_minutes(self):
-        self.h.write_sample("k", 100, 7.0, None, output=True)
-        self.h.write_sample("k", 110, 13.0, None, output=True)
+        self.h.write_sample("k", 100, 7.0, output=True)
+        self.h.write_sample("k", 110, 13.0, output=True)
         self.h.flush_pending_minutes(now=200)
         bucket, pts = self.h.query_power("k", 0, 200)
         self.assertEqual(len(pts), 1)
         self.assertAlmostEqual(pts[0][1], 10.0)
         self.assertEqual(pts[0][2], 1)
 
-    def test_energy_snapshot_replaces_within_hour(self):
-        self.h.write_sample("k", 100, None, 50.0)
-        self.h.write_sample("k", 200, None, 75.0)  # later in same hour
-        rows = self.h.query_energy("k", 0, 4000)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0], 0)         # hour-aligned
-        self.assertAlmostEqual(rows[0][1], 75.0)  # latest snapshot wins
-
-    def test_energy_snapshot_per_hour(self):
-        self.h.write_sample("k", 100, None, 50.0)
-        self.h.write_sample("k", 3700, None, 60.0)  # next hour
-        rows = self.h.query_energy("k", 0, 7200)
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(rows[0][0], 0)
-        self.assertEqual(rows[1][0], 3600)
-
-
     def test_query_power_downsamples(self):
         # Insert 240 minutes of data, ask for 60 points → bucket ≥ 240s
         for i in range(240):
-            self.h.write_sample("k", i * 60, float(i), None)
+            self.h.write_sample("k", i * 60, float(i))
         # Force final minute to flush
-        self.h.write_sample("k", 240 * 60 + 5, 0.0, None)
+        self.h.write_sample("k", 240 * 60 + 5, 0.0)
         bucket, pts = self.h.query_power("k", 0, 240 * 60, max_points=60)
         # bucket should be ≥ 240s (4 min) so ≤ 60 buckets cover 4 hours
         self.assertGreaterEqual(bucket, 240)
@@ -906,29 +889,28 @@ class TestHistory(unittest.TestCase):
         finally:
             h.close()
 
-    def test_aenergy_at(self):
-        # write_sample drops the cumulative aenergy at hour boundaries
-        # via _snapshot_aenergy. aenergy_at returns the latest reading
-        # at-or-before the target ts (NEW semantics — was earliest>= in v0.1).
-        self.h.write_sample("k", 0,    None, 100.0)
-        self.h.write_sample("k", 3700, None, 150.0)
-        self.h.write_sample("k", 7300, None, 220.0)
-        # ts 0 → only the t=0 snapshot is at-or-before
-        self.assertEqual(self.h.aenergy_at("k", 0), 100.0)
-        # ts 3600 → both t=0 and t=3600 are at-or-before; latest wins
-        self.assertEqual(self.h.aenergy_at("k", 3600), 150.0)
-        # ts 10000 → all three are at-or-before; latest is t=7200
-        self.assertEqual(self.h.aenergy_at("k", 10000), 220.0)
-        # Before any data → None
-        self.assertIsNone(self.h.aenergy_at("k", -1))
+    def _put_aenergy(self, device, ts, total_wh):
+        """Test helper: write a raw aenergy_total_wh row to samples_raw
+        via record_status (the production write path)."""
+        self.h.record_status(device, ts, {"aenergy": {"total": total_wh}})
+
+    def test_aenergy_at_via_samples_raw(self):
+        # New semantics: latest at-or-before(target_ts), pulled directly
+        # from samples_raw. No energy_hour / aenergy_minute involved.
+        self._put_aenergy("k", 100, 100.0)
+        self._put_aenergy("k", 200, 150.0)
+        self._put_aenergy("k", 300, 220.0)
+        self.assertEqual(self.h.aenergy_at("k", 99), None)   # before any data
+        self.assertEqual(self.h.aenergy_at("k", 100), 100.0)
+        self.assertEqual(self.h.aenergy_at("k", 250), 150.0) # latest <=250
+        self.assertEqual(self.h.aenergy_at("k", 1000), 220.0) # latest overall
 
     def test_record_status_writes_samples_raw(self):
         payload = {
             "id": 0, "output": True,
             "apower": 42.0, "voltage": 230.5, "current": 0.18,
             "freq": 49.95, "temperature": {"tC": 28.5},
-            "aenergy": {"total": 100.5, "by_minute": [0.0, 3500.0, 3200.0],
-                        "minute_ts": 1700000060},
+            "aenergy": {"total": 100.5},
         }
         self.h.record_status("k", 1700000050, payload)
         rows = self.h.query_samples_raw("k", 0, 2_000_000_000)
@@ -942,136 +924,92 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(out, 1)
         self.assertEqual(tc, 28.5)
 
-    def test_record_status_does_not_touch_aenergy_minute(self):
-        # samples_raw stores RAW aenergy_total_wh; aenergy_minute is
-        # written separately by write_aenergy_minute (called from
-        # PlugTwin.on_mqtt with the post-offset effective value).
-        payload = {"aenergy": {"total": 100.0}}
-        self.h.record_status("k", 1700000050, payload)
-        # samples_raw populated…
-        self.assertEqual(len(self.h.query_samples_raw("k", 0, 2_000_000_000)), 1)
-        # …but aenergy_minute untouched by record_status alone.
-        with self.h._lock:
-            cnt = self.h._db.execute(
-                "SELECT COUNT(*) FROM aenergy_minute WHERE device='k'"
-            ).fetchone()[0]
-        self.assertEqual(cnt, 0)
+    def test_aenergy_at_applies_offset_events(self):
+        # Counter-reset offset events shift the effective lifetime.
+        # 1000 Wh at t=100, then a reset at t=200 records +400 delta.
+        # t=300 raw=50 → effective = 50 + 400 = 450 Wh.
+        self._put_aenergy("k", 100, 1000.0)
+        self._put_aenergy("k", 200, 50.0)   # raw dropped
+        self.h.record_offset_event("k", 200, 400.0)
+        self._put_aenergy("k", 300, 60.0)   # still raw
+        # At t=99: no data → None.
+        self.assertIsNone(self.h.aenergy_at("k", 99))
+        # At t=150: pre-reset, raw=1000, no offsets <= 150 → 1000.
+        self.assertEqual(self.h.aenergy_at("k", 150), 1000.0)
+        # At t=250: raw=50 (latest <= 250), offset SUM=400 → 450.
+        self.assertEqual(self.h.aenergy_at("k", 250), 450.0)
+        # At t=300: raw=60, offset=400 → 460.
+        self.assertEqual(self.h.aenergy_at("k", 300), 460.0)
 
-    def test_write_aenergy_minute_idempotent_within_minute(self):
-        # Two writes in the same minute → INSERT OR REPLACE keeps the
-        # latest. Different minute boundaries → separate rows.
-        # ts=1700001000 % 60 = 40, so its minute_start = 1700000960.
-        # ts=1700001020 → minute 1700001020 (mod-60 = 0, aligned).
-        # Easier: use minute-aligned ts values (multiples of 60 above
-        # the unix epoch are all aligned). 1700001000 is NOT aligned
-        # (1700001000 % 60 = 40), so use cleaner values.
-        m1, m2 = 1700001060, 1700001120     # both minute-aligned
-        self.h.write_aenergy_minute("k", m1 + 5, 100.0)   # minute m1
-        self.h.write_aenergy_minute("k", m1 + 50, 105.0)  # same minute → replace
-        self.h.write_aenergy_minute("k", m2, 110.0)        # next minute
+    def test_record_offset_event_idempotent(self):
+        # Same (device, ts) twice → INSERT OR IGNORE → only one row.
+        self.h.record_offset_event("k", 100, 50.0)
+        self.h.record_offset_event("k", 100, 999.0)  # ignored
         with self.h._lock:
             rows = list(self.h._db.execute(
-                "SELECT ts, aenergy_wh FROM aenergy_minute "
+                "SELECT ts, delta_wh FROM aenergy_offset_events "
                 "WHERE device='k' ORDER BY ts ASC"
             ))
-        self.assertEqual(rows, [(m1, 105.0), (m2, 110.0)])
+        self.assertEqual(rows, [(100, 50.0)])
 
-    def test_aenergy_at_two_tier_lookup(self):
-        # aenergy_minute (fine) for boundary inside its window;
-        # energy_hour (coarse) for older boundary.
-        m1, m2 = 1700001060, 1700001120
-        self.h.write_aenergy_minute("k", m1, 1000.0)
-        self.h.write_aenergy_minute("k", m2, 1100.0)
-        # Older snapshot in energy_hour only.
-        with self.h._lock:
-            self.h._db.execute(
-                "INSERT INTO energy_hour (device, ts, aenergy_wh) "
-                "VALUES ('k', 1699996800, 500.0)"  # ~hour earlier
-            )
-            self.h._db.commit()
-        # Inside aenergy_minute range → fine-tier reading.
-        self.assertEqual(self.h.aenergy_at("k", m2 + 30), 1100.0)
-        self.assertEqual(self.h.aenergy_at("k", m1), 1000.0)
-        # Older than aenergy_minute → falls back to energy_hour.
-        self.assertEqual(self.h.aenergy_at("k", 1699997000), 500.0)
-        # Before any data → None.
-        self.assertIsNone(self.h.aenergy_at("k", 1000000000))
+    def test_energy_consumed_in_spans_offset_event(self):
+        # Window straddling a reset event reports the post-offset
+        # delta — user-facing math doesn't see the discontinuity.
+        self._put_aenergy("k", 100, 1000.0)
+        self._put_aenergy("k", 200, 100.0)            # raw dropped 900
+        self.h.record_offset_event("k", 200, 900.0)   # offset closes the gap
+        self._put_aenergy("k", 300, 250.0)            # +150 over post-reset
+        # Window [99, 350] = effective(350) - effective(99 → falls back
+        # to earliest) = (250+900) - (1000+0) = 1150 - 1000 = 150 Wh.
+        wh, earliest = self.h.energy_consumed_in("k", 99, 350)
+        self.assertAlmostEqual(wh, 150.0, places=3)
+        self.assertEqual(earliest, 100)   # earliest available sample
 
     def test_energy_consumed_in_delta_of_total(self):
         # Two cumulative readings: 1000 Wh at t1, 1500 Wh at t2.
-        # Energy in [t1, t2] = 500 Wh. No integration, no fallback.
-        m1, m2 = 1700001060, 1700004660    # both aligned, 1h apart
-        self.h.write_aenergy_minute("k", m1, 1000.0)
-        self.h.write_aenergy_minute("k", m2, 1500.0)
-        wh, earliest = self.h.energy_consumed_in("k", m1 - 60, m2 + 60)
+        # Energy in [t1-1, t2+1] = 500 Wh, derived from samples_raw.
+        self._put_aenergy("k", 1000, 1000.0)
+        self._put_aenergy("k", 4000, 1500.0)
+        wh, earliest = self.h.energy_consumed_in("k", 999, 4001)
         self.assertAlmostEqual(wh, 500.0, places=3)
-        self.assertEqual(earliest, m1)
+        self.assertEqual(earliest, 1000)
 
     def test_energy_consumed_in_clamps_negative_to_zero(self):
-        # If a hardware reset somehow slips past the offset detector,
-        # the query clamps to 0 instead of returning negative.
-        m1, m2 = 1700001060, 1700004660
-        self.h.write_aenergy_minute("k", m1, 1500.0)
-        self.h.write_aenergy_minute("k", m2, 100.0)        # went DOWN
-        wh, _ = self.h.energy_consumed_in("k", m1 - 60, m2 + 60)
+        # If raw counter dropped without an offset event being
+        # recorded (corrupted state, lost write), clamp to 0.
+        self._put_aenergy("k", 1000, 1500.0)
+        self._put_aenergy("k", 4000, 100.0)
+        wh, _ = self.h.energy_consumed_in("k", 999, 4001)
         self.assertEqual(wh, 0.0)
 
     def test_energy_consumed_in_partial_window(self):
-        # Window starts before any data; the earliest available sample
-        # is used as the lower bound and reported as `earliest_ts` so
-        # the caller can mark a partial-since asterisk.
-        m1, m2 = 1700001060, 1700004660
-        self.h.write_aenergy_minute("k", m1, 100.0)
-        self.h.write_aenergy_minute("k", m2, 200.0)
-        wh, earliest = self.h.energy_consumed_in("k", 1600000000, m2 + 60)
-        self.assertAlmostEqual(wh, 100.0, places=3)   # 200 - 100
-        self.assertEqual(earliest, m1)                 # earliest available
+        # Window starts before any data → use earliest available row
+        # as the lower bound; report it as earliest_ts.
+        self._put_aenergy("k", 1000, 100.0)
+        self._put_aenergy("k", 4000, 200.0)
+        wh, earliest = self.h.energy_consumed_in("k", 0, 4001)
+        self.assertAlmostEqual(wh, 100.0, places=3)
+        self.assertEqual(earliest, 1000)
 
     def test_daily_energy_kwh_uses_aenergy_at(self):
         # Daily bars are differences between aenergy_at(midnight) values.
-        midnight = 1700006400   # arbitrary aligned ts
+        midnight = 1700006400
         oldest = midnight - 2 * 86400
         # A reading just before each midnight (so each "day" is bounded).
-        self.h.write_aenergy_minute("k", oldest - 60, 1000.0)
-        self.h.write_aenergy_minute("k", oldest + 86400 - 60, 1050.0)
-        self.h.write_aenergy_minute("k", oldest + 2 * 86400 - 60, 1130.0)
-        self.h.write_aenergy_minute("k", oldest + 3 * 86400 - 60, 1160.0)
+        self._put_aenergy("k", oldest - 60, 1000.0)
+        self._put_aenergy("k", oldest + 86400 - 60, 1050.0)
+        self._put_aenergy("k", oldest + 2 * 86400 - 60, 1130.0)
+        self._put_aenergy("k", oldest + 3 * 86400 - 60, 1160.0)
         days = self.h.daily_energy_kwh("k", midnight, days=3)
         self.assertEqual(len(days), 3)
         self.assertAlmostEqual(days[0][1], 50.0, places=3)
         self.assertAlmostEqual(days[1][1], 80.0, places=3)
         self.assertAlmostEqual(days[2][1], 30.0, places=3)
 
-    def test_backfill_aenergy_minute_from_samples(self):
-        # Drop a few raw samples; backfill picks the latest per minute.
-        self.h.record_status("k", 1700000050, {"aenergy": {"total": 100.0}})
-        self.h.record_status("k", 1700000055, {"aenergy": {"total": 105.0}})
-        self.h.record_status("k", 1700000115, {"aenergy": {"total": 110.0}})
-        n = self.h.backfill_aenergy_minute_from_samples()
-        self.assertEqual(n, 2)   # two distinct minutes
-        # The within-minute MAX wins.
-        with self.h._lock:
-            rows = list(self.h._db.execute(
-                "SELECT ts, aenergy_wh FROM aenergy_minute "
-                "WHERE device='k' ORDER BY ts ASC"
-            ))
-        self.assertEqual(rows, [(1700000040, 105.0), (1700000100, 110.0)])
-        # Idempotent: a second call inserts nothing new (and won't
-        # overwrite live writes).
-        self.h.write_aenergy_minute("k", 1700000115, 999.0)  # live write
-        n2 = self.h.backfill_aenergy_minute_from_samples()
-        self.assertEqual(n2, 0)
-        with self.h._lock:
-            v = self.h._db.execute(
-                "SELECT aenergy_wh FROM aenergy_minute "
-                "WHERE device='k' AND ts=1700000100"
-            ).fetchone()[0]
-        self.assertEqual(v, 999.0)   # live write preserved
-
     def test_query_power_raw(self):
-        self.h.write_sample("k", 60,  10.0, None, output=True)
-        self.h.write_sample("k", 70,  20.0, None, output=True)  # same minute
-        self.h.write_sample("k", 130, 30.0, None, output=False) # next minute
+        self.h.write_sample("k", 60,  10.0, output=True)
+        self.h.write_sample("k", 70,  20.0, output=True)  # same minute
+        self.h.write_sample("k", 130, 30.0, output=False) # next minute
         self.h.flush_pending_minutes(now=200)
         rows = self.h.query_power_raw("k", 0, 200)
         self.assertEqual(len(rows), 2)
@@ -1123,71 +1061,92 @@ class TestPlugTwinResetCounter(unittest.TestCase):
 
 
 class TestPlugTwinCounterResetDetection(unittest.TestCase):
-    """The plug's hardware aenergy.total counter going backwards
-    triggers an in-memory offset bump so the time series stays
-    continuous. Confirms detection, offset arithmetic, persistence
-    callback, chat alert, and that the field stored in the twin is
-    the EFFECTIVE (post-offset) value.
-    """
+    """The plug's hardware aenergy.total going backwards records an
+    offset event in history.aenergy_offset_events. self.fields
+    ["aenergy"] keeps the RAW counter value; the displayed lifetime
+    is computed at read time via history.aenergy_at (which adds the
+    cumulative offset SUM)."""
 
-    def test_drop_increments_offset_and_alerts(self):
-        twin, calls, _ = _build_twin()
-        # First arrival: 1000 Wh, no prior reading → no reset.
+    def _build_twin_with_history(self):
+        """Like _build_twin but with a real History wired in so we can
+        observe record_offset_event writes via SQL."""
+        twin, calls, cfg = _build_twin()
+        tmpdir = Path(tempfile.mkdtemp())
+        h = history_mod.History(tmpdir / "h.sqlite")
+        twin.deps = plug_mod.TwinDeps(
+            mqtt_publish=lambda t, p: calls["published"].append((t, p)),
+            post_to_chats=lambda dev, txt: calls["posted"].append((dev.name, txt)),
+            broadcast=lambda n=None: calls["broadcasts"].append(n),
+            save_rules=lambda: None,
+            save_baselines=lambda: calls.__setitem__(
+                "baseline_saves", calls.get("baseline_saves", 0) + 1),
+            react=lambda *a: None,
+            history=h,
+            client_id="test",
+        )
+        return twin, calls, h
+
+    def test_drop_records_offset_event_and_alerts(self):
+        twin, calls, h = self._build_twin_with_history()
+        # First arrival: 1000 Wh — no prior reading → no reset.
         twin.on_mqtt("status/switch:0",
                      json.dumps({"output": True, "aenergy": {"total": 1000.0}}).encode())
         self.assertEqual(twin.fields["aenergy"], 1000.0)
-        self.assertEqual(twin.aenergy_offset_wh, 0.0)
         self.assertEqual(twin.last_seen_aenergy_wh, 1000.0)
-        baseline_saves_before = calls.get("baseline_saves", 0)
+        with h._lock:
+            cnt = h._db.execute(
+                "SELECT COUNT(*) FROM aenergy_offset_events"
+            ).fetchone()[0]
+        self.assertEqual(cnt, 0)
 
-        # Second arrival: 200 Wh — the plug's counter went backwards
-        # (replacement, manufacturer reset, etc.).
+        # Second arrival: 200 Wh — counter went backwards.
         twin.on_mqtt("status/switch:0",
                      json.dumps({"output": True, "aenergy": {"total": 200.0}}).encode())
-        # Offset captures the drop.
-        self.assertEqual(twin.aenergy_offset_wh, 800.0)   # 1000 - 200
-        # last_seen tracks the RAW reading (so the next comparison works).
+        # last_seen tracks RAW; fields["aenergy"] stays RAW.
         self.assertEqual(twin.last_seen_aenergy_wh, 200.0)
-        # Field stores the EFFECTIVE value (continuous lifetime).
-        self.assertEqual(twin.fields["aenergy"], 200.0 + 800.0)
-        # Persistence triggered.
-        self.assertGreater(calls.get("baseline_saves", 0), baseline_saves_before)
+        self.assertEqual(twin.fields["aenergy"], 200.0)
+        # Offset event recorded.
+        with h._lock:
+            row = h._db.execute(
+                "SELECT delta_wh FROM aenergy_offset_events WHERE device='kitchen'"
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 800.0)   # 1000 - 200
         # Chat alert posted.
         self.assertTrue(any("hardware counter reset" in t
                              for _, t in calls["posted"]),
                         msg=f"posted={calls['posted']}")
 
-    def test_offset_accumulates_across_multiple_resets(self):
-        twin, _, _ = _build_twin()
+    def test_multiple_resets_accumulate_in_offset_events(self):
+        twin, _, h = self._build_twin_with_history()
         twin.on_mqtt("status/switch:0",
                      json.dumps({"aenergy": {"total": 500.0}}).encode())
+        time.sleep(1.1)   # ensure distinct ts for INSERT OR IGNORE
         twin.on_mqtt("status/switch:0",
                      json.dumps({"aenergy": {"total": 100.0}}).encode())  # drop 400
         twin.on_mqtt("status/switch:0",
-                     json.dumps({"aenergy": {"total": 250.0}}).encode())  # rises (no reset)
+                     json.dumps({"aenergy": {"total": 250.0}}).encode())  # rises
+        time.sleep(1.1)
         twin.on_mqtt("status/switch:0",
-                     json.dumps({"aenergy": {"total": 50.0}}).encode())   # drops 200 more
-        self.assertEqual(twin.aenergy_offset_wh, 400.0 + 200.0)
-        # Effective: 50 raw + 600 offset = 650 effective lifetime.
-        self.assertEqual(twin.fields["aenergy"], 650.0)
+                     json.dumps({"aenergy": {"total": 50.0}}).encode())   # drops 200
+        with h._lock:
+            rows = list(h._db.execute(
+                "SELECT delta_wh FROM aenergy_offset_events "
+                "WHERE device='kitchen' ORDER BY ts ASC"
+            ))
+        self.assertEqual([r[0] for r in rows], [400.0, 200.0])
 
     def test_no_offset_when_counter_only_grows(self):
-        twin, _, _ = _build_twin()
+        twin, _, h = self._build_twin_with_history()
         for total in (100.0, 200.0, 350.0, 350.0, 1000.0):
             twin.on_mqtt("status/switch:0",
                          json.dumps({"aenergy": {"total": total}}).encode())
-        self.assertEqual(twin.aenergy_offset_wh, 0.0)
+        with h._lock:
+            cnt = h._db.execute(
+                "SELECT COUNT(*) FROM aenergy_offset_events"
+            ).fetchone()[0]
+        self.assertEqual(cnt, 0)
         self.assertEqual(twin.fields["aenergy"], 1000.0)
-
-    def test_set_baseline_restores_offset(self):
-        # Round-trips via the bot's baselines.json: we restore offset
-        # from disk alongside baseline_wh and reset_at_ts.
-        twin, _, _ = _build_twin()
-        twin.set_baseline(baseline_wh=500.0, reset_at_ts=100,
-                          aenergy_offset_wh=42.0)
-        self.assertEqual(twin.aenergy_offset_wh, 42.0)
-        self.assertEqual(twin.baseline_wh, 500.0)
-        self.assertEqual(twin.reset_at_ts, 100)
 
 
 class TestKwhSinceResetMath(unittest.TestCase):
@@ -1643,6 +1602,10 @@ class _FakeHistory:
         return [(0, 0.0)] * 30
     def energy_consumed_in(self, *_a, **_kw):
         return (0.0, None)
+    def aenergy_at(self, *_a, **_kw):
+        return None
+    def record_offset_event(self, *_a, **_kw):
+        pass
 
 
 if __name__ == "__main__":

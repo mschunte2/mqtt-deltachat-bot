@@ -3,30 +3,34 @@
 Single SQLite file under the bot's config dir. Tables:
 
   samples_raw    — every status/switch:0 captured verbatim
-                   (lossless audit trail; raw aenergy_total_wh)
-  aenergy_minute — absolute aenergy.total counter, one row per
-                   minute, post-offset (the fine-tier source for
-                   energy_consumed_in)
+                   (lossless audit trail; raw aenergy_total_wh).
+                   The single source of truth for energy queries.
   power_minute   — average apower (W) per minute per device
-  energy_hour    — absolute aenergy.total (Wh) snapshot per hour,
-                   post-offset (forever-retained coarse tier)
+                   (used for the app's power chart + rule rehydration)
+  aenergy_offset_events — append-only log of detected hardware
+                   counter resets (typically empty)
 
 Energy "kWh consumed in [a, b]" is computed as the difference
-between two cumulative-counter readings — `total_at(b) - total_at(a)`.
-Two-tier lookup: prefer aenergy_minute (≤1-min rounding) for each
-boundary, fall back to energy_hour (≤1-hr rounding) for boundaries
-older than the minute-tier retention. Both tables store the
-post-offset effective counter — see plug.py's PlugTwin counter-reset
-detection: when the plug's hardware aenergy.total is observed to go
-backwards (manufacturer reset, replacement, firmware glitch), the
-twin tracks a per-device offset so the time series stays continuous
-across the discontinuity. samples_raw stores the *raw* counter
-(untouched) so the CSV export still reflects the plug's webUI 1:1.
+between two effective-aenergy readings:
 
-Retention has two knobs:
-  RETENTION_DAYS              applies to aenergy_minute, power_minute
-  SAMPLES_RAW_RETENTION_DAYS  applies to samples_raw (the bulky one)
-  energy_hour                 always kept forever (≤150 KB/year/device)
+    effective_at(t) = raw_at_or_before(t)
+                    + Σ delta_wh from aenergy_offset_events WHERE ts ≤ t
+
+Both lookups are O(log N) index seeks against samples_raw; the
+offset SUM is over a tiny table (typically 0 rows). For 99% of users
+the math collapses to `raw_at_or_before(b) - raw_at_or_before(a)`.
+
+Why offsets exist: when the plug's hardware aenergy.total counter
+goes backwards (manufacturer reset, plug replacement, firmware
+glitch), PlugTwin.on_mqtt detects the drop and appends a row to
+aenergy_offset_events. Subsequent queries add the cumulative offset
+so the lifetime series stays continuous across the discontinuity.
+samples_raw stores the RAW counter (untouched) so CSV exports stay
+1:1 with the plug's webUI.
+
+Retention: a single RETENTION_DAYS knob applies to samples_raw +
+power_minute. aenergy_offset_events is forever (tiny + load-bearing
+for energy queries spanning a reset).
   - 0       → keep forever
   - >0      → delete rows older than N days, once per day
 
@@ -34,10 +38,9 @@ Single shared connection guarded by a threading.Lock; writes serialize
 on the lock, which is fine for the few-writes-per-minute traffic this
 bot generates.
 
-(The `events` table was dropped in v0.2; the `energy_minute` table
-that stored Shelly's per-minute by_minute[] deltas was dropped from
-the code in v0.2.2 — its DDL is gone but rows in users' existing
-SQLite files persist as dead data.)
+(Earlier versions had `events`, `energy_minute`, `aenergy_minute`,
+and `energy_hour` tables; all dropped from the code. Existing rows
+in users' SQLite files are dead data the bot never reads.)
 """
 
 from __future__ import annotations
@@ -54,9 +57,8 @@ log = logging.getLogger("mqtt_bot.history")
 
 _SCHEMA = """
 -- Every status/switch:0 message, captured verbatim. Lossless audit
--- trail; aenergy_total_wh here is the RAW plug counter, untouched
--- by any reset-offset adjustment (so a CSV export still matches the
--- plug's webUI 1:1).
+-- trail and the single source of truth for energy queries:
+-- aenergy_total_wh holds the RAW plug counter on every sample.
 CREATE TABLE IF NOT EXISTS samples_raw (
   device           TEXT    NOT NULL,
   ts               INTEGER NOT NULL,
@@ -72,17 +74,6 @@ CREATE TABLE IF NOT EXISTS samples_raw (
 );
 CREATE INDEX IF NOT EXISTS idx_samples_raw_ts ON samples_raw (ts);
 
--- Per-minute aenergy.total snapshot — POST-OFFSET (continuous
--- across hardware counter resets). Fine-grained tier for
--- energy_consumed_via_total. Idempotent: INSERT OR REPLACE.
-CREATE TABLE IF NOT EXISTS aenergy_minute (
-  device     TEXT    NOT NULL,
-  ts         INTEGER NOT NULL,    -- minute boundary in unix seconds
-  aenergy_wh REAL    NOT NULL,
-  PRIMARY KEY (device, ts)
-);
-CREATE INDEX IF NOT EXISTS idx_aenergy_minute_ts ON aenergy_minute (ts);
-
 -- Per-minute apower average (computed from raw samples). Kept for the
 -- power chart in the app and for rule rehydration.
 CREATE TABLE IF NOT EXISTS power_minute (
@@ -95,35 +86,31 @@ CREATE TABLE IF NOT EXISTS power_minute (
 );
 CREATE INDEX IF NOT EXISTS idx_power_minute_ts ON power_minute (ts);
 
--- Per-hour aenergy.total snapshot — POST-OFFSET. Coarse tier;
--- forever-retained (~150 KB/year/device) so "Last 365 days" works
--- even if the user prunes aenergy_minute aggressively.
-CREATE TABLE IF NOT EXISTS energy_hour (
-  device     TEXT    NOT NULL,
-  ts         INTEGER NOT NULL,
-  aenergy_wh REAL    NOT NULL,
+-- Append-only log of detected hardware counter resets. Each row's
+-- delta_wh is added to every effective_at(T) lookup where T >= ts.
+-- Forever-retained (typically 0 rows; never bigger than KB).
+CREATE TABLE IF NOT EXISTS aenergy_offset_events (
+  device   TEXT    NOT NULL,
+  ts       INTEGER NOT NULL,
+  delta_wh REAL    NOT NULL,
   PRIMARY KEY (device, ts)
 );
-CREATE INDEX IF NOT EXISTS idx_energy_hour_ts ON energy_hour (ts);
+CREATE INDEX IF NOT EXISTS idx_aenergy_offset_events_ts
+  ON aenergy_offset_events (ts);
 """
 
 
 class History:
     def __init__(self, db_path: Path,
-                 retention_days: int = 0,
-                 samples_raw_retention_days: int = 0) -> None:
+                 retention_days: int = 0) -> None:
         self.db_path = db_path
-        # Two retention knobs:
-        # - retention_days: aenergy_minute, power_minute (per-minute series)
-        # - samples_raw_retention_days: samples_raw (lossless, ~70 MB/yr/device)
-        # energy_hour is forever-retained regardless.
+        # Single retention knob — applies to samples_raw + power_minute.
+        # aenergy_offset_events is forever (tiny + load-bearing).
         self.retention_days = max(0, int(retention_days))
-        self.samples_raw_retention_days = max(0, int(samples_raw_retention_days))
         self._lock = threading.Lock()
-        # Per-device current-minute accumulator:
+        # Per-device current-minute accumulator for power_minute:
         # {device: (minute_start_ts, [apower, ...], latest_output_or_None)}
         self._minute: dict[str, tuple[int, list[float], int | None]] = {}
-        self._hour_seen: dict[str, int] = {}     # last hour-start written per device
         self._last_prune_ts = 0
         self._closed = False
 
@@ -138,20 +125,17 @@ class History:
             if "output" not in cols:
                 self._db.execute("ALTER TABLE power_minute ADD COLUMN output INTEGER")
             self._db.commit()
-        log.info("history db at %s (retention_days=%s, "
-                 "samples_raw_retention_days=%s)",
+        log.info("history db at %s (retention_days=%s)",
                  db_path,
-                 "forever" if self.retention_days == 0 else self.retention_days,
-                 ("forever" if self.samples_raw_retention_days == 0
-                  else self.samples_raw_retention_days))
+                 "forever" if self.retention_days == 0 else self.retention_days)
 
     # --- writes ----------------------------------------------------------
 
     def write_sample(self, device: str, ts: int,
                      apower: float | None,
-                     aenergy_wh: float | None,
                      output: bool | None = None) -> None:
-        """Called on every MQTT status update where apower or aenergy changed.
+        """Buffer the apower reading for power_minute aggregation.
+        Called on every MQTT status update via PlugTwin.on_mqtt.
 
         `output` is the relay state at the time of the sample. When the
         minute boundary rolls over, the LATEST output value seen during
@@ -160,15 +144,32 @@ class History:
         No-op once the connection has been closed — late writes can
         race the SIGTERM-triggered close() while the MQTT thread is
         still draining its inbox.
+
+        (Note: aenergy is NOT touched here. The cumulative counter
+        comes in via record_status → samples_raw.aenergy_total_wh,
+        which is the single source of truth for energy queries.)
         """
         if self._closed:
             return
         if apower is not None and isinstance(apower, (int, float)):
             out_int = (1 if output is True else 0 if output is False else None)
             self._buffer_apower(device, ts, float(apower), out_int)
-        if aenergy_wh is not None and isinstance(aenergy_wh, (int, float)):
-            self._snapshot_aenergy(device, ts, float(aenergy_wh))
         self._maybe_prune(ts)
+
+    def record_offset_event(self, device: str, ts: int,
+                             delta_wh: float) -> None:
+        """Append one row to aenergy_offset_events. Idempotent on
+        (device, ts) — INSERT OR IGNORE so a retry-storm during a
+        flapping plug only records the first event."""
+        if self._closed:
+            return
+        with self._lock:
+            self._db.execute(
+                "INSERT OR IGNORE INTO aenergy_offset_events "
+                "(device, ts, delta_wh) VALUES (?, ?, ?)",
+                (device, int(ts), float(delta_wh)),
+            )
+            self._db.commit()
 
     def record_status(self, device: str, ts: int,
                       payload: dict[str, Any]) -> None:
@@ -213,56 +214,6 @@ class History:
             )
             self._db.commit()
 
-    def write_aenergy_minute(self, device: str, ts: int,
-                              effective_aenergy_wh: float) -> None:
-        """Snapshot the post-offset cumulative aenergy.total at the
-        minute boundary `ts // 60 * 60`. Called from PlugTwin.on_mqtt
-        with the offset-adjusted ('effective') value so the time
-        series stays continuous across hardware counter resets.
-
-        INSERT OR REPLACE — the latest write within a minute wins."""
-        if self._closed:
-            return
-        minute_start = int(ts) - (int(ts) % 60)
-        with self._lock:
-            self._db.execute(
-                "INSERT OR REPLACE INTO aenergy_minute "
-                "(device, ts, aenergy_wh) VALUES (?, ?, ?)",
-                (device, minute_start, float(effective_aenergy_wh)),
-            )
-            self._db.commit()
-
-    def backfill_aenergy_minute_from_samples(self) -> int:
-        """Populate aenergy_minute from existing samples_raw rows so
-        a fresh deploy doesn't have to wait for new MQTT data to fill
-        the minute-tier. Idempotent (INSERT OR IGNORE).
-
-        Note: backfilled values are taken from samples_raw, which
-        stores the RAW pre-offset aenergy_total_wh. Pre-existing
-        offsets aren't applied here. Subsequent live writes from
-        PlugTwin.on_mqtt use the post-offset value via
-        write_aenergy_minute. The two regimes only differ at the
-        moment the offset accrues — see plug.py for the trade-off.
-
-        Returns the count of rows inserted (excludes pre-existing).
-        """
-        if self._closed:
-            return 0
-        with self._lock:
-            cur = self._db.execute(
-                "INSERT OR IGNORE INTO aenergy_minute (device, ts, aenergy_wh) "
-                "SELECT device, (ts/60)*60 AS minute, MAX(aenergy_total_wh) "
-                "  FROM samples_raw "
-                " WHERE aenergy_total_wh IS NOT NULL "
-                " GROUP BY device, minute"
-            )
-            inserted = cur.rowcount
-            self._db.commit()
-        if inserted > 0:
-            log.info("backfilled %d aenergy_minute rows from samples_raw",
-                     inserted)
-        return inserted
-
     def flush_pending_minutes(self, now: int | None = None) -> None:
         """Force-flush minute buffers regardless of boundary. Called on
         clean shutdown so an interrupted minute isn't lost."""
@@ -305,25 +256,6 @@ class History:
             for t, w, o in rows if w is not None
         ])
 
-    def query_energy(self, device: str, since_ts: int, until_ts: int
-                     ) -> list[tuple[int, float]]:
-        """Per-hour cumulative aenergy snapshots in the window.
-
-        Caller can compute per-hour consumption as deltas between
-        consecutive points.
-        """
-        if self._closed:
-            return []
-        with self._lock:
-            cur = self._db.execute(
-                "SELECT ts, aenergy_wh FROM energy_hour "
-                "WHERE device=? AND ts >= ? AND ts < ? "
-                "ORDER BY ts ASC",
-                (device, int(since_ts), int(until_ts)),
-            )
-            rows = cur.fetchall()
-        return [(int(t), float(e)) for t, e in rows]
-
     def query_power_raw(self, device: str, since_ts: int, until_ts: int
                         ) -> list[tuple[int, float, int | None, int]]:
         """Un-bucketed minute rows for the window. Used for CSV export."""
@@ -340,29 +272,35 @@ class History:
                 for t, w, o, c in rows]
 
     def aenergy_at(self, device: str, target_ts: int) -> float | None:
-        """Latest cumulative aenergy reading at-or-before `target_ts`,
-        in post-offset Wh. Two-tier lookup: prefer aenergy_minute, fall
-        back to energy_hour. Used internally by energy_consumed_in;
-        also exposed for callers that need a single-point lookup.
+        """Effective cumulative aenergy at-or-before `target_ts`, in
+        post-offset Wh. Single source of truth: samples_raw, plus the
+        cumulative offset sum from aenergy_offset_events.
 
-        Returns None if no row exists at-or-before target_ts in either
-        tier (e.g. asking about a window before the bot was deployed).
+        Returns None when no samples_raw row exists at-or-before
+        target_ts for this device (e.g. asking about a window before
+        the plug was first seen).
         """
         if self._closed:
             return None
         target = int(target_ts)
         with self._lock:
-            row_min = self._db.execute(
-                "SELECT ts, aenergy_wh FROM aenergy_minute "
-                "WHERE device=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+            raw_row = self._db.execute(
+                "SELECT aenergy_total_wh FROM samples_raw "
+                "WHERE device=? AND aenergy_total_wh IS NOT NULL "
+                "  AND ts<=? "
+                "ORDER BY ts DESC LIMIT 1",
                 (device, target),
             ).fetchone()
-            row_hr = self._db.execute(
-                "SELECT ts, aenergy_wh FROM energy_hour "
-                "WHERE device=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+            if raw_row is None:
+                return None
+            offset_row = self._db.execute(
+                "SELECT COALESCE(SUM(delta_wh), 0.0) "
+                "FROM aenergy_offset_events "
+                "WHERE device=? AND ts<=?",
                 (device, target),
             ).fetchone()
-        return _pick_more_recent(row_min, row_hr)
+        offset = float(offset_row[0]) if offset_row else 0.0
+        return float(raw_row[0]) + offset
 
     def energy_consumed_in(self, device: str, since_ts: int, until_ts: int
                            ) -> tuple[float, int | None]:
@@ -395,41 +333,39 @@ class History:
         upper_wh = self.aenergy_at(device, until)
         if upper_wh is None:
             return (0.0, None)
-        # Lower-bound: prefer at-or-before(since). Fall back to the
-        # *earliest* available row if the window starts before our
-        # data (caller marks this as partial via earliest_ts > since).
+        # Lower-bound: try at-or-before(since); if window starts
+        # before our data, fall back to the earliest available sample
+        # (caller flags partial via earliest_ts > since).
+        lower_wh = self.aenergy_at(device, since)
         earliest_ts: int | None
-        lower_wh: float
-        with self._lock:
-            row_min = self._db.execute(
-                "SELECT ts, aenergy_wh FROM aenergy_minute "
-                "WHERE device=? AND ts<=? ORDER BY ts DESC LIMIT 1",
-                (device, since),
-            ).fetchone()
-            row_hr = self._db.execute(
-                "SELECT ts, aenergy_wh FROM energy_hour "
-                "WHERE device=? AND ts<=? ORDER BY ts DESC LIMIT 1",
-                (device, since),
-            ).fetchone()
-            best = _pick_more_recent_row(row_min, row_hr)
-            if best is None:
-                # No row at-or-before since: try the *earliest*
-                # available row instead.
-                row_min = self._db.execute(
-                    "SELECT ts, aenergy_wh FROM aenergy_minute "
-                    "WHERE device=? ORDER BY ts ASC LIMIT 1",
+        if lower_wh is not None:
+            # We have a reading at-or-before(since); its ts is the
+            # latest row in samples_raw at-or-before since. Look it
+            # up to report earliest_ts to the caller.
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT ts FROM samples_raw "
+                    "WHERE device=? AND aenergy_total_wh IS NOT NULL "
+                    "  AND ts<=? ORDER BY ts DESC LIMIT 1",
+                    (device, since),
+                ).fetchone()
+            earliest_ts = int(row[0]) if row else None
+        else:
+            # No row at-or-before since: use the earliest sample.
+            with self._lock:
+                row = self._db.execute(
+                    "SELECT ts, aenergy_total_wh FROM samples_raw "
+                    "WHERE device=? AND aenergy_total_wh IS NOT NULL "
+                    "ORDER BY ts ASC LIMIT 1",
                     (device,),
                 ).fetchone()
-                row_hr = self._db.execute(
-                    "SELECT ts, aenergy_wh FROM energy_hour "
-                    "WHERE device=? ORDER BY ts ASC LIMIT 1",
-                    (device,),
-                ).fetchone()
-                best = _pick_earliest_row(row_min, row_hr)
-                if best is None:
-                    return (0.0, None)
-            earliest_ts = int(best[0])
-            lower_wh = float(best[1])
+            if row is None:
+                return (0.0, None)
+            earliest_ts = int(row[0])
+            # aenergy_at applies the offset SUM at this earliest ts.
+            lower_wh = self.aenergy_at(device, earliest_ts)
+            if lower_wh is None:
+                return (0.0, None)
         wh = max(0.0, upper_wh - lower_wh)
         return (wh, earliest_ts)
 
@@ -523,45 +459,20 @@ class History:
             )
             self._db.commit()
 
-    def _snapshot_aenergy(self, device: str, ts: int, aenergy_wh: float) -> None:
-        ts = int(ts)
-        hour_start = ts - (ts % 3600)
-        last = self._hour_seen.get(device)
-        with self._lock:
-            self._db.execute(
-                "INSERT OR REPLACE INTO energy_hour (device, ts, aenergy_wh) "
-                "VALUES (?, ?, ?)",
-                (device, hour_start, aenergy_wh),
-            )
-            self._db.commit()
-        # Track the latest hour we've snapshotted; not used for correctness
-        # (INSERT OR REPLACE handles re-snapshots within the same hour) but
-        # useful for diagnostics.
-        if last is None or hour_start > last:
-            self._hour_seen[device] = hour_start
-
     def _maybe_prune(self, now: int) -> None:
-        # Both knobs: 0 means forever (no prune for that group).
-        # energy_hour is forever-retained regardless — it's tiny
-        # (~150 KB/year/device) and is what makes "Last 365 days"
-        # work after aggressive minute-tier pruning.
-        if (self.retention_days <= 0
-                and self.samples_raw_retention_days <= 0):
+        # Single knob applies to samples_raw + power_minute.
+        # aenergy_offset_events is forever — tiny + load-bearing for
+        # offset-spanning energy queries.
+        if self.retention_days <= 0:
             return
         if now - self._last_prune_ts < 86400:
             return
+        cutoff = now - self.retention_days * 86400
         counts: dict[str, int] = {}
         with self._lock:
-            if self.retention_days > 0:
-                cutoff = now - self.retention_days * 86400
-                for table in ("aenergy_minute", "power_minute"):
-                    counts[table] = self._db.execute(
-                        f"DELETE FROM {table} WHERE ts < ?", (cutoff,)
-                    ).rowcount
-            if self.samples_raw_retention_days > 0:
-                cutoff = now - self.samples_raw_retention_days * 86400
-                counts["samples_raw"] = self._db.execute(
-                    "DELETE FROM samples_raw WHERE ts < ?", (cutoff,)
+            for table in ("samples_raw", "power_minute"):
+                counts[table] = self._db.execute(
+                    f"DELETE FROM {table} WHERE ts < ?", (cutoff,)
                 ).rowcount
             self._db.commit()
         self._last_prune_ts = now
@@ -581,34 +492,6 @@ class History:
             with self._lock:
                 self._db.close()
             self._closed = True
-
-
-def _pick_more_recent(row_min, row_hr) -> float | None:
-    """Two `(ts, value)` rows from the two tiers; return the value
-    from whichever has the higher ts. None if both are None."""
-    best = _pick_more_recent_row(row_min, row_hr)
-    return float(best[1]) if best else None
-
-
-def _pick_more_recent_row(row_min, row_hr):
-    """Two-tier picker: return the (ts, value) row with the higher
-    ts. Used for "latest at-or-before T" lookups."""
-    if row_min is None:
-        return row_hr
-    if row_hr is None:
-        return row_min
-    return row_min if row_min[0] >= row_hr[0] else row_hr
-
-
-def _pick_earliest_row(row_min, row_hr):
-    """Two-tier picker: return the (ts, value) row with the lower
-    ts. Used for the partial-window-fallback path in
-    `energy_consumed_in` (window starts before any data)."""
-    if row_min is None:
-        return row_hr
-    if row_hr is None:
-        return row_min
-    return row_min if row_min[0] <= row_hr[0] else row_hr
 
 
 def _coerce_float(v: Any) -> float | None:

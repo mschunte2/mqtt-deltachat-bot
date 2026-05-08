@@ -67,7 +67,7 @@ mqtt-bot/
 /<device> auto-on at 7h           # next 07:00 local
 /<device> auto-on at 7h daily     # recurring
 /<device> cancel-auto-off | cancel-auto-on | cancel-schedule
-/<device> export 7d               # CSV (samples_raw + power_minute + energy_minute + energy_hour)
+/<device> export 7d               # CSV (samples_raw + power_minute)
 /<device> rules                   # list this device's pending auto-off / auto-on rules
 
 /all on | off | toggle            # act on every device visible to this chat
@@ -122,20 +122,20 @@ that's ~63 MB / month / device.
 
 ## History data model (SQLite)
 
-`~/.config/<BOT_NAME>/history.sqlite` — five tables, all keyed by
-`(device, ts)`:
+`~/.config/<BOT_NAME>/history.sqlite` — three live tables, all
+keyed by `(device, ts)`:
 
 | Table | What | Source |
 |---|---|---|
-| `samples_raw` | Every `status/switch:0` verbatim — apower, voltage, current, freq, aenergy.total, output, temperature.tC, plus a `payload_json` blob for the rest | one row per status update |
-| `energy_minute` | Authoritative energy in **mWh** per minute | extracted from Shelly's `aenergy.by_minute[1..2]`; idempotent |
+| `samples_raw` | Every `status/switch:0` verbatim — apower, voltage, current, freq, **aenergy.total** (RAW), output, temperature.tC, plus a `payload_json` blob for the rest | one row per status update |
 | `power_minute` | Per-minute average `apower` (W) | aggregated client-side from samples |
-| `energy_hour` | Cumulative `aenergy.total` snapshot per hour | latest sample within the hour wins |
+| `aenergy_offset_events` | Append-only log of detected hardware counter resets; `delta_wh` per row | written by PlugTwin.on_mqtt when the plug's aenergy.total goes backwards |
 
-Energy queries are a single SQL `SUM` over a per-minute hybrid
-(`energy_minute` first, `power_minute` integration as fallback for
-minutes without by_minute coverage). This stitches data from before
-v1.3 (when `energy_minute` was added) with newer rows seamlessly.
+Energy queries: `aenergy_at(T) = raw_at_or_before(T) + Σ delta_wh
+from aenergy_offset_events WHERE ts ≤ T`. "kWh in [a, b]" is
+`aenergy_at(b) - aenergy_at(a)` — two index seeks plus a tiny
+SUM. For plugs that never have a hardware reset, the offset SUM
+is over zero rows and the math is a straight subtraction.
 
 ## Persistence + restart recovery
 
@@ -144,7 +144,7 @@ Two pieces of state survive `systemctl restart`:
 | File | Holds |
 |---|---|
 | `~/.config/<BOT_NAME>/rules.json` | every pending auto-off / auto-on rule |
-| `~/.config/<BOT_NAME>/history.sqlite` | the four tables above |
+| `~/.config/<BOT_NAME>/history.sqlite` | the three tables above |
 | `~/.config/<BOT_NAME>/app_msgids.json` | which webxdc msgid is registered per chat per device class |
 
 On startup `rules.load_into(registry, ...)`:

@@ -520,25 +520,44 @@ falls back to the 1.x API if `CallbackAPIVersion` isn't importable.
 ## History (SQLite time series)
 
 `history.py` owns a single SQLite file at
-`~/.config/<BOT_NAME>/history.sqlite`:
+`~/.config/<BOT_NAME>/history.sqlite` with three live tables:
 
+- `samples_raw(device, ts, apower_w, voltage_v, current_a, freq_hz,
+  aenergy_total_wh, output, temperature_c, payload_json)` — every
+  status/switch:0 captured verbatim. `aenergy_total_wh` is the RAW
+  plug counter (untouched by offset adjustment). This is the
+  single source of truth for energy queries.
 - `power_minute(device, ts, avg_apower_w, sample_count, output)` —
-  one row per minute per device. `output` is the relay state
-  (0/1/NULL); used to colour the chart red on off-segments.
-- `energy_hour(device, ts, aenergy_wh)` — cumulative aenergy.total
-  snapshot at the top of each hour (latest sample within the hour
-  wins).
-`PlugTwin.on_mqtt` writes a sample on every `apower` / `aenergy`
-update and writes raw status to `samples_raw`. The SIGTERM handler
-in `bot.py` calls `history.flush_pending_minutes` so an interrupted
-minute isn't lost.
+  one row per minute, derived from the apower stream in
+  samples_raw. Used by the app's power chart and by rule
+  rehydration. `output` is the relay state (0/1/NULL).
+- `aenergy_offset_events(device, ts, delta_wh)` — append-only log
+  of detected hardware counter resets. Each row's delta_wh is
+  added to every `aenergy_at(T)` lookup where `T >= ts`. Forever-
+  retained. Typically empty (no reset events ever observed).
 
-`RETENTION_DAYS` env var: `0` means keep forever, `>0` prunes all
-tables older than N days, evaluated once per day on the next write.
+Energy queries: `aenergy_at(device, T) = raw_at_or_before(T) + Σ
+delta_wh from aenergy_offset_events WHERE ts ≤ T`. Both lookups
+hit O(log N) indexes; the offset SUM is over a tiny table. For
+plugs that never have a hardware reset the math collapses to a
+straight subtraction of two raw counter readings.
 
-(The `events` table was dropped in v0.2 — chat events are emitted
-live from `PlugTwin._fire_on_change` / `_fire_threshold` and not
-persisted; the app's recent-events panel was removed.)
+`PlugTwin.on_mqtt` writes apower to power_minute (via
+`write_sample`) and the full status payload to samples_raw (via
+`record_status`). When it detects the plug's `aenergy.total`
+going backwards, it appends to aenergy_offset_events.
+
+The SIGTERM handler in `bot.py` calls
+`history.flush_pending_minutes` so an interrupted minute isn't
+lost.
+
+`RETENTION_DAYS` env var: `0` means keep forever, `>0` prunes
+samples_raw + power_minute older than N days, evaluated once per
+day on the next write. aenergy_offset_events is exempt (forever).
+
+(Earlier versions had `events`, `energy_minute`, `aenergy_minute`,
+and `energy_hour` tables; all dropped from the code. Existing
+rows in users' SQLite files are dead data the bot never reads.)
 
 ## Snapshot energy + history blocks
 
@@ -558,7 +577,7 @@ Each device payload includes:
 
 ## Chat command additions
 
-- `/<device> export 7d` — bot dumps power_minute + energy_hour for the
+- `/<device> export 7d` — bot dumps power_minute + samples_raw for the
   window to a CSV and sends as a chat attachment. Window accepts
   `s/m/h/d` (the d unit was added for this).
 

@@ -151,24 +151,20 @@ def _save_rules() -> None:
 
 
 def _save_baselines() -> None:
-    """Atomic write of every twin's per-device counter state:
+    """Atomic write of every twin's user-Counter state:
 
       - baseline_wh   user-set 'reset Counter' baseline (effective Wh)
       - reset_at_ts   timestamp of the last user reset
-      - aenergy_offset_wh   per-plug hardware-counter-reset offset
-                            (auto-tracked by PlugTwin.on_mqtt)
 
-    Same file/dir pattern as rules.json; round-trips via
-    _load_baselines on startup. _save_baselines is called whenever the
-    user resets the Counter and whenever the bot detects a hardware
-    aenergy.total drop (so the offset survives a restart between the
-    reset event and the next graceful shutdown).
+    Hardware-counter-reset offsets are NOT in baselines.json — those
+    live in history.sqlite/aenergy_offset_events as a queryable log.
+    Same file/dir pattern as rules.json; round-trips via _load_baselines
+    on startup.
     """
     data = {
         t.name: {
-            "baseline_wh":       t.baseline_wh,
-            "reset_at_ts":       t.reset_at_ts,
-            "aenergy_offset_wh": t.aenergy_offset_wh,
+            "baseline_wh": t.baseline_wh,
+            "reset_at_ts": t.reset_at_ts,
         }
         for t in registry.all()
     }
@@ -184,7 +180,13 @@ def _save_baselines() -> None:
 def _load_baselines() -> int:
     """Restore each twin's baseline state from baselines.json. Drops
     entries for unknown devices (with a WARN summary, mirroring the
-    rules.load_into pattern). Returns the count restored."""
+    rules.load_into pattern). Returns the count restored.
+
+    Migration: older versions stored an `aenergy_offset_wh` field
+    here. If we see a non-zero one, we re-record it as a single
+    aenergy_offset_events row at ts=0 so cumulative SUMs going
+    forward still pick it up. Idempotent via INSERT OR IGNORE.
+    """
     if not BASELINES_PATH.exists():
         return 0
     try:
@@ -193,6 +195,7 @@ def _load_baselines() -> int:
         log.exception("failed to read %s; skipping load", BASELINES_PATH)
         return 0
     loaded = 0
+    migrated_offsets = 0
     unknown: list[str] = []
     for name, entry in data.items():
         twin = registry.get(name)
@@ -204,10 +207,19 @@ def _load_baselines() -> int:
         twin.set_baseline(
             float(entry.get("baseline_wh", 0.0) or 0.0),
             entry.get("reset_at_ts"),
-            aenergy_offset_wh=float(entry.get("aenergy_offset_wh", 0.0) or 0.0),
         )
         loaded += 1
+        # Migrate any pre-existing aenergy_offset_wh from older
+        # baselines.json into history's aenergy_offset_events at ts=0.
+        legacy_offset = float(entry.get("aenergy_offset_wh", 0.0) or 0.0)
+        if legacy_offset > 0:
+            history.record_offset_event(name, 0, legacy_offset)
+            migrated_offsets += 1
     log.info("loaded %d baselines from %s", loaded, BASELINES_PATH)
+    if migrated_offsets:
+        log.info("  migrated %d legacy aenergy_offset_wh into "
+                 "aenergy_offset_events (one row each at ts=0)",
+                 migrated_offsets)
     if unknown:
         log.warning("  baselines.json had entries for unknown device(s): %s — "
                     "ignored. Edit %s to remove them or rename them to "
@@ -237,9 +249,6 @@ history = History(
     db_path=STATE_DIR / "history.sqlite",
     retention_days=int(
         (os.environ.get("RETENTION_DAYS") or "0").strip() or "0"
-    ),
-    samples_raw_retention_days=int(
-        (os.environ.get("SAMPLES_RAW_RETENTION_DAYS") or "0").strip() or "0"
     ),
 )
 
@@ -1015,11 +1024,9 @@ def _handle_export(bot, accid, chatid, device_name, rest):
     until_ts = int(time.time())
     since_ts = until_ts - window_seconds
     power_rows = history.query_power_raw(device_name, since_ts, until_ts)
-    energy_rows = history.query_energy(device_name, since_ts, until_ts)
-    energy_minute_rows = history.query_energy_minute(device_name, since_ts, until_ts)
     samples_rows = history.query_samples_raw(device_name, since_ts, until_ts)
 
-    if not (power_rows or energy_rows or energy_minute_rows or samples_rows):
+    if not (power_rows or samples_rows):
         bot.rpc.send_msg(accid, chatid,
                          MsgData(text=f"no history yet for {device_name} ({window_str})"))
         return
@@ -1032,7 +1039,6 @@ def _handle_export(bot, accid, chatid, device_name, rest):
             w.writerow([
                 "unix_ts", "iso_time", "device", "kind",
                 "avg_apower_w", "output", "sample_count",
-                "aenergy_wh", "energy_mwh",
                 "apower_w", "voltage_v", "current_a", "freq_hz",
                 "aenergy_total_wh", "temperature_c",
             ])
@@ -1041,22 +1047,12 @@ def _handle_export(bot, accid, chatid, device_name, rest):
                             device_name, "power_minute",
                             f"{apower:.3f}",
                             "" if output is None else output,
-                            count, "", "", "", "", "", "", "", ""])
-            for ts, aenergy in energy_rows:
-                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
-                            device_name, "energy_hour",
-                            "", "", "", f"{aenergy:.3f}", "",
-                            "", "", "", "", "", ""])
-            for ts, mwh in energy_minute_rows:
-                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
-                            device_name, "energy_minute",
-                            "", "", "", "", f"{mwh:.3f}",
-                            "", "", "", "", "", ""])
+                            count, "", "", "", "", "", "", ""])
             for row in samples_rows:
                 ts, ap, v, c, f_hz, ae, out, tc = row
                 w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
                             device_name, "samples_raw",
-                            "", "", "", "", "",
+                            "", "", "",
                             "" if ap is None else f"{ap:.3f}",
                             "" if v is None else f"{v:.2f}",
                             "" if c is None else f"{c:.4f}",
@@ -1069,9 +1065,7 @@ def _handle_export(bot, accid, chatid, device_name, rest):
             MsgData(file=path,
                     text=f"{device_name} export · {window_str} · "
                          f"{len(samples_rows)} status updates · "
-                         f"{len(power_rows)} per-min · "
-                         f"{len(energy_minute_rows)} energy-min · "
-                         f"{len(energy_rows)} energy-hr"),
+                         f"{len(power_rows)} per-min"),
         )
     finally:
         try:
@@ -1099,17 +1093,9 @@ def _on_start(bot, _args):
     rules_mod.load_into(registry, RULES_PATH)
     _rehydrate_rules_from_history()
 
-    # Restore resettable-counter baselines AND counter-reset offsets
-    # before any new MQTT data lands (so the first inbound write goes
-    # straight into the correct effective-Wh space).
+    # Restore resettable-counter baselines (samples_raw + aenergy_offset_events
+    # are persistent in SQLite; nothing else to load).
     _load_baselines()
-
-    # Populate the fine-tier aenergy_minute table from samples_raw if
-    # this is a fresh deploy (or just upgraded to v0.2.2). Idempotent:
-    # repeats are no-ops thanks to INSERT OR IGNORE. Note that the
-    # backfill uses the RAW counter values from samples_raw (we don't
-    # try to retroactively apply offsets to historical rows).
-    history.backfill_aenergy_minute_from_samples()
 
     mqtt.start()
     sweeper.start()
