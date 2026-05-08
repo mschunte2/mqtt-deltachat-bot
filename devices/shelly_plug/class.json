@@ -28,7 +28,7 @@
 
   "chat_events": [
     {"type": "on_change", "field": "output",
-     "values": {"true": "💡 {name} is now ON", "false": "💡 {name} is now OFF"}},
+     "values": {"true": "💡 {name} is now ON", "false": "🌑 {name} is now OFF"}},
     {"type": "on_change", "field": "online",
      "values": {"true": "🟢 {name} back online", "false": "🔴 {name} went offline"}},
     {"type": "threshold", "field": "apower",
