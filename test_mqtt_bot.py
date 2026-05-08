@@ -651,6 +651,44 @@ class TestPlugTwinDispatch(unittest.TestCase):
         self.assertEqual(len(twin.rules), 0)  # cancelled
         self.assertTrue(any("cancelled" in t for _, t in calls["posted"]))
 
+    def test_dispatch_off_when_already_off_preserves_rules(self):
+        # Redundant action: pressing /off on an off plug must NOT
+        # cancel the pending auto-off rule — the rule's purpose is
+        # unchanged (the plug might come back on before its deadline).
+        twin, calls, _ = _build_twin()
+        twin.fields["output"] = False
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=1800), 12)
+        self.assertEqual(len(twin.rules), 1)
+        calls["posted"].clear()
+        ok, _ = twin.dispatch("off")
+        self.assertTrue(ok)
+        self.assertEqual(len(twin.rules), 1)
+        self.assertFalse(any("cancelled" in t for _, t in calls["posted"]))
+
+    def test_dispatch_on_when_already_on_preserves_rules(self):
+        twin, calls, _ = _build_twin()
+        twin.fields["output"] = True
+        twin.schedule("on", sched.ScheduledPolicy(timer_seconds=1800), 12)
+        self.assertEqual(len(twin.rules), 1)
+        calls["posted"].clear()
+        ok, _ = twin.dispatch("on")
+        self.assertTrue(ok)
+        self.assertEqual(len(twin.rules), 1)
+        self.assertFalse(any("cancelled" in t for _, t in calls["posted"]))
+
+    def test_dispatch_off_when_on_still_cancels(self):
+        # Regression guard: state-changing dispatch must keep the
+        # v0.1.5 manual-override semantics.
+        twin, calls, _ = _build_twin()
+        twin.fields["output"] = True
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=1800), 12)
+        self.assertEqual(len(twin.rules), 1)
+        calls["posted"].clear()
+        ok, _ = twin.dispatch("off")
+        self.assertTrue(ok)
+        self.assertEqual(len(twin.rules), 0)
+        self.assertTrue(any("cancelled" in t for _, t in calls["posted"]))
+
 
 # --- schedule + cancel ---------------------------------------------------
 

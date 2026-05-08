@@ -173,8 +173,18 @@ class PlugTwin:
 
         # Manual-override: cancel any pending rule whose target_action ==
         # this action. Same-direction only (a manual /off should NOT
-        # clear a pending auto-on).
-        cancelled = self._remove_rules(target_action=action)
+        # clear a pending auto-on). Skip when the action is redundant
+        # (plug already in target state) — pressing "off" on an off plug
+        # is a no-op for the relay AND should preserve any pending rule,
+        # which still serves its purpose if the plug comes back on.
+        known_output = self.fields.get("output")
+        is_redundant = (
+            (action == "off" and known_output is False)
+            or (action == "on" and known_output is True)
+        )
+        cancelled = (
+            [] if is_redundant else self._remove_rules(target_action=action)
+        )
         section = self._auto_section_for(action)
         if cancelled and section:
             tpl = section.trigger_messages.get("cancelled_manual")
