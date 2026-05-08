@@ -401,11 +401,12 @@ function fmtSecs(s) {
 
 window.webxdc.setUpdateListener((update) => {
   const p = update.payload;
-  if (!p || !p.snapshot) return;
-  const snap = p.snapshot;
-  state.serverTs = snap.server_ts || Math.floor(Date.now() / 1000);
-  state.devices = snap.devices || {};
-  // Persist for fast hydration on reload.
+  // The bot pushes {class, server_ts, devices} at the top level of
+  // `payload`. (No wrapping `snapshot` key — that would be one extra
+  // indirection for no reason.)
+  if (!p || !p.devices) return;
+  state.serverTs = p.server_ts || Math.floor(Date.now() / 1000);
+  state.devices = p.devices;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       server_ts: state.serverTs, devices: state.devices,

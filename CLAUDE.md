@@ -354,10 +354,13 @@ Legacy actions (`history`, `events`, `set_param`) are silently
 dropped post-v0.2 — users `/apps` to upgrade to a build that no
 longer emits them.
 
-### bot → app (single message kind: `snapshot`)
+### bot → app (single message kind)
+
+The snapshot is the only thing the bot pushes. It lives at the top
+level of `payload` — no wrapping `snapshot:` key:
 
 ```json
-{"payload": {"snapshot": {
+{"payload": {
    "class": "shelly_plug",
    "server_ts": 1714000000,
    "devices": {
@@ -376,7 +379,7 @@ longer emits them.
        }
      }
    }
-}}}
+}}
 ```
 
 Pushed on (a) state edges, (b) periodic timer
