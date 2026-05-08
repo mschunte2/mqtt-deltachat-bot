@@ -361,7 +361,20 @@ class PlugTwin:
         """Evaluate idle and consumed rules after every state update.
         Mirrors what scheduler.tick used to do. Mutates job's transient
         bookkeeping (`_below_since`, `_samples`, `_consumed_started_at`)
-        and the rules list (one-shot rules that fire are dropped)."""
+        and the rules list (one-shot rules that fire are dropped).
+
+        Locking invariant
+        -----------------
+        Transient per-job state — `_below_since`, `_samples`,
+        `_consumed_started_at` — is owned by `self._lock`. Both
+        `_eval_idle` and `_eval_consumed` MUST be called while
+        holding it, and `integrate_wh` MUST stay inside the lock
+        even though it's a pure function: another thread (DC
+        handler, sweeper) could otherwise prepend to `_samples`
+        between the cutoff trim and the integral, producing a
+        wrong Wh number. If you're tempted to release the lock
+        for a "perf win" — don't.
+        """
         fires: list[tuple[rules_mod.ScheduledJob, str, dict[str, Any]]] = []
         mutated = False
         survivors: list[rules_mod.ScheduledJob] = []
