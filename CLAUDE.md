@@ -363,6 +363,7 @@ level of `payload` — no wrapping `snapshot:` key:
 {"payload": {
    "class": "shelly_plug",
    "server_ts": 1714000000,
+   "echo_actions_to_chat": false,
    "devices": {
      "kitchen": {
        "name": "kitchen",
@@ -381,6 +382,21 @@ level of `payload` — no wrapping `snapshot:` key:
    }
 }}
 ```
+
+`echo_actions_to_chat` is the class-level flag (configured per
+class in `class.json`, default `false`). When `true`, the app
+passes a non-empty `info` string to `webxdc.sendUpdate` so each
+button press surfaces as a chat info line — useful in shared
+chats for "who pressed what" transparency. Format: `/<device>
+<action>`, mirroring chat-command syntax.
+
+Future option to revisit: instead of a webxdc info string, the
+app could send actual chat messages via `webxdc.sendToChat({text:
+"/kaffeete on"})`. The bot's existing `_on_new_message` /
+`_parse_text_command` path would route them, decoupling action
+delivery from the webxdc transport. Not implemented today; see
+the comment block at the top of `devices/shelly_plug/app/main.js`
+for the trade-off.
 
 Pushed on (a) state edges, (b) periodic timer
 (`PUBLISH_INTERVAL_S`, default 300 s), (c) refresh button,

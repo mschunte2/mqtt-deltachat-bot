@@ -8,6 +8,8 @@
     {"suffix": "status/switch:0", "format": "json"}
   ],
 
+  "echo_actions_to_chat": true,
+
   "commands": {
     "on":     {"suffix": "command/switch:0", "payload": "on"},
     "off":    {"suffix": "command/switch:0", "payload": "off"},
