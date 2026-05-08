@@ -171,10 +171,28 @@ function render() {
     return;
   }
   const f = dev.fields || {};
-  onlineDot.textContent =
-    f.online === true ? '🟢' : f.online === false ? '🔴' : '⚪';
-  stateText.textContent =
-    typeof f.output === 'boolean' ? (f.output ? 'ON' : 'OFF') : '?';
+  // Header dot: green=on, red=off, grey=offline-or-unknown.
+  // (Was showing online/offline only — confusing because a plug can
+  // be online AND off, which used to look identical to online AND on.)
+  if (f.online === false) {
+    onlineDot.textContent = '⚫';            // offline
+  } else if (f.output === true) {
+    onlineDot.textContent = '🟢';            // on
+  } else if (f.output === false) {
+    onlineDot.textContent = '🔴';            // off
+  } else {
+    onlineDot.textContent = '⚫';            // unknown / no data yet
+  }
+  // Big state text: explicitly say "offline" when LWT reports the
+  // plug unreachable, instead of the stale ON/OFF that the relay
+  // last claimed.
+  if (f.online === false) {
+    stateText.textContent = 'offline';
+  } else if (typeof f.output === 'boolean') {
+    stateText.textContent = f.output ? 'ON' : 'OFF';
+  } else {
+    stateText.textContent = '?';
+  }
   statePower.textContent =
     typeof f.apower === 'number' ? `${f.apower.toFixed(0)} W` : '— W';
   stateEnergy.textContent =
