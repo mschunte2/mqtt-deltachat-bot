@@ -69,7 +69,28 @@ header select {
   font-weight: 600;
   margin-bottom: 4px;
 }
-.state-icon { margin-right: 6px; }
+.state-icon {
+  margin-right: 6px;
+  position: relative;
+  display: inline-block;
+}
+.state-icon.off .bulb-glyph,
+.state-icon.offline .bulb-glyph {
+  filter: grayscale(1) brightness(0.5);
+  opacity: 0.55;
+}
+.state-icon.offline::after {
+  content: '✕';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #d70015;
+  font-weight: 900;
+  font-size: 1.1em;
+  pointer-events: none;
+}
 .metrics {
   font-size: 1rem;
   color: #6b6b70;

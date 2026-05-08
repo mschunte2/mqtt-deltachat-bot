@@ -51,6 +51,7 @@ const picker = $('device-picker');
 const deviceDesc = $('device-desc');
 const onlineDot = $('online-dot');
 const lastUpdate = $('last-update');
+const stateIcon = $('state-icon');
 const stateText = $('state-text');
 const statePower = $('state-power');
 const sparkline = $('sparkline');
@@ -197,6 +198,7 @@ function render() {
     statePower.textContent = '— W';
     stateEnergy.textContent = '';
     onlineDot.textContent = '⚪';
+    stateIcon.className = 'state-icon off';
     return;
   }
   const f = dev.fields || {};
@@ -212,15 +214,22 @@ function render() {
   } else {
     onlineDot.textContent = '⚫';            // unknown / no data yet
   }
-  // Big state text: explicitly say "offline" when LWT reports the
-  // plug unreachable, instead of the stale ON/OFF that the relay
-  // last claimed.
+  // Big state text + bulb icon: explicitly say "offline" when LWT
+  // reports the plug unreachable, instead of the stale ON/OFF that
+  // the relay last claimed. Icon mirrors: bright bulb = ON,
+  // dimmed = OFF, dimmed + red ✕ = offline / unknown.
   if (f.online === false) {
     stateText.textContent = 'offline';
-  } else if (typeof f.output === 'boolean') {
-    stateText.textContent = f.output ? 'ON' : 'OFF';
+    stateIcon.className = 'state-icon offline';
+  } else if (f.output === true) {
+    stateText.textContent = 'ON';
+    stateIcon.className = 'state-icon';
+  } else if (f.output === false) {
+    stateText.textContent = 'OFF';
+    stateIcon.className = 'state-icon off';
   } else {
     stateText.textContent = '?';
+    stateIcon.className = 'state-icon offline';
   }
   statePower.textContent =
     typeof f.apower === 'number' ? `${f.apower.toFixed(0)} W` : '— W';
