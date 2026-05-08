@@ -514,8 +514,9 @@ falls back to the 1.x API if `CallbackAPIVersion` isn't importable.
   right after recording the new msgid.
 - **bot.py needs `logging.basicConfig`.** deltabot-cli only attaches a
   Rich handler to its own logger; without basicConfig at the top of
-  bot.py, every `mqtt_bot.engine`/`scheduler`/`mqtt`/`history` log call
-  is silently dropped. We hit this trying to debug the empty-picker bug.
+  bot.py, every `mqtt_bot.*` log call (plug, rules, mqtt, history,
+  publisher, snapshot, baselines, etc.) is silently dropped. We hit
+  this trying to debug the empty-picker bug.
 
 ## History (SQLite time series)
 
@@ -587,6 +588,29 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
+- 2026-05-08 **v0.2.1 — energy-storage simplification + quality**.
+  Same-day follow-up to v0.2.0. Drops `aenergy_minute` and
+  `energy_hour` tables from the code (rows in users' SQLite stay
+  forever as dead data; no DROP TABLE). `samples_raw` becomes the
+  single source of truth for energy queries. Effective aenergy at
+  any T = `raw_at_or_before(T) + Σ delta_wh from
+  aenergy_offset_events WHERE ts ≤ T` — two index seeks plus a
+  tiny SUM over a forever-tiny offset-events table. For users
+  who never have a hardware counter reset (the typical case),
+  the math collapses to a straight subtraction of two cumulative
+  counter readings. Counter-reset offsets moved from in-memory
+  twin state + baselines.json to history.aenergy_offset_events
+  (queryable, persistent, append-only). Two retention knobs
+  collapsed back to one (`RETENTION_DAYS` covers samples_raw +
+  power_minute; aenergy_offset_events is forever). Earlier
+  symptom — "Last 365 days > Plug Lifetime" — became
+  unrepresentable by construction. Added: cold-start
+  integration test, baselines.json round-trip + legacy-offset
+  migration test, per-twin counter-reset detection test
+  (writes-to-history). Extracted `baselines.py` so persistence
+  logic is unit-testable without bot.py globals. Added
+  `.github/workflows/ci.yml` (test + check-config + xdc build +
+  guards on engine.py / scheduler.py reappearing). 118 tests.
 - 2026-05-08 **v0.2.0 — digital-twin refactor**. `engine.py` and
   `scheduler.py` deleted. New: `plug.py` (PlugTwin per device),
   `twins.py` (TwinRegistry), `snapshot.py` (single
