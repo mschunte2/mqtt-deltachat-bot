@@ -50,16 +50,14 @@
       "timer":            "🕐 {name}: timer elapsed; {action_verb}",
       "tod":              "📅 {name}: scheduled time {hh}:{mm} reached; {action_verb}",
       "idle":             "💤 {name}: power {value:.1f} W < {threshold:.0f} W threshold for {duration_human}; {action_verb}",
-      "consumed":         "🔋 {name}: consumed {value:.2f} Wh < {threshold:.1f} Wh threshold over last {window_human}; {action_verb}",
-      "cancelled_manual": "↩️ {name}: pending auto-{action} cancelled (manually toggled)"
+      "consumed":         "🔋 {name}: consumed {value:.2f} Wh < {threshold:.1f} Wh threshold over last {window_human}; {action_verb}"
     }
   },
 
   "auto_on": {
     "command": "on",
     "trigger_messages": {
-      "tod":              "📅 {name}: scheduled time {hh}:{mm} reached; {action_verb}",
-      "cancelled_manual": "↩️ {name}: pending auto-{action} cancelled (manually toggled)"
+      "tod":              "📅 {name}: scheduled time {hh}:{mm} reached; {action_verb}"
     }
   }
 }

@@ -298,7 +298,7 @@ def _parse_auto_off(cls: str, raw: Any, commands: dict[str, Command]) -> AutoOff
     msgs = raw.get("trigger_messages") or {}
     if not isinstance(msgs, dict):
         raise ConfigError(f"{cls}.auto_off.trigger_messages must be object")
-    required = {"timer", "tod", "idle", "consumed", "cancelled_manual"}
+    required = {"timer", "tod", "idle", "consumed"}
     missing = required - set(msgs.keys())
     if missing:
         raise ConfigError(f"{cls}.auto_off.trigger_messages missing: {sorted(missing)}")
@@ -323,7 +323,7 @@ def _parse_auto_on(cls: str, raw: Any, commands: dict[str, Command]) -> AutoOnCo
     msgs = raw.get("trigger_messages") or {}
     if not isinstance(msgs, dict):
         raise ConfigError(f"{cls}.auto_on.trigger_messages must be object")
-    required = {"tod", "cancelled_manual"}
+    required = {"tod"}
     missing = required - set(msgs.keys())
     if missing:
         raise ConfigError(f"{cls}.auto_on.trigger_messages missing: {sorted(missing)}")

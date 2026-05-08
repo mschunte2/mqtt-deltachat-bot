@@ -369,7 +369,6 @@ CLASS_JSON_OK = {
             "tod":              "{name} auto-off ({hh}:{mm})",
             "idle":             "{name} auto-off (idle: {field}={value:.1f}W for {seconds}s)",
             "consumed":         "{name} auto-off (used {value:.2f}Wh)",
-            "cancelled_manual": "{name} auto-off cancelled (manually toggled)",
         },
     },
 }
@@ -525,14 +524,12 @@ CLASS_JSON_OK = {
         "trigger_messages": {
             "timer": "🕐 {name} timer", "tod": "📅 {name} {hh}:{mm}",
             "idle": "💤 {name} idle", "consumed": "🔋 {name} consumed",
-            "cancelled_manual": "↩️ {name} cancelled",
         },
     },
     "auto_on": {
         "command": "on",
         "trigger_messages": {
             "tod": "📅 {name} on at {hh}:{mm}",
-            "cancelled_manual": "↩️ {name} on-cancelled",
         },
     },
 }
@@ -638,56 +635,31 @@ class TestPlugTwinDispatch(unittest.TestCase):
         self.assertIn("unknown action", msg)
         self.assertEqual(calls["published"], [])
 
-    def test_dispatch_cancels_same_direction_pending_rule(self):
-        twin, calls, _ = _build_twin()
-        # Schedule an auto-off, then dispatch off manually.
-        policy = sched.ScheduledPolicy(timer_seconds=1800)
-        twin.schedule("off", policy, chat_id_origin=12)
-        self.assertEqual(len(twin.rules), 1)
-        calls["broadcasts"].clear()
-        calls["posted"].clear()
-        ok, _ = twin.dispatch("off")
-        self.assertTrue(ok)
-        self.assertEqual(len(twin.rules), 0)  # cancelled
-        self.assertTrue(any("cancelled" in t for _, t in calls["posted"]))
-
-    def test_dispatch_off_when_already_off_preserves_rules(self):
-        # Redundant action: pressing /off on an off plug must NOT
-        # cancel the pending auto-off rule — the rule's purpose is
-        # unchanged (the plug might come back on before its deadline).
-        twin, calls, _ = _build_twin()
-        twin.fields["output"] = False
-        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=1800), 12)
-        self.assertEqual(len(twin.rules), 1)
-        calls["posted"].clear()
-        ok, _ = twin.dispatch("off")
-        self.assertTrue(ok)
-        self.assertEqual(len(twin.rules), 1)
-        self.assertFalse(any("cancelled" in t for _, t in calls["posted"]))
-
-    def test_dispatch_on_when_already_on_preserves_rules(self):
-        twin, calls, _ = _build_twin()
-        twin.fields["output"] = True
-        twin.schedule("on", sched.ScheduledPolicy(timer_seconds=1800), 12)
-        self.assertEqual(len(twin.rules), 1)
-        calls["posted"].clear()
-        ok, _ = twin.dispatch("on")
-        self.assertTrue(ok)
-        self.assertEqual(len(twin.rules), 1)
-        self.assertFalse(any("cancelled" in t for _, t in calls["posted"]))
-
-    def test_dispatch_off_when_on_still_cancels(self):
-        # Regression guard: state-changing dispatch must keep the
-        # v0.1.5 manual-override semantics.
-        twin, calls, _ = _build_twin()
-        twin.fields["output"] = True
-        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=1800), 12)
-        self.assertEqual(len(twin.rules), 1)
-        calls["posted"].clear()
-        ok, _ = twin.dispatch("off")
-        self.assertTrue(ok)
-        self.assertEqual(len(twin.rules), 0)
-        self.assertTrue(any("cancelled" in t for _, t in calls["posted"]))
+    def test_dispatch_preserves_pending_rules(self):
+        # Manual toggles never cancel pending rules; only explicit
+        # `cancel-auto-*` (or the app's × button) removes a rule.
+        # State-aware dormancy keeps a rule silent while its target
+        # state matches the plug, and re-arms it when the plug flips.
+        cases = [
+            ("off", False),  # off on already-off
+            ("off", True),   # off on currently-on (state-changing)
+            ("on",  True),   # on on already-on
+            ("on",  False),  # on on currently-off (state-changing)
+        ]
+        for action, output in cases:
+            with self.subTest(action=action, output=output):
+                twin, calls, _ = _build_twin()
+                twin.fields["output"] = output
+                twin.schedule("off" if action == "off" else "on",
+                              sched.ScheduledPolicy(timer_seconds=1800), 12)
+                self.assertEqual(len(twin.rules), 1)
+                calls["posted"].clear()
+                ok, _ = twin.dispatch(action)
+                self.assertTrue(ok)
+                self.assertEqual(len(twin.rules), 1)
+                self.assertFalse(
+                    any("cancelled" in t for _, t in calls["posted"])
+                )
 
 
 # --- schedule + cancel ---------------------------------------------------

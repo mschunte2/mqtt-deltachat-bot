@@ -213,8 +213,8 @@ import bot/mqtt/webxdc/publisher — keeps the dep graph a clean DAG.
   rules (idle / consumed) → write history → call `broadcast(name)`
   if any state edge fired.
 - `dispatch(action, source_msgid?)` (DC handler thread): validate
-  action → publish → cancel same-direction pending rules + post
-  cancelled_manual → react 🆗 → broadcast.
+  action → publish → react 🆗 → broadcast. Pending rules survive
+  manual toggles; explicit removal goes through `cancel`.
 - `schedule(target_action, policy, chat_origin)`: build ScheduledJob;
   replace any rule with the same `(target_action, rule_id)`; save +
   broadcast.
@@ -435,7 +435,7 @@ fallback), scheduler.parse_policy (every form + restricted kinds),
 scheduler.integrate_wh, scheduler.next_tod_deadline, scheduler.tick
 (idle fire + reset), config loader (every error path), engine
 (unknown device, permission denied, unknown action, publish, template
-substitution including JSON, manual-override cancellation, threshold
+substitution including JSON, dispatch preserves pending rules, threshold
 detector fire + clear, on_fire publish + post, snapshot filtering).
 
 Add tests when extending — pure-module changes get pure-function tests;
