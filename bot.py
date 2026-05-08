@@ -28,6 +28,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
 
+
+class _SwallowBrokenPipe(logging.Filter):
+    """deltachat2's IOTransport writer thread races our SIGTERM handler;
+    the rpc subprocess closes its stdin while we're shutting down and the
+    writer logs a full BrokenPipeError stacktrace. It's harmless noise —
+    we've already flushed history and signalled the publisher. Drop it."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name != "deltachat2.IOTransport":
+            return True
+        if record.exc_info and isinstance(record.exc_info[1], BrokenPipeError):
+            return False
+        return "BrokenPipe" not in record.getMessage()
+
+
+logging.getLogger("deltachat2.IOTransport").addFilter(_SwallowBrokenPipe())
+
 import config as config_mod
 
 # --- Lightweight startup (no deltachat2 / paho dependency) ---------------
@@ -134,7 +150,17 @@ def _save_rules() -> None:
 
 
 def _publisher_broadcast(device_name: str | None = None) -> None:
-    publisher.broadcast(device_name)
+    # Twins call this on every state edge. We resolve the class so the
+    # publisher only pushes to apps of that class — a Tasmota toggle
+    # doesn't churn unrelated Shelly app instances. Force=True so we
+    # don't suppress edges with hash-equal payloads (e.g. a quick
+    # toggle that lands back where it started before the plug echoes).
+    only_class = None
+    if device_name:
+        twin = registry.get(device_name)
+        if twin is not None:
+            only_class = twin.cls.name
+    publisher.broadcast(device_name, only_class=only_class, force=True)
 
 
 # --- Construct everything ------------------------------------------------
@@ -194,7 +220,12 @@ def _on_shutdown(*_a) -> None:
         history.close()
     except Exception:
         log.exception("history close failed")
-    sys.exit(0)
+    # os._exit instead of sys.exit: deltabot-cli's main thread is blocked
+    # in a transport loop that doesn't propagate SystemExit cleanly, so
+    # sys.exit was leaving the process alive until systemd's SIGKILL
+    # (~90s after SIGTERM). os._exit terminates immediately — safe here
+    # because we've already flushed everything we own.
+    os._exit(0)
 
 
 import atexit  # noqa: E402
@@ -311,6 +342,8 @@ def help_text(chat_id: int) -> str:
         "  /<device> export 7d                — CSV of power + energy history\n"
         "  /<device> rules                    — list this device's rules\n"
         "  /rules               — list rules for every visible device\n"
+        "  /refresh             — push fresh state to every open webxdc app in this chat\n"
+        "  /<device> refresh    — push fresh state for that device's class only\n"
         "  /list                — list devices visible to this chat\n"
         "  /apps                — (re)deliver webxdc control apps\n"
         "  /id                  — show this chat's id\n"
@@ -340,10 +373,15 @@ def handle_webxdc_request(chat_id: int, msgid: int,
     if not device_name or not action:
         return
 
-    # Legacy actions — silently drop. App needs /apps to upgrade.
-    if action in ("history", "events", "set_param"):
-        log.info("legacy webxdc action %r dropped (chat=%d msgid=%d)",
-                 action, chat_id, msgid)
+    # Whitelist of actions we know about. Anything else (including the
+    # pre-v0.2 history/events/set_param) silently drops — old app
+    # instances in the chat will keep retrying until /apps replaces them.
+    _KNOWN = ("on", "off", "toggle", "status",
+              "auto-off", "auto-on",
+              "cancel-auto-off", "cancel-auto-on", "cancel-schedule")
+    if action not in _KNOWN:
+        log.debug("ignoring webxdc action %r (chat=%d msgid=%d)",
+                  action, chat_id, msgid)
         return
 
     if action in ("cancel-auto-off", "cancel-auto-on", "cancel-schedule"):
@@ -460,6 +498,19 @@ def _defaults_from_section(section) -> rules_mod.PolicyDefaults:
     return rules_mod.PolicyDefaults()
 
 
+def _refresh_chat(chat_id: int, only_class: str | None = None) -> int:
+    """Push a fresh snapshot to every webxdc instance in this chat
+    (filtered to `only_class` if given). Returns the count pushed.
+    Used by /refresh / /<dev> refresh chat commands."""
+    pushed = 0
+    for cls_name, msgid in webxdc.map_snapshot().get(chat_id, {}).items():
+        if only_class is not None and cls_name != only_class:
+            continue
+        if publisher.push_unicast(chat_id, msgid, cls_name):
+            pushed += 1
+    return pushed
+
+
 def _resolve_cancel_target(device_name: str, verb: str) -> str | None:
     twin = registry.get(device_name)
     if twin is None:
@@ -539,7 +590,7 @@ def _rule_clauses(job) -> list[str]:
 
 # --- Text-command parser --------------------------------------------------
 
-_GLOBAL_VERBS = {"id", "list", "apps", "help", "rules"}
+_GLOBAL_VERBS = {"id", "list", "apps", "help", "rules", "refresh"}
 _DIRECT_VERBS = {"on", "off", "toggle", "status"}
 _CANCEL_VERBS = {"cancel-auto-off", "cancel-auto-on", "cancel-schedule"}
 _SCHEDULE_VERBS = {"auto-off", "auto-on"}
@@ -677,6 +728,13 @@ def _on_new_message(bot, accid, event):
         if verb == "rules":
             bot.rpc.send_msg(accid, chatid, MsgData(text=list_rules(chatid)))
             return
+        if verb == "refresh":
+            n = _refresh_chat(chatid)
+            try:
+                bot.rpc.send_reaction(accid, msg.id, ["🆗" if n else "⚠️"])
+            except Exception:
+                pass
+            return
 
     if head == "all" and verb in _DIRECT_VERBS and not rest:
         _handle_all(bot, accid, chatid, verb, msg.id)
@@ -690,6 +748,21 @@ def _on_new_message(bot, accid, event):
     if verb == "rules" and not rest:
         bot.rpc.send_msg(accid, chatid,
                          MsgData(text=list_rules(chatid, device_name)))
+        return
+    if verb == "refresh" and not rest:
+        # /<dev> refresh: same effect as /refresh — pushes the snapshot
+        # for the device's class. Useful when the user has the chat focused
+        # and wants the app updated without opening it.
+        twin = registry.get(device_name)
+        if twin is None or not twin.can_chat_see(chatid, ALLOWED_CHATS):
+            bot.rpc.send_msg(accid, chatid,
+                             MsgData(text=f"unknown device: {device_name}"))
+            return
+        _refresh_chat(chatid, only_class=twin.cls.name)
+        try:
+            bot.rpc.send_reaction(accid, msg.id, ["🆗"])
+        except Exception:
+            pass
         return
     if verb in _DIRECT_VERBS:
         if verb == "off" and rest:

@@ -23,11 +23,21 @@ points (send_apps) are confined to the DC handler thread.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from collections.abc import Callable
 
 log = logging.getLogger("mqtt_bot.publisher")
+
+
+def _content_hash(payload: dict) -> int:
+    """Hash the snapshot's content excluding the always-changing
+    server_ts. Two snapshots taken seconds apart on an offline device
+    will hash equal — the periodic skip uses this to avoid re-pushing
+    identical payloads."""
+    body = {k: v for k, v in payload.items() if k != "server_ts"}
+    return hash(json.dumps(body, sort_keys=True, default=str))
 
 
 class Publisher:
@@ -44,6 +54,10 @@ class Publisher:
         self._interval = max(60, min(int(interval_s), 900))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Last successfully-pushed content hash per (chat_id, msgid).
+        # Used to skip identical periodic pushes; force-pushed by
+        # push_unicast (refresh button) and by edge broadcasts.
+        self._last_hash: dict[tuple[int, int], int] = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -58,27 +72,49 @@ class Publisher:
 
     # --- triggers --------------------------------------------------------
 
-    def broadcast(self, device_name: str | None = None) -> int:
-        """Build + push to every registered (chat, class). `device_name`
-        is informational; the snapshot always contains every device the
-        chat can see in that class."""
+    def broadcast(self, device_name: str | None = None,
+                  *, only_class: str | None = None,
+                  force: bool = False) -> int:
+        """Build + push to every registered (chat, class). With
+        `only_class`, restrict the fan-out to that class — used by
+        twin-driven edge broadcasts so a Tasmota toggle doesn't churn
+        unrelated Shelly app instances. With `force`, push regardless
+        of the content hash (state edges); without it, skip pushes
+        whose hash matches the last successful one for that
+        (chat, msgid)."""
         pushed = 0
+        skipped = 0
         for chat_id, by_class in self._msgids().items():
             for class_name, msgid in by_class.items():
+                if only_class is not None and class_name != only_class:
+                    continue
                 payload = self._build(chat_id, class_name)
                 if payload is None:
                     continue
+                key = (chat_id, msgid)
+                h = _content_hash(payload)
+                if not force and self._last_hash.get(key) == h:
+                    skipped += 1
+                    continue
                 if self._send(chat_id, msgid, payload):
+                    self._last_hash[key] = h
                     pushed += 1
-        log.debug("broadcast(trigger=%s) → %d push(es)", device_name, pushed)
+        if device_name or skipped:
+            log.debug("broadcast(trigger=%s class=%s force=%s) → %d push(es), %d skipped",
+                      device_name, only_class, force, pushed, skipped)
         return pushed
 
     def push_unicast(self, chat_id: int, msgid: int,
                      class_name: str) -> bool:
+        """Always pushes (force-true) — used for the refresh button and
+        /apps onboarding."""
         payload = self._build(chat_id, class_name)
         if payload is None:
             return False
-        return self._send(chat_id, msgid, payload)
+        if self._send(chat_id, msgid, payload):
+            self._last_hash[(chat_id, msgid)] = _content_hash(payload)
+            return True
+        return False
 
     # --- daemon ----------------------------------------------------------
 

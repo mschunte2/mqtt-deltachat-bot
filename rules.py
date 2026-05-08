@@ -434,15 +434,19 @@ def load_into(registry, path: Path | str) -> int:
     now = int(time.time())
     loaded = 0
     rearmed = False
+    dropped_unknown: dict[str, int] = {}   # device_name → count
+    dropped_expired = 0
+    dropped_malformed = 0
     for d in data.get("jobs", []):
         try:
             job = ScheduledJob.from_dict(d)
         except (KeyError, TypeError, ValueError):
+            dropped_malformed += 1
             continue
         twin = registry.get(job.device_name)
         if twin is None:
-            log.warning("dropping rule for unknown device %s",
-                        job.device_name)
+            dropped_unknown[job.device_name] = dropped_unknown.get(
+                job.device_name, 0) + 1
             continue
         if job.deadline_ts and job.deadline_ts < now:
             if job.recurring_tod and job.time_of_day:
@@ -451,10 +455,23 @@ def load_into(registry, path: Path | str) -> int:
                 rearmed = True
             else:
                 # one-shot timer/tod expired during downtime — drop
+                dropped_expired += 1
                 continue
         twin.add_persisted_rule(job)
         loaded += 1
     log.info("loaded %d persisted rules from %s", loaded, p)
+    if dropped_expired:
+        log.info("  dropped %d rule(s) whose deadline elapsed during downtime",
+                 dropped_expired)
+    if dropped_malformed:
+        log.warning("  dropped %d malformed rule(s) (rules.json schema drift?)",
+                    dropped_malformed)
+    if dropped_unknown:
+        names = ", ".join(f"{n}×{c}" for n, c in sorted(dropped_unknown.items()))
+        log.warning("  DROPPED rules for unknown device(s): %s — "
+                    "rename in devices.json reverts on next save_all. "
+                    "Edit %s manually to relocate the rules.",
+                    names, p)
     if rearmed:
         save_all(registry, p)
     return loaded

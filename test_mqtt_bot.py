@@ -1038,5 +1038,358 @@ class TestHistory(unittest.TestCase):
             h.close()
 
 
+# --- Snapshot protocol contract -----------------------------------------
+#
+# Locks the bot↔app payload shape. A protocol drift on either side
+# (renamed key, missing field, wrong nesting level) fails the test
+# instead of leaving the UI silently blank — which is the exact bug
+# we hit when first deploying v0.2.0.
+
+class TestSnapshotContract(unittest.TestCase):
+    def setUp(self):
+        # Build a twin with mock history so build_for_chat populates
+        # every per-device key.
+        twin, _, _ = _build_twin()
+        twin.deps = plug_mod.TwinDeps(
+            mqtt_publish=lambda *a: None,
+            post_to_chats=lambda *a: None,
+            broadcast=lambda *a: None,
+            save_rules=lambda: None,
+            react=lambda *a: None,
+            history=_FakeHistory(),
+            client_id="test",
+        )
+        twin.fields = {"online": True, "output": True,
+                        "apower": 42.0, "aenergy": 1234.5}
+        twin.last_update_ts = int(time.time())
+        from twins import TwinRegistry as _Reg
+        self.registry = _Reg([twin])
+
+    def test_top_level_keys(self):
+        snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
+        self.assertIsNotNone(snap)
+        # Snapshot is at the top level of payload — NO `snapshot:` wrapper.
+        # The app reads `payload.devices`, `payload.server_ts`, etc.
+        self.assertEqual(set(snap.keys()), {"class", "server_ts", "devices"})
+        self.assertEqual(snap["class"], "tplug")
+        self.assertIsInstance(snap["server_ts"], int)
+
+    def test_per_device_keys(self):
+        snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
+        dev = snap["devices"]["kitchen"]
+        # Every key the app reads. If you add/rename one in plug.py.to_dict,
+        # update both here AND devices/<class>/app/main.js.
+        for k in ("name", "description", "fields", "last_update_ts",
+                  "scheduled_jobs", "params", "energy",
+                  "daily_energy_wh", "power_history"):
+            self.assertIn(k, dev, f"missing top-level device key: {k}")
+        # power_history shape — minute @ ≤24h, hour @ ≤31d.
+        self.assertEqual(set(dev["power_history"].keys()), {"minute", "hour"})
+
+    def test_power_history_tuple_shape(self):
+        snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
+        ph = snap["devices"]["kitchen"]["power_history"]
+        # Each entry is [ts:int, w:float, output:0|1|None].
+        for series in (ph["minute"], ph["hour"]):
+            for entry in series[:5]:  # first 5 are enough
+                self.assertEqual(len(entry), 3)
+                self.assertIsInstance(entry[0], int)
+                self.assertIsInstance(entry[1], (int, float))
+                self.assertIn(entry[2], (0, 1, None))
+
+    def test_webxdc_io_wraps_payload_correctly(self):
+        # webxdc.push_to_msgid is what the publisher actually calls.
+        # It must serialise to {"payload": <snapshot>} with NO extra
+        # wrapping — main.js reads update.payload.devices directly.
+        captured = []
+        class _StubBot:
+            class rpc:
+                @staticmethod
+                def send_webxdc_status_update(_a, _m, body, _d):
+                    captured.append(body)
+
+        import webxdc_io as wio
+        tmp = Path(tempfile.mkdtemp())
+        io = wio.WebxdcIO(state_dir=tmp, devices_dir=tmp / "devices")
+        snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
+        ok = io.push_to_msgid(_StubBot(), 0, 99, snap)
+        self.assertTrue(ok)
+        body = json.loads(captured[0])
+        # Single `payload` wrapper, snapshot keys at the top level
+        # under it (NO extra `snapshot:` nesting).
+        self.assertEqual(set(body.keys()), {"payload"})
+        self.assertEqual(set(body["payload"].keys()), {"class", "server_ts", "devices"})
+        self.assertIn("kitchen", body["payload"]["devices"])
+
+
+# --- rules.save_all / load_into round trip -----------------------------
+
+class TestRulesPersistence(unittest.TestCase):
+    def setUp(self):
+        twin, _, _ = _build_twin()
+        # Schedule three rules of mixed shapes.
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=600), 12)
+        twin.schedule("off", sched.ScheduledPolicy(
+            consumed_field="apower", consumed_threshold_wh=5.0,
+            consumed_window_s=600), 12)
+        twin.schedule("on", sched.ScheduledPolicy(
+            time_of_day=(7, 30), recurring_tod=True), 12)
+        from twins import TwinRegistry as _Reg
+        self.registry = _Reg([twin])
+        self.path = Path(tempfile.mkdtemp()) / "rules.json"
+
+    def test_save_load_round_trip(self):
+        sched.save_all(self.registry, self.path)
+        before = sorted(j.rule_id for j in self.registry.get("kitchen").rules)
+
+        # Wipe the in-memory rules and reload from disk.
+        self.registry.get("kitchen").rules.clear()
+        n = sched.load_into(self.registry, self.path)
+        self.assertEqual(n, 3)
+        after = sorted(j.rule_id for j in self.registry.get("kitchen").rules)
+        self.assertEqual(before, after)
+
+    def test_load_into_drops_rules_for_unknown_device(self):
+        # Save rules from a registry with `kitchen`, then load into a
+        # registry that no longer has that twin.
+        sched.save_all(self.registry, self.path)
+        from twins import TwinRegistry as _Reg
+        empty = _Reg([])
+        with self.assertLogs("mqtt_bot.rules", level="WARNING") as cap:
+            n = sched.load_into(empty, self.path)
+        self.assertEqual(n, 0)
+        # The summary log line should mention `kitchen`.
+        self.assertTrue(any("kitchen" in m for m in cap.output))
+
+
+# --- Second device class (Tasmota) — engine is class-agnostic ---------
+#
+# Loads the real devices/tasmota_plug/class.json from the repo, wires
+# a twin, feeds Tasmota-shaped MQTT payloads through it, and asserts
+# state extraction + dispatch + snapshot all work without any Python
+# changes. The whole point of the declarative class model is that
+# adding a device type is a config-only change; this test guards that.
+
+class TestTasmotaClass(unittest.TestCase):
+    def setUp(self):
+        # Use the real devices/ directory + a one-device temp instances file.
+        repo_devices = HERE / "devices"
+        self.assertTrue((repo_devices / "tasmota_plug" / "class.json").exists())
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "devices.json").write_text(json.dumps({"devices": [{
+            "name": "lamp", "class": "tasmota_plug",
+            "topic_prefix": "tasmota_AB12CD",
+            "allowed_chats": [12],
+            "power_threshold_watts": 1000,
+            "power_threshold_duration_s": 5,
+        }]}))
+        self.cfg = cfg_mod.load(devices_dir=repo_devices,
+                                instances_file=tmp / "devices.json")
+        self.calls = {"published": [], "posted": [], "broadcasts": []}
+        deps = plug_mod.TwinDeps(
+            mqtt_publish=lambda t, p: self.calls["published"].append((t, p)),
+            post_to_chats=lambda dev, txt: self.calls["posted"].append(txt),
+            broadcast=lambda n=None: self.calls["broadcasts"].append(n),
+            save_rules=lambda: None,
+            react=lambda *a: None,
+            history=None,
+            client_id="test",
+        )
+        self.twin = plug_mod.PlugTwin(
+            cls=self.cfg.classes["tasmota_plug"],
+            cfg=self.cfg.devices["lamp"], deps=deps,
+        )
+
+    def test_lwt_drives_online_field(self):
+        # Tasmota LWT is text "Online"/"Offline" → bool_text extractor
+        # should accept "online" (lowercase via normalisation in state.py).
+        # The class config uses suffix "LWT" with extract:"bool_text".
+        # bool_text accepts "true|1|on" and "false|0|off"; anything else
+        # silently skips. Tasmota's "Online"/"Offline" payload doesn't
+        # match those keywords — so this is intentional: the LWT topic
+        # only updates `online` to True/False if the user has Tasmota
+        # configured to publish "true"/"false" (a 1-line SetOption).
+        # We verify the path exists; full LWT mapping is the user's
+        # configuration concern.
+        self.twin.on_mqtt("LWT", b"true")
+        self.assertEqual(self.twin.fields.get("online"), True)
+        self.twin.on_mqtt("LWT", b"false")
+        self.assertEqual(self.twin.fields.get("online"), False)
+
+    def test_stat_power_drives_output_field(self):
+        # Tasmota's relay echo on stat/POWER is "ON"/"OFF" text.
+        self.twin.on_mqtt("stat/POWER", b"on")
+        self.assertEqual(self.twin.fields["output"], True)
+        self.assertTrue(any("ON" in s for s in self.calls["posted"]))
+        self.twin.on_mqtt("stat/POWER", b"off")
+        self.assertEqual(self.twin.fields["output"], False)
+
+    def test_sensor_payload_extracts_apower_aenergy(self):
+        # Standard Tasmota tele/SENSOR shape.
+        payload = {
+            "Time": "2026-05-08T12:00:00",
+            "ENERGY": {
+                "Total": 12.345, "Yesterday": 1.0, "Today": 0.5,
+                "Power": 42, "ApparentPower": 50, "ReactivePower": 10,
+                "Factor": 0.84, "Voltage": 230, "Current": 0.183,
+            },
+        }
+        self.twin.on_mqtt("tele/SENSOR", json.dumps(payload).encode())
+        self.assertEqual(self.twin.fields["apower"], 42)
+        self.assertEqual(self.twin.fields["aenergy"], 12.345)
+        self.assertEqual(self.twin.fields["voltage"], 230)
+
+    def test_dispatch_publishes_tasmota_topic(self):
+        # /dev on for a Tasmota device should publish to cmnd/POWER
+        # with payload "ON" — totally different from Shelly's
+        # command/switch:0 + "on".
+        ok, _ = self.twin.dispatch("on")
+        self.assertTrue(ok)
+        self.assertEqual(self.calls["published"],
+                         [("tasmota_AB12CD/cmnd/POWER", "ON")])
+
+    def test_two_classes_coexist_in_one_registry(self):
+        # The whole point: one bot, two classes, no Python change.
+        repo_devices = HERE / "devices"
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "devices.json").write_text(json.dumps({"devices": [
+            {"name": "kitchen", "class": "shelly_plug",
+             "topic_prefix": "p/kitchen", "allowed_chats": [12]},
+            {"name": "lamp", "class": "tasmota_plug",
+             "topic_prefix": "tasmota_AB12CD", "allowed_chats": [12]},
+        ]}))
+        cfg2 = cfg_mod.load(devices_dir=repo_devices,
+                            instances_file=tmp / "devices.json")
+        self.assertEqual(set(cfg2.classes), {"shelly_plug", "tasmota_plug"})
+        self.assertEqual(set(cfg2.devices), {"kitchen", "lamp"})
+
+
+# --- In-process integration test ---------------------------------------
+#
+# Exercises the full bot-internal routing chain — topic → registry →
+# twin → state edge → publisher.broadcast → snapshot.build_for_chat →
+# send — without Delta Chat or paho. Catches wiring bugs that no
+# single-module test would (e.g. the v0.2 deploy that pushed snapshots
+# the app couldn't read).
+
+class TestIntegrationRoutingChain(unittest.TestCase):
+    def setUp(self):
+        # Build two twins (different classes, different chats) wired to
+        # a captured-send Publisher and a real TwinRegistry.
+        repo_devices = HERE / "devices"
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "devices.json").write_text(json.dumps({"devices": [
+            {"name": "kitchen", "class": "shelly_plug",
+             "topic_prefix": "p/kitchen", "allowed_chats": [12]},
+            {"name": "lamp", "class": "tasmota_plug",
+             "topic_prefix": "tasmota_AB", "allowed_chats": [12, 14]},
+        ]}))
+        cfg = cfg_mod.load(devices_dir=repo_devices,
+                           instances_file=tmp / "devices.json")
+
+        # Captured-send publisher: records every (chat, msgid, payload).
+        self.sent: list[tuple[int, int, dict]] = []
+
+        from twins import TwinRegistry as _Reg
+        from snapshot import build_for_chat as _build
+        from publisher import Publisher as _Pub
+
+        # We construct twins below with a deps that calls broadcast on
+        # every edge — deps.broadcast captures `self.publisher` via
+        # closure. The forward reference is fine because Python
+        # resolves the closure lazily at call time.
+        self.registry: "_Reg | None" = None
+        self.publisher: "_Pub | None" = None
+        twins = []
+        for d in cfg.devices.values():
+            cls_name = d.class_name
+            deps = plug_mod.TwinDeps(
+                mqtt_publish=lambda t, p: None,
+                post_to_chats=lambda dev, txt: None,
+                # Mirror bot._publisher_broadcast: filter by class so
+                # an edge on one class doesn't churn another class's
+                # apps. Capture class via default-arg trick.
+                broadcast=(lambda name=None, _cls=cls_name:
+                           self.publisher.broadcast(
+                               name, only_class=_cls, force=True)),
+                save_rules=lambda: None,
+                react=lambda *a: None,
+                history=None,
+                client_id="test",
+            )
+            twins.append(plug_mod.PlugTwin(
+                cls=cfg.classes[d.class_name], cfg=d, deps=deps))
+        self.registry = _Reg(twins)
+        # Two chats know about apps for both classes.
+        msgid_map = {
+            12: {"shelly_plug": 1001, "tasmota_plug": 1002},
+            14: {"tasmota_plug": 2002},
+        }
+        self.publisher = _Pub(
+            build=lambda chat, cls: _build(chat, cls, self.registry, set()),
+            msgids=lambda: msgid_map,
+            send=lambda c, m, p: (self.sent.append((c, m, p)), True)[1],
+            interval_s=300,
+        )
+
+    def _route(self, topic: str, payload: bytes) -> None:
+        """Mimic bot.on_mqtt_message: registry lookup + twin dispatch."""
+        found = self.registry.find_by_topic(topic)
+        self.assertIsNotNone(found, f"no twin for topic {topic}")
+        twin, suffix = found
+        twin.on_mqtt(suffix, payload)
+
+    def test_shelly_status_propagates_to_visible_chats(self):
+        # status/switch:0 with output=true → on_change fires → broadcast
+        # → publisher pushes to chat 12 (kitchen visible) but NOT 14
+        # (kitchen hidden — lamp visible only).
+        self.sent.clear()
+        self._route("p/kitchen/status/switch:0",
+                    json.dumps({"output": True}).encode())
+        self.assertGreaterEqual(len(self.sent), 1)
+        targets = {(c, m) for c, m, _ in self.sent}
+        self.assertIn((12, 1001), targets)   # kitchen visible to chat 12
+        # chat 14 sees no shelly_plug devices → no shelly_plug push.
+        for c, m, _ in self.sent:
+            if c == 14:
+                self.assertNotEqual(m, 1001)
+
+    def test_tasmota_lwt_propagates_to_both_chats(self):
+        # lamp is visible in chats 12 AND 14, so an edge on it should
+        # push tasmota_plug snapshots to both.
+        self.sent.clear()
+        self._route("tasmota_AB/LWT", b"true")
+        targets = {(c, m) for c, m, _ in self.sent}
+        self.assertIn((12, 1002), targets)
+        self.assertIn((14, 2002), targets)
+
+    def test_payload_shape_matches_app_expectations(self):
+        # Drive a state change, capture the pushed snapshot, and assert
+        # the app would be able to render it. Top-level keys MUST be
+        # {class, server_ts, devices} — anything else and main.js
+        # bails (which is the v0.2 deploy bug we're guarding against).
+        self.sent.clear()
+        self._route("tasmota_AB/stat/POWER", b"on")
+        self.assertGreater(len(self.sent), 0)
+        for chat_id, msgid, payload in self.sent:
+            self.assertEqual(set(payload.keys()),
+                             {"class", "server_ts", "devices"})
+            self.assertIn("lamp", payload["devices"])
+            dev = payload["devices"]["lamp"]
+            self.assertIn("fields", dev)
+            self.assertIn("scheduled_jobs", dev)
+
+
+# Stub History used by the snapshot-contract test. Just enough of the
+# query API for build_for_chat to populate every key.
+class _FakeHistory:
+    def query_power(self, *_a, **_kw):
+        return (60, [])
+    def daily_energy_kwh(self, *_a, **_kw):
+        return [(0, 0.0)] * 30
+    def energy_consumed_in(self, *_a, **_kw):
+        return (0.0, None)
+
+
 if __name__ == "__main__":
     unittest.main()

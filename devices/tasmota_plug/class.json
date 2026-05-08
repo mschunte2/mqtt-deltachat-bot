@@ -1,0 +1,64 @@
+{
+  "name": "tasmota_plug",
+  "description": "Tasmota smart plugs (Sonoff S26 / S31, Athom, GoSund, etc.) speaking the standard tele/stat/cmnd MQTT topic structure.",
+  "app_id": "tasmota_plug",
+
+  "subscribe": [
+    {"suffix": "LWT",        "format": "text"},
+    {"suffix": "tele/STATE", "format": "json"},
+    {"suffix": "tele/SENSOR","format": "json", "optional": true},
+    {"suffix": "stat/POWER", "format": "text"}
+  ],
+
+  "commands": {
+    "on":     {"suffix": "cmnd/POWER", "payload": "ON"},
+    "off":    {"suffix": "cmnd/POWER", "payload": "OFF"},
+    "toggle": {"suffix": "cmnd/POWER", "payload": "TOGGLE"},
+    "status": {"suffix": "cmnd/STATE", "payload": ""}
+  },
+
+  "state_fields": {
+    "online":  {"from_suffix": "LWT",         "extract": "bool_text"},
+    "output":  {"from_suffix": "stat/POWER",  "extract": "bool_text"},
+    "apower":  {"from_suffix": "tele/SENSOR", "json_path": "ENERGY.Power"},
+    "aenergy": {"from_suffix": "tele/SENSOR", "json_path": "ENERGY.Total"},
+    "voltage": {"from_suffix": "tele/SENSOR", "json_path": "ENERGY.Voltage"}
+  },
+
+  "chat_events": [
+    {"type": "on_change", "field": "output",
+     "values": {"true": "💡 {name} is now ON", "false": "💡 {name} is now OFF"}},
+    {"type": "on_change", "field": "online",
+     "values": {"true": "🟢 {name} back online", "false": "🔴 {name} went offline"}},
+    {"type": "threshold", "field": "apower",
+     "limit_param":    "power_threshold_watts",
+     "duration_param": "power_threshold_duration_s",
+     "above": "⚠️ {name} drew {value:.0f} W for {seconds}s",
+     "below": "✅ {name} load cleared"}
+  ],
+
+  "auto_off": {
+    "command": "off",
+    "default_idle_field":            "apower",
+    "default_idle_threshold":        5,
+    "default_idle_duration":         60,
+    "default_consumed_field":        "apower",
+    "default_consumed_threshold_wh": 5,
+    "default_consumed_window_s":     600,
+    "trigger_messages": {
+      "timer":            "🕐 {name}: timer elapsed; {action_verb}",
+      "tod":              "📅 {name}: scheduled time {hh}:{mm} reached; {action_verb}",
+      "idle":             "💤 {name}: power {value:.1f} W < {threshold:.0f} W threshold for {duration_human}; {action_verb}",
+      "consumed":         "🔋 {name}: consumed {value:.2f} Wh < {threshold:.1f} Wh threshold over last {window_human}; {action_verb}",
+      "cancelled_manual": "↩️ {name}: pending auto-{action} cancelled (manually toggled)"
+    }
+  },
+
+  "auto_on": {
+    "command": "on",
+    "trigger_messages": {
+      "tod":              "📅 {name}: scheduled time {hh}:{mm} reached; {action_verb}",
+      "cancelled_manual": "↩️ {name}: pending auto-{action} cancelled (manually toggled)"
+    }
+  }
+}
