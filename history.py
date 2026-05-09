@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS power_minute (
   avg_apower_w REAL    NOT NULL,
   sample_count INTEGER NOT NULL,
   output       INTEGER,
+  max_apower_w REAL,
   PRIMARY KEY (device, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_power_minute_ts ON power_minute (ts);
@@ -124,6 +125,25 @@ class History:
             cols = {row[1] for row in self._db.execute("PRAGMA table_info(power_minute)")}
             if "output" not in cols:
                 self._db.execute("ALTER TABLE power_minute ADD COLUMN output INTEGER")
+            if "max_apower_w" not in cols:
+                self._db.execute("ALTER TABLE power_minute ADD COLUMN max_apower_w REAL")
+            # Idempotent backfill: any NULL max_apower_w gets the per-minute
+            # MAX from samples_raw. WHERE clause makes this a no-op on
+            # subsequent boots once everything's filled.
+            backfill = self._db.execute(
+                "UPDATE power_minute "
+                "SET max_apower_w = ("
+                "  SELECT MAX(s.apower_w) FROM samples_raw s "
+                "  WHERE s.device = power_minute.device "
+                "    AND s.ts >= power_minute.ts "
+                "    AND s.ts <  power_minute.ts + 60 "
+                "    AND s.apower_w IS NOT NULL"
+                ") "
+                "WHERE max_apower_w IS NULL"
+            )
+            if backfill.rowcount > 0:
+                log.info("history: backfilled max_apower_w for %d power_minute rows",
+                         backfill.rowcount)
             self._db.commit()
         log.info("history db at %s (retention_days=%s)",
                  db_path,
@@ -225,15 +245,16 @@ class History:
 
     def query_power(self, device: str, since_ts: int, until_ts: int,
                     max_points: int = 200,
-                    ) -> tuple[int, list[tuple[int, float, int | None]]]:
+                    ) -> tuple[int, list[tuple[int, float | None, float, int | None]]]:
         if self._closed:
             return (60, [])
-        """Return (bucket_seconds, [(ts, avg_w, output), ...]) for the window.
+        """Return (bucket_seconds, [(ts, max_w, avg_w, output), ...]).
 
-        `output` for a bucket is MAX(output) over its underlying minute
-        rows: 1 if the device was on for any minute, 0 if every minute was
-        off, NULL if no minutes had a known output. (Treating "any-on as
-        on" keeps brief usage visible in coarse buckets.)
+        `max_w` is the peak apower observed in the bucket (None for legacy
+        rows the migration couldn't reach — caller falls back to avg_w).
+        `avg_w` is the sample-count-weighted mean. `output` is MAX over
+        the bucket's minutes: 1 if on for any minute, 0 if every minute
+        off, NULL if no minutes had a known output.
         """
         if until_ts <= since_ts:
             return (60, [])
@@ -242,6 +263,7 @@ class History:
         with self._lock:
             cur = self._db.execute(
                 "SELECT (ts/?)*?, "
+                "       MAX(max_apower_w), "
                 "       SUM(avg_apower_w * sample_count) / SUM(sample_count), "
                 "       MAX(output) "
                 "FROM power_minute "
@@ -252,8 +274,11 @@ class History:
             )
             rows = cur.fetchall()
         return (bucket, [
-            (int(t), float(w), int(o) if o is not None else None)
-            for t, w, o in rows if w is not None
+            (int(t),
+             float(mx) if mx is not None else None,
+             float(avg),
+             int(o) if o is not None else None)
+            for t, mx, avg, o in rows if avg is not None
         ])
 
     def query_power_raw(self, device: str, since_ts: int, until_ts: int
@@ -427,11 +452,12 @@ class History:
                 # Flush previous minute, start new
                 if samples:
                     avg = sum(samples) / len(samples)
+                    mx = max(samples)
                     self._db.execute(
                         "INSERT OR REPLACE INTO power_minute "
-                        "(device, ts, avg_apower_w, sample_count, output) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (device, prev_start, avg, len(samples), prev_output),
+                        "(device, ts, avg_apower_w, sample_count, output, max_apower_w) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (device, prev_start, avg, len(samples), prev_output, mx),
                     )
                     self._db.commit()
                 self._minute[device] = (minute_start, [apower], output)
@@ -451,11 +477,12 @@ class History:
             if not samples:
                 return
             avg = sum(samples) / len(samples)
+            mx = max(samples)
             self._db.execute(
                 "INSERT OR REPLACE INTO power_minute "
-                "(device, ts, avg_apower_w, sample_count, output) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (device, minute_start, avg, len(samples), output),
+                "(device, ts, avg_apower_w, sample_count, output, max_apower_w) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (device, minute_start, avg, len(samples), output, mx),
             )
             self._db.commit()
 

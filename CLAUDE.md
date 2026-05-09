@@ -528,9 +528,12 @@ falls back to the 1.x API if `CallbackAPIVersion` isn't importable.
   status/switch:0 captured verbatim. `aenergy_total_wh` is the RAW
   plug counter (untouched by offset adjustment). This is the
   single source of truth for energy queries.
-- `power_minute(device, ts, avg_apower_w, sample_count, output)` —
-  one row per minute, derived from the apower stream in
-  samples_raw. Used by the app's power chart and by rule
+- `power_minute(device, ts, avg_apower_w, sample_count, output,
+  max_apower_w)` — one row per minute, derived from the apower
+  stream in samples_raw. `avg_apower_w` is the mean over that
+  minute's samples; `max_apower_w` is the peak (added v0.2.2;
+  legacy rows backfilled idempotently from samples_raw on
+  startup). Used by the app's power chart and by rule
   rehydration. `output` is the relay state (0/1/NULL).
 - `aenergy_offset_events(device, ts, delta_wh)` — append-only log
   of detected hardware counter resets. Each row's delta_wh is
@@ -572,9 +575,16 @@ Each device payload includes:
 - `daily_energy_wh: [[ts, wh] * 30]` — last 30 days of daily totals
   for the bar chart.
 - `power_history: {minute, hour}` — two pre-aggregated series the
-  app picks between based on the chart window. Buckets without a
-  `power_minute` row gap-fill as `[ts, 0, null]` → grey on the
-  chart (offline).
+  app picks between based on the chart window. Each entry is
+  `[ts, max_w, avg_w, output]`. The app plots `max_w` for short
+  windows (≤12 h) so cycling-load peaks (espresso boilers, etc.)
+  are rule-faithful, and `avg_w` for ≥24 h so the curve still
+  shows typicality. Header always reads
+  `max X W · avg Y W` from the visible points. Buckets without a
+  `power_minute` row gap-fill as `[ts, 0, 0, null]` → grey on
+  the chart (offline). Energy panels (`kWh consumed in last X`)
+  always use avg-based integration — not max — so they don't
+  overstate consumption.
 
 ## Chat command additions
 
@@ -588,6 +598,20 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
+- 2026-05-09 **v0.2.2 — power chart shows peaks**. `power_minute`
+  gains `max_apower_w` column; per-minute aggregation tracks max
+  alongside avg. Chart switches to max-per-minute for windows up
+  to 12 h (rule-faithful, catches boiler-burst spikes that the
+  minute-average smooths away) and stays on avg for 24 h / 31 d
+  (typicality-faithful). Header reads
+  `max X W · avg Y W` from the visible points. Idempotent
+  migration backfills existing power_minute rows from samples_raw
+  on first boot. Snapshot's `power_history` entry shape changes
+  from `[ts, w, output]` to `[ts, max_w, avg_w, output]`. Energy
+  panels (`kWh consumed in last X`) unchanged — keep using
+  avg-based integration so they don't overstate. Fixes the "chart
+  says 800 W but the idle rule never fires" mystery for cycling-
+  load devices like espresso machines. 120 tests.
 - 2026-05-08 **v0.2.1 — energy-storage simplification + quality**.
   Same-day follow-up to v0.2.0. Drops `aenergy_minute` and
   `energy_hour` tables from the code (rows in users' SQLite stay

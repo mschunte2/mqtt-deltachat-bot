@@ -64,20 +64,28 @@ def _power_history(history, device_name: str) -> dict[str, list]:
     return {"minute": minute, "hour": hour}
 
 
-def _gap_fill(rows: list[tuple[int, float, int | None]],
+def _gap_fill(rows: list[tuple[int, float | None, float, int | None]],
               since: int, until: int, bucket: int) -> list[list]:
-    """Dense series at `bucket` step. Missing buckets become
-    [ts, 0.0, None] — None=offline, app paints grey."""
-    by_ts = {int(ts): (float(w), out) for ts, w, out in rows}
+    """Dense series at `bucket` step.
+
+    Each emitted point is [ts, max_w, avg_w, output]:
+      - max_w is the bucket's peak (None for legacy rows the migration
+        couldn't backfill — the app falls back to avg_w for those).
+      - avg_w is the sample-count-weighted mean (always populated).
+      - output is None for missing buckets — app paints grey.
+
+    Missing buckets emit [ts, 0.0, 0.0, None].
+    """
+    by_ts = {int(ts): (mx, float(avg), out) for ts, mx, avg, out in rows}
     start = ((since + bucket - 1) // bucket) * bucket
     out: list[list] = []
     t = start
     while t < until:
         if t in by_ts:
-            w, o = by_ts[t]
-            out.append([t, w, o])
+            mx, avg, o = by_ts[t]
+            out.append([t, (float(mx) if mx is not None else None), avg, o])
         else:
-            out.append([t, 0.0, None])
+            out.append([t, 0.0, 0.0, None])
         t += bucket
     return out
 

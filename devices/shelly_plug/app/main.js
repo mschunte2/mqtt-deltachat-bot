@@ -256,7 +256,7 @@ function renderSparkline() {
     chartFoot.textContent = '(no data yet)';
     return;
   }
-  // Pick resolution based on window. ≤24h → minute, 31d → hour.
+  // Pick resolution based on window. ≤24h → minute, 7d+ → hour.
   const useHour = state.windowSeconds >= 7 * 86400;
   const series = useHour ? dev.power_history.hour : dev.power_history.minute;
   if (!Array.isArray(series) || series.length < 2) {
@@ -267,30 +267,36 @@ function renderSparkline() {
   const now = Math.floor(Date.now() / 1000);
   const xMax = now;
   const xMin = now - state.windowSeconds;
-  // Slice series to the window.
+  // Slice series to the window. Each point is [ts, max_w, avg_w, output].
   const pts = series.filter(p => p[0] >= xMin && p[0] <= xMax);
   if (pts.length < 2) {
     sparkline.innerHTML = ''; chartMax.textContent = '';
     chartFoot.textContent = '(no data in this window)';
     return;
   }
+  // Plot max-per-minute for short windows (rule-faithful: catches
+  // boiler-burst spikes etc.); avg for ≥24h (typicality-faithful).
+  // Hour buckets always plot avg — peaks at hour granularity are noise.
+  const showMax = !useHour && state.windowSeconds <= 12 * 3600;
+  const pickW = (p) => showMax ? ((p[1] != null) ? p[1] : p[2]) : p[2];
+
   const tSpan = Math.max(1, xMax - xMin);
-  const pMax = Math.max(1, ...pts.map(p => p[1]));
+  const pMax = Math.max(1, ...pts.map(pickW));
   const W = 200, H = 60;
   const yOff = H - 2;
 
   const onSegs = [], offSegs = [], offlineSegs = [];
   for (let i = 0; i < pts.length - 1; i++) {
-    const [t1, w1, o1] = pts[i];
-    const [t2] = pts[i + 1];
+    const p1 = pts[i], p2 = pts[i + 1];
+    const t1 = p1[0], o1 = p1[3];
     const x1 = ((t1 - xMin) / tSpan) * W;
-    const x2 = ((t2 - xMin) / tSpan) * W;
+    const x2 = ((p2[0] - xMin) / tSpan) * W;
     if (o1 === null) {
       offlineSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
     } else if (o1 === 0) {
       offSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
     } else {
-      const [, w2] = pts[i + 1];
+      const w1 = pickW(p1), w2 = pickW(p2);
       const y1 = H - (w1 / pMax) * (H - 6) - 3;
       const y2 = H - (w2 / pMax) * (H - 6) - 3;
       onSegs.push(`M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)}`);
@@ -310,7 +316,12 @@ function renderSparkline() {
                   stroke-linecap="round" d="${onSegs.join(' ')}"/>`;
   }
   sparkline.innerHTML = svg;
-  chartMax.textContent = `max ${pMax.toFixed(0)} W`;
+  // Header always shows both max and avg from the visible points,
+  // computed from the underlying max_w / avg_w fields regardless of
+  // which one the line is plotting. `null` max falls back to avg.
+  const maxOfPts = Math.max(...pts.map(p => (p[1] != null) ? p[1] : p[2]));
+  const avgOfPts = pts.reduce((s, p) => s + p[2], 0) / pts.length;
+  chartMax.textContent = `max ${maxOfPts.toFixed(0)} W · avg ${avgOfPts.toFixed(0)} W`;
   // Total kWh from energy summary if available, else integrate from points.
   const e = dev.energy;
   let kwh = null;

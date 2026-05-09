@@ -821,7 +821,7 @@ class TestHistory(unittest.TestCase):
         self.h.close()
 
     def test_write_sample_buffers_until_minute_rolls(self):
-        # All samples in the same minute → not yet flushed
+        # query_power tuples: (ts, max_w, avg_w, output)
         self.h.write_sample("kaffeete", 1000, 5.0, output=True)
         self.h.write_sample("kaffeete", 1010, 15.0, output=True)
         bucket, pts = self.h.query_power("kaffeete", 0, 2000)
@@ -831,8 +831,21 @@ class TestHistory(unittest.TestCase):
         bucket, pts = self.h.query_power("kaffeete", 0, 2000)
         self.assertEqual(len(pts), 1)
         self.assertEqual(pts[0][0], 960)  # 1000 // 60 * 60
-        self.assertAlmostEqual(pts[0][1], 10.0)
-        self.assertEqual(pts[0][2], 1)  # output=on
+        self.assertAlmostEqual(pts[0][1], 15.0)  # max
+        self.assertAlmostEqual(pts[0][2], 10.0)  # avg
+        self.assertEqual(pts[0][3], 1)  # output=on
+
+    def test_max_tracked_alongside_avg(self):
+        # Three samples within the same minute window [60, 120).
+        # 5W, 200W, 10W → avg ≈ 71.67, max = 200.
+        self.h.write_sample("k", 65, 5.0, output=True)
+        self.h.write_sample("k", 90, 200.0, output=True)
+        self.h.write_sample("k", 115, 10.0, output=True)
+        self.h.flush_pending_minutes(now=200)
+        _, pts = self.h.query_power("k", 0, 200)
+        self.assertEqual(len(pts), 1)
+        self.assertAlmostEqual(pts[0][1], 200.0)            # max
+        self.assertAlmostEqual(pts[0][2], 215.0 / 3, places=2)  # avg
 
     def test_output_off_persisted(self):
         self.h.write_sample("k", 100, 0.0, output=False)
@@ -840,14 +853,14 @@ class TestHistory(unittest.TestCase):
         self.h.flush_pending_minutes(now=200)
         _, pts = self.h.query_power("k", 0, 200)
         self.assertEqual(len(pts), 1)
-        self.assertEqual(pts[0][2], 0)  # output=off
+        self.assertEqual(pts[0][3], 0)  # output=off
 
     def test_output_unknown_when_never_reported(self):
         self.h.write_sample("k", 100, 5.0)  # no output kwarg
         self.h.flush_pending_minutes(now=200)
         _, pts = self.h.query_power("k", 0, 200)
         self.assertEqual(len(pts), 1)
-        self.assertIsNone(pts[0][2])  # output unknown
+        self.assertIsNone(pts[0][3])  # output unknown
 
     def test_flush_pending_minutes(self):
         self.h.write_sample("k", 100, 7.0, output=True)
@@ -855,8 +868,9 @@ class TestHistory(unittest.TestCase):
         self.h.flush_pending_minutes(now=200)
         bucket, pts = self.h.query_power("k", 0, 200)
         self.assertEqual(len(pts), 1)
-        self.assertAlmostEqual(pts[0][1], 10.0)
-        self.assertEqual(pts[0][2], 1)
+        self.assertAlmostEqual(pts[0][1], 13.0)  # max
+        self.assertAlmostEqual(pts[0][2], 10.0)  # avg
+        self.assertEqual(pts[0][3], 1)
 
     def test_query_power_downsamples(self):
         # Insert 240 minutes of data, ask for 60 points → bucket ≥ 240s
@@ -896,6 +910,59 @@ class TestHistory(unittest.TestCase):
             _, all_pts = h.query_power("k", 0, now + 60, max_points=200)
             self.assertNotIn(old_ts - (old_ts % 60),
                               [p[0] for p in all_pts])
+        finally:
+            h.close()
+
+    def test_legacy_schema_migration_backfills_max(self):
+        """Cold-start on a db from before max_apower_w existed: ALTER runs
+        and the backfill query fills max from samples_raw."""
+        import sqlite3 as _sqlite3
+        legacy_path = self.tmp / "legacy.sqlite"
+        db = _sqlite3.connect(str(legacy_path))
+        # Legacy schema: power_minute without max_apower_w.
+        db.executescript(
+            "CREATE TABLE samples_raw ("
+            "  device TEXT, ts INTEGER, apower_w REAL, voltage_v REAL,"
+            "  current_a REAL, freq_hz REAL, aenergy_total_wh REAL,"
+            "  output INTEGER, temperature_c REAL, payload_json TEXT,"
+            "  PRIMARY KEY (device, ts)"
+            ");"
+            "CREATE TABLE power_minute ("
+            "  device TEXT NOT NULL, ts INTEGER NOT NULL,"
+            "  avg_apower_w REAL NOT NULL, sample_count INTEGER NOT NULL,"
+            "  output INTEGER, PRIMARY KEY (device, ts)"
+            ");"
+            "CREATE TABLE aenergy_offset_events ("
+            "  device TEXT, ts INTEGER, delta_wh REAL,"
+            "  PRIMARY KEY (device, ts)"
+            ");"
+        )
+        # Samples in [60, 120): 5W, 200W, 50W → expected max = 200.
+        for ts, w in [(65, 5.0), (90, 200.0), (115, 50.0)]:
+            db.execute(
+                "INSERT INTO samples_raw (device, ts, apower_w) "
+                "VALUES ('k', ?, ?)", (ts, w),
+            )
+        # Legacy power_minute row carries only the avg.
+        db.execute(
+            "INSERT INTO power_minute (device, ts, avg_apower_w, sample_count) "
+            "VALUES ('k', 60, 85.0, 3)",
+        )
+        db.commit()
+        db.close()
+
+        # Instantiate History → triggers ALTER + backfill.
+        h = history_mod.History(legacy_path, retention_days=0)
+        try:
+            cols = {r[1] for r in h._db.execute(
+                "PRAGMA table_info(power_minute)")}
+            self.assertIn("max_apower_w", cols)
+            row = h._db.execute(
+                "SELECT avg_apower_w, max_apower_w FROM power_minute "
+                "WHERE device='k' AND ts=60"
+            ).fetchone()
+            self.assertAlmostEqual(row[0], 85.0)   # avg untouched
+            self.assertAlmostEqual(row[1], 200.0)  # max backfilled
         finally:
             h.close()
 
@@ -1310,13 +1377,14 @@ class TestSnapshotContract(unittest.TestCase):
     def test_power_history_tuple_shape(self):
         snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
         ph = snap["devices"]["kitchen"]["power_history"]
-        # Each entry is [ts:int, w:float, output:0|1|None].
+        # Each entry is [ts:int, max_w:float|None, avg_w:float, output:0|1|None].
         for series in (ph["minute"], ph["hour"]):
             for entry in series[:5]:  # first 5 are enough
-                self.assertEqual(len(entry), 3)
+                self.assertEqual(len(entry), 4)
                 self.assertIsInstance(entry[0], int)
-                self.assertIsInstance(entry[1], (int, float))
-                self.assertIn(entry[2], (0, 1, None))
+                self.assertTrue(entry[1] is None or isinstance(entry[1], (int, float)))
+                self.assertIsInstance(entry[2], (int, float))
+                self.assertIn(entry[3], (0, 1, None))
 
     def test_webxdc_io_wraps_payload_correctly(self):
         # webxdc.push_to_msgid is what the publisher actually calls.
