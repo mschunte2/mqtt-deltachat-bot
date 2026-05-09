@@ -417,6 +417,23 @@ function renderEnergySummary(dev) {
   }
 }
 
+function currentObservedText(j) {
+  // Live observed values vs. the rule's threshold. Idle and consumed
+  // rules carry their own current_* field, populated by the bot's
+  // snapshot pipeline. If neither is present (timer/tod-only rules),
+  // we have nothing live to display.
+  const parts = [];
+  if (j.idle && typeof j.idle.current_max_w === 'number') {
+    parts.push(`max ${j.idle.current_max_w.toFixed(0)}W in last `
+             + `${fmtSecs(j.idle.duration_s)}`);
+  }
+  if (j.consumed && typeof j.consumed.current_wh === 'number') {
+    parts.push(`${j.consumed.current_wh.toFixed(2)}Wh in last `
+             + `${fmtSecs(j.consumed.window_s)}`);
+  }
+  return parts.join(' · ');
+}
+
 function describeRule(j) {
   const parts = [];
   if (j.deadline_ts) {
@@ -460,8 +477,9 @@ function renderRulesList(dev) {
     ul.innerHTML = list.map(j => {
       const desc = describeRule(j);
       const rid  = j.rule_id || '';
+      const cur  = currentObservedText(j);
       return `<li><span class="rule-text">${esc(desc)}</span>`
-           + `<span class="rule-id">${esc(rid)}</span>`
+           + `<span class="rule-current">${esc(cur)}</span>`
            + `<button class="delete-btn" data-action="${action}" `
            + `data-rule-id="${esc(rid)}">×</button></li>`;
     }).join('');

@@ -209,9 +209,11 @@ import bot/mqtt/webxdc/publisher — keeps the dep graph a clean DAG.
 ### Methods
 
 - `on_mqtt(suffix, payload)` (MQTT thread): extract → update fields →
-  evaluate `chat_events` (on_change + threshold) → tick state-based
-  rules (idle / consumed) → write history → call `broadcast(name)`
-  if any state edge fired.
+  evaluate `chat_events` (on_change + threshold) → reset rule windows
+  on a genuine output edge (F→T resets off-target rules' transient
+  state, T→F resets on-target rules; None→T/F is bot-startup
+  hydration and skipped) → tick state-based rules (idle / consumed)
+  → write history → call `broadcast(name)` if any state edge fired.
 - `dispatch(action, source_msgid?)` (DC handler thread): validate
   action → publish → react 🆗 → broadcast. Pending rules survive
   manual toggles; explicit removal goes through `cancel`.
@@ -598,6 +600,24 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
+- 2026-05-09 **v0.2.3 — idle-rule fidelity + manual-toggle window
+  reset + actuals next to rules**. Three small fixes that together
+  make idle/consumed rules behave the way users naturally expect.
+  (1) Bot-restart rehydration of idle rules now reads raw samples
+  (samples_raw) instead of per-minute averages (power_minute), so
+  cycling-load devices like espresso machines no longer have their
+  off-rule spuriously armed at startup. (2) Manual ON resets the
+  transient state of every off-targeted rule on the twin (and
+  symmetrically, manual OFF resets on-targeted rules), so a "off
+  if idle for 30 min" rule always leaves the user a fresh 30-min
+  window after they manually switch the device on. None→True
+  (bot startup hydration of `output`) is excluded — only genuine
+  user-or-device edges trigger the reset. (3) The app's per-rule
+  display drops the redundant `consumed:5Wh:600s` rule-id span
+  and shows live observed values instead — `8.30 Wh in last 10m`
+  for consumed rules, `max 1219W in last 30m` for idle rules,
+  computed from the rule's _samples deque (consumed) or a
+  samples_raw query (idle). 125 tests.
 - 2026-05-09 **v0.2.2 — power chart shows peaks**. `power_minute`
   gains `max_apower_w` column; per-minute aggregation tracks max
   alongside avg. Chart switches to max-per-minute for windows up

@@ -596,6 +596,91 @@ class TestPlugTwinOnMqtt(unittest.TestCase):
         self.assertIn(("kitchen", "💡 kitchen ON"), calls["posted"])
         self.assertEqual(calls["broadcasts"][-1], "kitchen")
 
+    def test_manual_on_resets_off_rule_idle_window(self):
+        # User toggles plug ON after a long idle period; off-rule's stale
+        # _below_since must be cleared so the user gets a fresh window.
+        # We use a long idle_duration_s so the rule doesn't insta-fire
+        # on the stale 2h-ago timestamp before the reset path runs.
+        twin, _, _ = _build_twin()
+        twin.fields["output"] = False
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(idle_field="apower", idle_threshold=5.0,
+                                  idle_duration_s=86400),
+            12,
+        )
+        rule = twin.rules[0]
+        stale = int(time.time()) - 7200  # 2h ago
+        rule._below_since = stale
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 1.5}).encode())
+        # Reset cleared the stale value; _eval_idle then re-stamped
+        # _below_since to ~now since apower (1.5) is still < threshold.
+        # End state: a fresh window starts here, not 2h ago.
+        self.assertNotEqual(rule._below_since, stale)
+        self.assertGreater(rule._below_since, int(time.time()) - 5)
+
+    def test_manual_on_resets_off_rule_consumed_window(self):
+        twin, _, _ = _build_twin()
+        twin.fields["output"] = False
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(consumed_field="apower",
+                                  consumed_threshold_wh=5.0,
+                                  consumed_window_s=600),
+            12,
+        )
+        rule = twin.rules[0]
+        long_ago = int(time.time()) - 7200
+        rule._samples.append((long_ago, 100.0))
+        rule._consumed_started_at = long_ago
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 50.0}).encode())
+        # Buffer cleared on reset; a fresh sample lands on the next
+        # _eval_consumed call inside on_mqtt — exactly one (now) entry
+        # for the new window.
+        self.assertEqual(len(rule._samples), 1)
+        self.assertGreater(rule._consumed_started_at, long_ago)
+
+    def test_manual_off_resets_on_rule_window(self):
+        twin, _, _ = _build_twin()
+        twin.fields["output"] = True
+        twin.schedule(
+            "on",
+            sched.ScheduledPolicy(idle_field="apower", idle_threshold=5.0,
+                                  idle_duration_s=86400),
+            12,
+        )
+        rule = twin.rules[0]
+        stale = int(time.time()) - 7200
+        rule._below_since = stale
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": False, "apower": 0.0}).encode())
+        self.assertNotEqual(rule._below_since, stale)
+        self.assertGreater(rule._below_since, int(time.time()) - 5)
+
+    def test_first_seen_output_does_not_reset(self):
+        # None→True is bot hydration on startup, not a user edge.
+        # Use a long duration so the live evaluator doesn't fire and
+        # confound the test.
+        twin, _, _ = _build_twin()
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(idle_field="apower", idle_threshold=5.0,
+                                  idle_duration_s=86400),
+            12,
+        )
+        rule = twin.rules[0]
+        marker = int(time.time()) - 7200
+        rule._below_since = marker
+        # Twin starts with no prior `output` field.
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 1.5}).encode())
+        # The reset hook was skipped (None→True is not user-initiated).
+        # _below_since stays at the marker — _eval_idle leaves it alone
+        # when v < threshold and _below_since is already set.
+        self.assertEqual(rule._below_since, marker)
+
     def test_threshold_above_then_below(self):
         twin, calls, _ = _build_twin(params={
             "power_threshold_watts": 100,
@@ -728,6 +813,26 @@ class TestPlugTwinTickTime(unittest.TestCase):
         twin.tick_time(int(time.time()) + 5)
         self.assertEqual(len(twin.rules), 1)         # rearmed
         self.assertEqual(calls["published"], [])     # but did not fire
+
+    def test_to_dict_includes_consumed_current_wh(self):
+        # Snapshot enrichment: every consumed rule gets a current_wh
+        # field computed from its _samples deque.
+        twin, _, _ = _build_twin()
+        policy = sched.ScheduledPolicy(consumed_field="apower",
+                                       consumed_threshold_wh=10.0,
+                                       consumed_window_s=600)
+        twin.schedule("off", policy, 12)
+        rule = twin.rules[0]
+        # Inject 100 W constant for 60 s → 100·60/3600 = 1.667 Wh
+        now = int(time.time())
+        for offset in range(60):
+            rule._samples.append((now - 60 + offset, 100.0))
+        out = twin.to_dict()
+        sched_jobs = out["scheduled_jobs"]
+        self.assertEqual(len(sched_jobs), 1)
+        consumed = sched_jobs[0]["consumed"]
+        self.assertIn("current_wh", consumed)
+        self.assertAlmostEqual(consumed["current_wh"], 100.0 / 60.0, places=1)
 
 
 # --- snapshot.build_for_chat --------------------------------------------

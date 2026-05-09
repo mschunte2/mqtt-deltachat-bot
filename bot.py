@@ -1071,14 +1071,25 @@ def _rehydrate_rules_from_history() -> None:
                 log.info("rehydrated consumed rule %s/%s with %d samples",
                          twin.name, job.rule_id, len(rows))
             if job.has_idle() and job.idle_field == "apower":
+                # Idle is "every raw sample below threshold throughout
+                # the window" — must rehydrate from samples_raw, not
+                # power_minute. Per-minute averages smooth cycling-load
+                # spikes (e.g. an espresso boiler hitting 1.2 kW for ~5 s
+                # every ~100 s), which would falsely satisfy the
+                # "all below threshold" check and arm the rule to fire
+                # on the first sample after restart.
                 since = now - job.idle_duration_s
-                rows = history.query_power_raw(twin.name, since, now)
-                if rows and all(r[1] < job.idle_threshold for r in rows):
-                    job._below_since = rows[0][0]
+                raw_rows = history.query_samples_raw(twin.name, since, now)
+                if raw_rows and all(
+                    (r[1] is not None and r[1] < job.idle_threshold)
+                    for r in raw_rows
+                ):
+                    job._below_since = raw_rows[0][0]
                     log.info("rehydrated idle rule %s/%s — below "
-                             "%.1fW since %d (continuous)",
+                             "%.1fW since %d (continuous, %d raw samples)",
                              twin.name, job.rule_id,
-                             job.idle_threshold, rows[0][0])
+                             job.idle_threshold, raw_rows[0][0],
+                             len(raw_rows))
 
 
 if __name__ == "__main__":

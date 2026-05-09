@@ -141,6 +141,18 @@ class PlugTwin:
         # but emits messages outside it).
         edge_fired = self._evaluate_chat_events(updates, prev, now)
 
+        # Direction-aware rule-window reset on a genuine output edge:
+        # F→T resets every off-target rule (user just turned ON; gives
+        # the full window before any auto-off can fire). T→F resets
+        # every on-target rule. None→T/F is bot-startup hydration, not
+        # a user-initiated edge — skipped.
+        prev_out = prev.get("output")
+        new_out = updates.get("output")
+        if new_out is True and prev_out is False:
+            self._reset_rule_windows_for("off", now)
+        elif new_out is False and prev_out is True:
+            self._reset_rule_windows_for("on", now)
+
         # State-based rule evaluation (idle / consumed). Dormant rules
         # (target state already met) are reset to their starting condition
         # so they don't accumulate while the plug sits in target.
@@ -363,10 +375,36 @@ class PlugTwin:
 
     def to_dict(self) -> dict[str, Any]:
         """The per-device payload included in the outbound snapshot."""
+        now_ts = int(time.time())
         with self._lock:
             fields = dict(self.fields)
             last_update_ts = self.last_update_ts
-            scheduled = [j.to_snapshot() for j in self.rules]
+            # Snapshot rules and enrich consumed entries with the current
+            # observed Wh (computed from the rule's _samples deque while
+            # we hold the lock — same locking invariant that protects
+            # _eval_consumed).
+            scheduled = []
+            idle_rules_pending: list[tuple[dict, int]] = []  # (snap, duration_s)
+            for j in self.rules:
+                snap = j.to_snapshot()
+                if j.has_consumed():
+                    cutoff = now_ts - j.consumed_window_s
+                    wh = rules_mod.integrate_wh(j._samples, cutoff, now_ts)
+                    snap["consumed"]["current_wh"] = float(wh)
+                if j.has_idle():
+                    idle_rules_pending.append((snap, j.idle_duration_s))
+                scheduled.append(snap)
+        # Outside the lock: idle rules need a samples_raw query for the
+        # peak in their window. History has its own lock; keep it
+        # outside ours to avoid nested-lock weirdness.
+        if self.deps.history is not None:
+            for snap, duration_s in idle_rules_pending:
+                rows = self.deps.history.query_samples_raw(
+                    self.name, now_ts - duration_s, now_ts,
+                )
+                vals = [r[1] for r in rows if r[1] is not None]
+                if vals:
+                    snap["idle"]["current_max_w"] = float(max(vals))
         params = dict(self.cfg.params)
         params.update(self.param_overrides)
         payload: dict[str, Any] = {
@@ -525,6 +563,23 @@ class PlugTwin:
         if mutated:
             self.deps.save_rules()
         return bool(fires)
+
+    def _reset_rule_windows_for(self, target_action: str,
+                                 now: int) -> None:
+        """Zero idle/consumed transient state for every rule whose
+        target_action matches. Called from on_mqtt's output-edge
+        handler so a manual ON gives off-rules a fresh window
+        (and symmetrically for manual OFF + on-rules).
+        """
+        with self._lock:
+            for job in self.rules:
+                if job.target_action != target_action:
+                    continue
+                if job.has_idle():
+                    job._below_since = None
+                if job.has_consumed():
+                    job._samples.clear()
+                    job._consumed_started_at = now
 
     def _eval_idle(self, job, fields, now, fires) -> bool:
         v = fields.get(job.idle_field)

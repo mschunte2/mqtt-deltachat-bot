@@ -249,7 +249,7 @@ header select {
   margin-bottom: 4px;
 }
 .rules-list .rule-text { flex: 1; color: #1c1c1e; }
-.rules-list .rule-id { color: #8e8e93; font-size: 0.75rem; margin-left: 4px; font-family: monospace; }
+.rules-list .rule-current { color: #6e6e73; font-size: 0.78rem; margin-left: 6px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .rules-list .delete-btn {
   border: 0; background: #ff3b30; color: #fff;
   border-radius: 4px; padding: 2px 8px; font-size: 0.85rem;
