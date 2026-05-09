@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
 
-from plug import PlugTwin
+from .twin import PlugTwin
 
 
 class TwinRegistry:

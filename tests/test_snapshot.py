@@ -8,10 +8,10 @@ import time
 import unittest
 from pathlib import Path
 
-import plug as plug_mod
-import snapshot as snap_mod
-import webxdc_io as wio
-from twins import TwinRegistry
+from mqtt_bot.core import twin as plug_mod
+from mqtt_bot.core import snapshot as snap_mod
+from mqtt_bot.io import webxdc_io as wio
+from mqtt_bot.core.twins import TwinRegistry
 
 from tests._fixtures import _build_twin, _FakeHistory
 
@@ -36,7 +36,7 @@ class TestSnapshot(unittest.TestCase):
 
 class TestKwhSinceResetMath(unittest.TestCase):
     def test_baseline_subtracted_correctly(self):
-        from snapshot import _energy_summary
+        from mqtt_bot.core.snapshot import _energy_summary
         e = _energy_summary(_FakeHistory(), "x",
                             current_wh=12345.0,
                             baseline_wh=345.0,
@@ -46,21 +46,21 @@ class TestKwhSinceResetMath(unittest.TestCase):
 
     def test_clamped_to_zero_on_rollover(self):
         # Plug counter rollover or a stale baseline shouldn't show negative.
-        from snapshot import _energy_summary
+        from mqtt_bot.core.snapshot import _energy_summary
         e = _energy_summary(_FakeHistory(), "x",
                             current_wh=10.0, baseline_wh=100.0,
                             reset_at_ts=None)
         self.assertEqual(e["kwh_since_reset"], 0.0)
 
     def test_none_when_no_current_reading(self):
-        from snapshot import _energy_summary
+        from mqtt_bot.core.snapshot import _energy_summary
         e = _energy_summary(_FakeHistory(), "x",
                             current_wh=None, baseline_wh=0.0,
                             reset_at_ts=None)
         self.assertIsNone(e["kwh_since_reset"])
 
     def test_includes_kwh_last_365d(self):
-        from snapshot import _energy_summary
+        from mqtt_bot.core.snapshot import _energy_summary
         e = _energy_summary(_FakeHistory(), "x",
                             current_wh=100.0, baseline_wh=0.0,
                             reset_at_ts=None)

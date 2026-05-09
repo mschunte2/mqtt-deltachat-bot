@@ -2,7 +2,7 @@
 
 import unittest
 
-import publisher as publisher_mod
+from mqtt_bot.io import publisher as publisher_mod
 
 
 class TestPublisher(unittest.TestCase):

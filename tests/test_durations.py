@@ -2,7 +2,7 @@
 
 import unittest
 
-import durations
+from mqtt_bot.util import durations
 
 
 class TestDurations(unittest.TestCase):

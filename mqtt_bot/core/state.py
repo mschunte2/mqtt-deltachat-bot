@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from config import DeviceClass
+from ..util.config import DeviceClass
 
 
 @dataclass

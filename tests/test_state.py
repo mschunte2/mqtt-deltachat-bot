@@ -3,8 +3,8 @@
 import json
 import unittest
 
-import config as cfg_mod
-import state as state_mod
+from mqtt_bot.util import config as cfg_mod
+from mqtt_bot.core import state as state_mod
 
 
 def _make_class():

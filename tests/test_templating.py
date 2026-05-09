@@ -2,7 +2,7 @@
 
 import unittest
 
-import templating
+from mqtt_bot.util import templating
 
 
 class TestTemplating(unittest.TestCase):

@@ -11,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 
-import history as history_mod
+from mqtt_bot.io import history as history_mod
 
 
 class TestHistory(unittest.TestCase):

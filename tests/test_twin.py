@@ -8,9 +8,9 @@ import time
 import unittest
 from pathlib import Path
 
-import history as history_mod
-import plug as plug_mod
-import rules as sched
+from mqtt_bot.io import history as history_mod
+from mqtt_bot.core import twin as plug_mod
+from mqtt_bot.core import rules as sched
 
 from tests._fixtures import _build_twin
 

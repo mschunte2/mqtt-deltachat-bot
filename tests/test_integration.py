@@ -27,12 +27,12 @@ import time
 import unittest
 from pathlib import Path
 
-import config as cfg_mod
-import history as history_mod
-import plug as plug_mod
-from publisher import Publisher
-from snapshot import build_for_chat
-from twins import TwinRegistry
+from mqtt_bot.util import config as cfg_mod
+from mqtt_bot.io import history as history_mod
+from mqtt_bot.core import twin as plug_mod
+from mqtt_bot.io.publisher import Publisher
+from mqtt_bot.core.snapshot import build_for_chat
+from mqtt_bot.core.twins import TwinRegistry
 
 from tests._fixtures import _build_twin
 

@@ -18,8 +18,8 @@ import json
 import tempfile
 from pathlib import Path
 
-import config as cfg_mod  # noqa: E402 — sys.path set by tests/__init__.py
-import plug as plug_mod  # noqa: E402
+from mqtt_bot.util import config as cfg_mod  # noqa: E402 — sys.path set by tests/__init__.py
+from mqtt_bot.core import twin as plug_mod  # noqa: E402
 
 
 CLASS_JSON_OK = {

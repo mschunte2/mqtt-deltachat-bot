@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import config as cfg_mod
+from mqtt_bot.util import config as cfg_mod
 
 
 # Smallest class.json that satisfies the loader's required keys.

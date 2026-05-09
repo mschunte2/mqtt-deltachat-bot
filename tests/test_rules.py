@@ -7,8 +7,8 @@ import time
 import unittest
 from pathlib import Path
 
-import rules as sched
-from twins import TwinRegistry
+from mqtt_bot.core import rules as sched
+from mqtt_bot.core.twins import TwinRegistry
 
 from tests._fixtures import _build_twin
 

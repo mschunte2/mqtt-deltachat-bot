@@ -2,7 +2,7 @@
 
 import unittest
 
-from twins import TwinRegistry
+from mqtt_bot.core.twins import TwinRegistry
 
 from tests._fixtures import _build_twin
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from config import Config, Device
+from .config import Config, Device
 
 
 def is_allowed(chat_id: int, allowed_chats: set[int]) -> bool:

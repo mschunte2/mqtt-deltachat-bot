@@ -31,12 +31,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-import durations
-import permissions
-import rules as rules_mod
-import state as state_mod
-import templating
-from config import (AutoOffConfig, ChatEventRule, Device, DeviceClass)
+from . import rules as rules_mod
+from . import state as state_mod
+from ..util import durations, permissions, templating
+from ..util.config import (AutoOffConfig, ChatEventRule, Device, DeviceClass)
 
 log = logging.getLogger("mqtt_bot.plug")
 
@@ -433,8 +431,8 @@ class PlugTwin:
             "params": params,
         }
         if self.deps.history is not None:
-            from snapshot import (_daily_energy_wh, _energy_summary,
-                                  _power_history)
+            from .snapshot import (_daily_energy_wh, _energy_summary,
+                                   _power_history)
             # Effective lifetime = raw_at_or_before(now) + cumulative
             # offset SUM. Falls back to the in-memory raw field if we
             # don't yet have a samples_raw row (e.g. just before the

@@ -2,8 +2,8 @@
 
 import unittest
 
-import config as cfg_mod
-import permissions
+from mqtt_bot.util import config as cfg_mod
+from mqtt_bot.util import permissions
 
 
 def _device(name, allowed):

@@ -44,7 +44,7 @@ class _SwallowBrokenPipe(logging.Filter):
 
 logging.getLogger("deltachat2.IOTransport").addFilter(_SwallowBrokenPipe())
 
-import config as config_mod
+from mqtt_bot.util import config as config_mod
 
 # --- Lightweight startup (no deltachat2 / paho dependency) ---------------
 
@@ -82,17 +82,16 @@ from appdirs import user_config_dir  # noqa: E402
 from deltachat2 import EventType, MsgData, events  # noqa: E402
 from deltabot_cli import BotCli  # noqa: E402
 
-import baselines as baselines_mod  # noqa: E402
-import durations  # noqa: E402
-import permissions  # noqa: E402
-import rules as rules_mod  # noqa: E402
-import snapshot as snap_mod  # noqa: E402
-from history import History  # noqa: E402
-from mqtt_client import MqttClient  # noqa: E402
-from plug import PlugTwin, TwinDeps  # noqa: E402
-from publisher import Publisher  # noqa: E402
-from twins import TwinRegistry  # noqa: E402
-from webxdc_io import WebxdcIO  # noqa: E402
+from mqtt_bot.io import baselines as baselines_mod  # noqa: E402
+from mqtt_bot.util import durations, permissions  # noqa: E402
+from mqtt_bot.core import rules as rules_mod  # noqa: E402
+from mqtt_bot.core import snapshot as snap_mod  # noqa: E402
+from mqtt_bot.io.history import History  # noqa: E402
+from mqtt_bot.io.mqtt_client import MqttClient  # noqa: E402
+from mqtt_bot.core.twin import PlugTwin, TwinDeps  # noqa: E402
+from mqtt_bot.io.publisher import Publisher  # noqa: E402
+from mqtt_bot.core.twins import TwinRegistry  # noqa: E402
+from mqtt_bot.io.webxdc_io import WebxdcIO  # noqa: E402
 
 cli = BotCli(BOT_NAME)
 log = logging.getLogger("mqtt_bot")

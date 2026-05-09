@@ -7,10 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import baselines as baselines_mod
-import history as history_mod
-import plug as plug_mod
-from twins import TwinRegistry
+from mqtt_bot.io import baselines as baselines_mod
+from mqtt_bot.io import history as history_mod
+from mqtt_bot.core import twin as plug_mod
+from mqtt_bot.core.twins import TwinRegistry
 
 from tests._fixtures import _build_twin
 
