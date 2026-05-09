@@ -258,22 +258,18 @@ function renderSparkline() {
   }
   // Pick resolution based on window:
   //   ≤24h         → minute series (with live tail at "now")
-  //   7d, 31d      → hour series (zig-zags preserved at 31d so the
-  //                   user can see whether consumption is intermittent
-  //                   vs. stable)
+  //   7d, 31d      → hour series
   //   ≥365d        → day series (only feasible resolution at this scale)
-  let series, useHour;
+  // Rendering style is identical across all three (see below).
+  let series;
   if (state.windowSeconds >= 365 * 86400) {
     // Fall back to hour if the bot's snapshot predates the day series
     // (older payload still in localStorage).
     series = dev.power_history.day || dev.power_history.hour;
-    useHour = true;   // day buckets behave like hour for showMax logic below
   } else if (state.windowSeconds >= 7 * 86400) {
     series = dev.power_history.hour;
-    useHour = true;
   } else {
     series = dev.power_history.minute;
-    useHour = false;
   }
   if (!Array.isArray(series) || series.length < 2) {
     sparkline.innerHTML = ''; chartMax.textContent = '';
@@ -305,94 +301,62 @@ function renderSparkline() {
     chartFoot.textContent = '(no data in this window)';
     return;
   }
-  // Mode selection:
-  //   minute series (≤24 h) → line plot of max-per-bucket for ≤12 h,
-  //     avg-per-bucket for 24 h. Same as before — peaks per minute
-  //     are already rule-faithful.
-  //   hour & day series (7 d, 31 d, 365 d) → vertical bars from
-  //     min to max per bucket, with a center dot at avg. Makes
-  //     "intermittent vs. stable" instantly readable.
-  const showMax = !useHour && state.windowSeconds <= 12 * 3600;
-  const pickW = (p) => showMax ? (pAt(p, 'max') ?? pAt(p, 'avg'))
-                                : pAt(p, 'avg');
-
+  // Unified rendering for all series (minute / hour / day):
+  //   on bucket  → grey min..max bar + green avg dot
+  //   off bucket → red dot at chart bottom
+  //   offline    → no dot, no bar, breaks the connecting line
+  // A thin grey line connects each consecutive pair of dots.
   const tSpan = Math.max(1, xMax - xMin);
   const pMax = Math.max(1, ...pts.map(p => pAt(p, 'max') ?? pAt(p, 'avg')));
   const W = 200, H = 60;
   const yOff = H - 2;
   const yOf = (w) => H - (w / pMax) * (H - 6) - 3;
 
+  const dots = [];          // {x, y, fill}
+  const bars = [];          // SVG path d for grey min..max ticks
+  const linePts = [];       // [{x,y} or null] — null = offline gap
+  for (const p of pts) {
+    const o = pAt(p, 'output');
+    const x = ((p[0] - xMin) / tSpan) * W;
+    if (o === 1) {
+      const minW = pAt(p, 'min') ?? pAt(p, 'avg');
+      const maxW = pAt(p, 'max') ?? pAt(p, 'avg');
+      const avgW = pAt(p, 'avg');
+      bars.push(
+        `M${x.toFixed(1)},${yOf(maxW).toFixed(1)} ` +
+        `L${x.toFixed(1)},${yOf(minW).toFixed(1)}`
+      );
+      const y = yOf(avgW);
+      dots.push({ x, y, fill: '#34c759' });    // green = on
+      linePts.push({ x, y });
+    } else if (o === 0) {
+      const y = yOff;                          // chart bottom
+      dots.push({ x, y, fill: '#ff3b30' });    // red = off whole bucket
+      linePts.push({ x, y });
+    } else {
+      linePts.push(null);                      // offline gap
+    }
+  }
+
   let svg = '';
-  if (useHour) {
-    // BAR MODE: per-bucket vertical bars from min..max, dot at avg.
-    const onBars = [], onDots = [];
-    const offSegs = [], offlineSegs = [];
-    const colW = (W / pts.length);
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i];
-      const t = p[0], o = pAt(p, 'output');
-      const x = ((t - xMin) / tSpan) * W;
-      if (o === null) {
-        offlineSegs.push(`M${x.toFixed(1)},${yOff} h${colW.toFixed(1)}`);
-      } else if (o === 0) {
-        offSegs.push(`M${x.toFixed(1)},${yOff} h${colW.toFixed(1)}`);
-      } else {
-        const minW = pAt(p, 'min') ?? pAt(p, 'avg');
-        const maxW = pAt(p, 'max') ?? pAt(p, 'avg');
-        const avgW = pAt(p, 'avg');
-        const yA = yOf(avgW), yB = yOf(maxW), yC = yOf(minW);
-        // y is inverted (smaller = higher). Bar from yB (top, =max)
-        // down to yC (bottom, =min). If min==max, that's still a 1px
-        // tick.
-        onBars.push(`M${x.toFixed(1)},${yB.toFixed(1)} L${x.toFixed(1)},${yC.toFixed(1)}`);
-        onDots.push(`<circle cx="${x.toFixed(1)}" cy="${yA.toFixed(1)}" r="0.7" fill="#138a4a"/>`);
-      }
-    }
-    if (offlineSegs.length) {
-      svg += `<path fill="none" stroke="#8e8e93" stroke-width="2"
-                    stroke-linecap="round" d="${offlineSegs.join(' ')}"/>`;
-    }
-    if (offSegs.length) {
-      svg += `<path fill="none" stroke="#ff3b30" stroke-width="2"
-                    stroke-linecap="round" d="${offSegs.join(' ')}"/>`;
-    }
-    if (onBars.length) {
-      svg += `<path fill="none" stroke="#34c759" stroke-width="1.2"
-                    stroke-linecap="round" d="${onBars.join(' ')}"/>`;
-    }
-    if (onDots.length) {
-      svg += onDots.join('');
-    }
-  } else {
-    // LINE MODE (minute series).
-    const onSegs = [], offSegs = [], offlineSegs = [];
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p1 = pts[i], p2 = pts[i + 1];
-      const t1 = p1[0], o1 = pAt(p1, 'output');
-      const x1 = ((t1 - xMin) / tSpan) * W;
-      const x2 = ((p2[0] - xMin) / tSpan) * W;
-      if (o1 === null) {
-        offlineSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
-      } else if (o1 === 0) {
-        offSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
-      } else {
-        const y1 = yOf(pickW(p1));
-        const y2 = yOf(pickW(p2));
-        onSegs.push(`M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)}`);
-      }
-    }
-    if (offlineSegs.length) {
-      svg += `<path fill="none" stroke="#8e8e93" stroke-width="2"
-                    stroke-linecap="round" d="${offlineSegs.join(' ')}"/>`;
-    }
-    if (offSegs.length) {
-      svg += `<path fill="none" stroke="#ff3b30" stroke-width="2"
-                    stroke-linecap="round" d="${offSegs.join(' ')}"/>`;
-    }
-    if (onSegs.length) {
-      svg += `<path fill="none" stroke="#34c759" stroke-width="1.5"
-                    stroke-linecap="round" d="${onSegs.join(' ')}"/>`;
-    }
+  // Connecting line (under bars/dots), broken across offline gaps.
+  let path = '', pen = false;
+  for (const lp of linePts) {
+    if (lp === null) { pen = false; continue; }
+    path += pen
+      ? ` L${lp.x.toFixed(1)},${lp.y.toFixed(1)}`
+      : `M${lp.x.toFixed(1)},${lp.y.toFixed(1)}`;
+    pen = true;
+  }
+  if (path) {
+    svg += `<path fill="none" stroke="#8e8e93" stroke-width="1" d="${path}"/>`;
+  }
+  if (bars.length) {
+    svg += `<path fill="none" stroke="#8e8e93" stroke-width="1"
+                  stroke-linecap="round" d="${bars.join(' ')}"/>`;
+  }
+  for (const d of dots) {
+    svg += `<circle cx="${d.x.toFixed(1)}" cy="${d.y.toFixed(1)}" r="1" fill="${d.fill}"/>`;
   }
   sparkline.innerHTML = svg;
   // Header always shows both max and avg from the visible points,

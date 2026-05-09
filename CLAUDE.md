@@ -579,22 +579,29 @@ Each device payload includes:
   for the bar chart.
 - `power_history: {minute, hour, day}` — three pre-aggregated
   series the app picks between based on the chart window. Each
-  entry is `[ts, min_w, max_w, avg_w, output]`. App rendering:
-  - **minute series (≤24 h)**: line plot. Plots `max_w` for ≤12 h
-    (cycling-load peaks rule-faithful), `avg_w` for 24 h
-    (typicality). A live trailing point at the twin's current
-    `apower` replaces the gap-filled zero of the in-flight
-    minute so the right edge reflects "now".
-  - **hour series (7 d, 31 d)**: vertical bars from
-    `min_w` to `max_w` with a center dot at `avg_w`. "Intermittent
-    vs. stable" reads at a glance — fat bars = cycling, thin
-    bars = steady. Zig-zags at 31 d are intentional.
-  - **day series (365 d)**: same bar style at day granularity.
+  entry is `[ts, min_w, max_w, avg_w, output]`. **Unified
+  rendering across all three series:**
+  - **on bucket** (`output=1`): grey vertical bar from `min_w` to
+    `max_w` (the activity range) plus a green dot at `avg_w`.
+  - **off bucket** (`output=0` for the whole bucket): red dot at
+    the chart bottom.
+  - **offline / no data** (`output=null`): nothing drawn at that
+    tick — the connecting line breaks across the gap.
+  - A thin grey line connects every consecutive pair of dots
+    (green→green, green→red, red→green, red→red), forming a
+    continuous trace except across offline gaps.
+  - Live trailing point on the minute series renders as a single
+    green dot at the live `apower`; min == max == avg, so the
+    bar collapses to a single tick.
+
+  Window → series mapping:
+  - `≤24 h` → `minute` (with live tail at "now")
+  - `7 d`, `31 d` → `hour`
+  - `365 d` → `day`
 
   Header always reads `max X W · avg Y W` from the visible
-  points, regardless of rendering mode. Buckets without a
-  `power_minute` row gap-fill as `[ts, 0, 0, 0, null]` → grey on
-  the chart (offline). Energy panels (`kWh consumed in last X`)
+  points. Buckets without a `power_minute` row gap-fill as
+  `[ts, 0, 0, 0, null]`. Energy panels (`kWh consumed in last X`)
   always use avg-based integration — not max — so they don't
   overstate consumption.
 
@@ -610,6 +617,17 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
+- 2026-05-09 **v0.2.7 — unified chart style: connected dots +
+  min..max bars across all series**. Drops the v0.2.6 split
+  between line rendering (minute series) and bar rendering
+  (hour/day series). Every chart window now uses the same
+  primitives: a grey min..max bar per "on" bucket, a green dot at
+  avg, a red dot at the chart bottom for "off" buckets, and a
+  thin grey line connecting every consecutive pair of dots
+  (broken across offline gaps). At dense windows (12 h, 24 h,
+  31 d) the rendering converges to a continuous line; at sparse
+  windows (1 h, 7 d, 365 d) the dots and bars are individually
+  legible. Wire format unchanged. Pure UI commit. 130 tests.
 - 2026-05-09 **v0.2.6 — min..max bars on long charts**. Adds
   `min_apower_w` column to `power_minute` (idempotent migration +
   backfill from samples_raw, mirroring v0.2.2's max addition).
