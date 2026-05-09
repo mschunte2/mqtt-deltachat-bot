@@ -82,16 +82,19 @@ from appdirs import user_config_dir  # noqa: E402
 from deltachat2 import EventType, MsgData, events  # noqa: E402
 from deltabot_cli import BotCli  # noqa: E402
 
-from mqtt_bot.io import baselines as baselines_mod  # noqa: E402
-from mqtt_bot.util import durations, permissions  # noqa: E402
+from mqtt_bot import commands as commands_mod  # noqa: E402
+from mqtt_bot import formatters  # noqa: E402
+from mqtt_bot import rehydrate as rehydrate_mod  # noqa: E402
 from mqtt_bot.core import rules as rules_mod  # noqa: E402
 from mqtt_bot.core import snapshot as snap_mod  # noqa: E402
+from mqtt_bot.core.twin import PlugTwin, TwinDeps  # noqa: E402
+from mqtt_bot.core.twins import TwinRegistry  # noqa: E402
+from mqtt_bot.io import baselines as baselines_mod  # noqa: E402
 from mqtt_bot.io.history import History  # noqa: E402
 from mqtt_bot.io.mqtt_client import MqttClient  # noqa: E402
-from mqtt_bot.core.twin import PlugTwin, TwinDeps  # noqa: E402
 from mqtt_bot.io.publisher import Publisher  # noqa: E402
-from mqtt_bot.core.twins import TwinRegistry  # noqa: E402
 from mqtt_bot.io.webxdc_io import WebxdcIO  # noqa: E402
+from mqtt_bot.util import durations, permissions  # noqa: E402
 
 cli = BotCli(BOT_NAME)
 log = logging.getLogger("mqtt_bot")
@@ -556,108 +559,25 @@ def _resolve_cancel_target(device_name: str, verb: str) -> str | None:
     return None  # cancel-schedule: drop all rules for the device
 
 
-# --- Formatting helpers ---------------------------------------------------
+# --- Formatters / commands / replay-windows are imported from
+# mqtt_bot.formatters and mqtt_bot.commands. Module-level aliases keep
+# the call sites in this file readable.
 
-def _format_device_line(twin: PlugTwin) -> str:
-    f = dict(twin.fields)
-    online = f.get("online")
-    output = f.get("output")
-    apower = f.get("apower")
-    aenergy = f.get("aenergy")
-    bits: list[str] = [twin.name]
-    bits.append("🟢" if online else "🔴" if online is False else "⚪")
-    if isinstance(output, bool):
-        bits.append("ON" if output else "OFF")
-    elif output is None:
-        bits.append("?")
-    if isinstance(apower, (int, float)):
-        bits.append(f"{apower:.0f}W")
-    if isinstance(aenergy, (int, float)):
-        bits.append(f"({aenergy / 1000.0:.2f} kWh)")
-    if twin.cfg.description:
-        bits.append(f"— {twin.cfg.description}")
-    for job in twin.jobs_snapshot():
-        action = job.target_action
-        if job.deadline_ts:
-            remaining = max(0, job.deadline_ts - int(time.time()))
-            bits.append(f"[{action} in {durations.format(remaining)}]")
-        elif job.has_idle():
-            bits.append(f"[{action} on idle]")
-        elif job.has_consumed():
-            bits.append(f"[{action} on used<Wh]")
-    if len(cfg.classes) > 1:
-        bits.append(f"[{twin.cls.name}]")
-    return " ".join(bits)
+_format_device_line = lambda twin: formatters.format_device_line(  # noqa: E731
+    twin, multi_class=len(cfg.classes) > 1)
+_format_rule_lines = formatters.format_rule_lines
+_rule_clauses = formatters.rule_clauses
 
+_GLOBAL_VERBS = commands_mod.GLOBAL_VERBS
+_DIRECT_VERBS = commands_mod.DIRECT_VERBS
+_CANCEL_VERBS = commands_mod.CANCEL_VERBS
+_SCHEDULE_VERBS = commands_mod.SCHEDULE_VERBS
+_sanitize = commands_mod.sanitize
+_parse_text_command = commands_mod.parse_text_command
 
-def _format_rule_lines(job) -> list[str]:
-    """Line(s) for /rules. Single-clause rules inline; multi-clause
-    (OR-combined) rules get an indented bullet list under the action header."""
-    clauses = _rule_clauses(job)
-    suffix = " (once)" if job.once else ""
-    if not clauses:
-        return [job.target_action + suffix]
-    if len(clauses) == 1:
-        return [f"{job.target_action} {clauses[0]}{suffix}"]
-    return [f"{job.target_action}:{suffix}"] + [f"  - {c}" for c in clauses]
-
-
-def _rule_clauses(job) -> list[str]:
-    out: list[str] = []
-    if job.deadline_ts:
-        remaining = max(0, job.deadline_ts - int(time.time()))
-        if job._time_mode == "tod" and job.time_of_day:
-            h, m = job.time_of_day
-            suffix = " daily" if job.recurring_tod else ""
-            out.append(f"at {h:02d}:{m:02d}{suffix} "
-                       f"(in {durations.format(remaining)})")
-        else:
-            out.append(f"in {durations.format(remaining)}")
-    if job.has_idle():
-        out.append(f"when {job.idle_field}<{job.idle_threshold:g}W "
-                   f"for {durations.format(job.idle_duration_s)}")
-    if job.has_consumed():
-        out.append(f"when used<{job.consumed_threshold_wh:g}Wh "
-                   f"in {durations.format(job.consumed_window_s)}")
-    return out
-
-
-# --- Text-command parser --------------------------------------------------
-
-_GLOBAL_VERBS = {"id", "list", "apps", "help", "rules", "refresh"}
-_DIRECT_VERBS = {"on", "off", "toggle", "status"}
-_CANCEL_VERBS = {"cancel-auto-off", "cancel-auto-on", "cancel-schedule"}
-_SCHEDULE_VERBS = {"auto-off", "auto-on"}
-
-_CMD_RE = re.compile(r"^/(\S+)(?:\s+(.*))?$", re.DOTALL)
-_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-MAX_AGE_SECONDS = 200
-MAX_APP_AGE_SECONDS = 45
-MAX_CLOCK_SKEW_SECONDS = 30
-
-
-def _sanitize(value, fallback: str = "?", max_len: int = 64) -> str:
-    if not isinstance(value, str):
-        value = str(value) if value is not None else ""
-    cleaned = _CTRL_RE.sub(" ", value).strip()
-    return cleaned[:max_len] if cleaned else fallback
-
-
-def _parse_text_command(text: str) -> tuple[str, str, str] | None:
-    m = _CMD_RE.match(text.strip())
-    if not m:
-        return None
-    head = m.group(1).lower()
-    tail = (m.group(2) or "").strip()
-    if head in _GLOBAL_VERBS:
-        return ("", head, tail)
-    if not tail:
-        return None
-    parts = tail.split(maxsplit=1)
-    verb = parts[0].lower()
-    rest = parts[1] if len(parts) > 1 else ""
-    return (head, verb, rest)
+MAX_AGE_SECONDS = commands_mod.MAX_AGE_SECONDS
+MAX_APP_AGE_SECONDS = commands_mod.MAX_APP_AGE_SECONDS
+MAX_CLOCK_SKEW_SECONDS = commands_mod.MAX_CLOCK_SKEW_SECONDS
 
 
 def _is_allowed(chatid: int) -> bool:
@@ -1050,45 +970,7 @@ def _on_start(bot, _args):
 
 
 def _rehydrate_rules_from_history() -> None:
-    """After load_into, backfill consumed-rule sample buffers and
-    idle-rule below-since timestamps from the SQLite history. Without
-    this, a `systemctl restart` would force every rule to wait a fresh
-    window."""
-    if history is None:
-        return
-    now = int(time.time())
-    for twin in registry.all():
-        for job in twin.jobs_snapshot():
-            if job.has_consumed() and job.consumed_field == "apower":
-                since = now - job.consumed_window_s
-                rows = history.query_power_raw(twin.name, since, now)
-                if not rows:
-                    continue
-                for ts, apower, _output, _count in rows:
-                    job._samples.append((ts, apower))
-                job._consumed_started_at = rows[0][0]
-                log.info("rehydrated consumed rule %s/%s with %d samples",
-                         twin.name, job.rule_id, len(rows))
-            if job.has_idle() and job.idle_field == "apower":
-                # Idle is "every raw sample below threshold throughout
-                # the window" — must rehydrate from samples_raw, not
-                # power_minute. Per-minute averages smooth cycling-load
-                # spikes (e.g. an espresso boiler hitting 1.2 kW for ~5 s
-                # every ~100 s), which would falsely satisfy the
-                # "all below threshold" check and arm the rule to fire
-                # on the first sample after restart.
-                since = now - job.idle_duration_s
-                raw_rows = history.query_samples_raw(twin.name, since, now)
-                if raw_rows and all(
-                    (r[1] is not None and r[1] < job.idle_threshold)
-                    for r in raw_rows
-                ):
-                    job._below_since = raw_rows[0][0]
-                    log.info("rehydrated idle rule %s/%s — below "
-                             "%.1fW since %d (continuous, %d raw samples)",
-                             twin.name, job.rule_id,
-                             job.idle_threshold, raw_rows[0][0],
-                             len(raw_rows))
+    rehydrate_mod.rehydrate_rules_from_history(registry, history)
 
 
 if __name__ == "__main__":
