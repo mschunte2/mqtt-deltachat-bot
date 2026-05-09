@@ -635,101 +635,63 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
-- 2026-05-09 **v0.2.2 — repo cleanup: hierarchical structure +
-  test split**. The 14 first-party Python modules at the project
-  root collapse into a single `mqtt_bot/` package with three
-  semantic sub-packages mirroring the design-rule split:
+- 2026-05-09 **v0.2.2 — chart fidelity + rule fidelity + repo
+  cleanup**. Bundles every unreleased change since v0.2.1 into a
+  single tag.
+
+  *Power chart fidelity.* `power_minute` gains `max_apower_w` and
+  `min_apower_w` columns (idempotent migrations + backfill from
+  samples_raw). Snapshot's `power_history` entry shape becomes
+  `[ts, min_w, max_w, avg_w, output]`; gap-filled buckets emit
+  `[ts, 0, 0, 0, null]`. The app renders every chart window with
+  the same primitives: a grey min..max bar per "on" bucket, a
+  green dot at avg, a red dot at the chart bottom for "off"
+  buckets, and a thin grey line connecting every consecutive pair
+  of dots (broken across offline gaps). At dense windows (12 h,
+  24 h, 31 d) the rendering converges to a continuous line; at
+  sparse windows (1 h, 7 d, 365 d) the dots and bars are
+  individually legible. Window picker grows "7 days" and "365
+  days" options; "6 h" dropped (no info gain over 12 h).
+  Resolution per window: minute (≤24 h, with live trailing
+  apower point), hour (7 d & 31 d), day (365 d). Energy panels
+  (`kWh consumed in last X`) keep avg-based integration so they
+  don't overstate. Fixes the "chart says 800 W but the idle rule
+  never fires" mystery for cycling-load devices like espresso
+  machines.
+
+  *Rule fidelity.* Idle-rule rehydration on bot restart now reads
+  `samples_raw` (not `power_minute` averages), so cycling-load
+  devices no longer have their off-rule spuriously armed. Manual
+  ON resets the transient state of every off-targeted rule on the
+  twin (and symmetrically, manual OFF resets on-targeted rules),
+  so a "off if idle for 30 min" rule always leaves a fresh
+  30-min window after a manual flip. None→True bot-startup
+  hydration is excluded — only genuine user/device edges trigger
+  the reset. Each rule tracks `_observation_started_at` and the
+  snapshot exposes `current_window_s = min(now - obs_start,
+  full_window)`, so a freshly-created rule's chat label reads
+  `8.30Wh in 23m` (or `1m` for a fresh rule) instead of always
+  the full window. Per-rule chat display drops the redundant
+  `consumed:5Wh:600s` rule-id span and shows live observed values
+  computed from each rule's `_samples` deque (consumed) or a
+  `samples_raw` query (idle).
+
+  *Repo cleanup.* The 14 first-party Python modules at the
+  project root collapse into a single `mqtt_bot/` package with
+  three semantic sub-packages mirroring the design-rule split:
   `mqtt_bot/core/` (twin engine + rules + state + snapshot),
   `mqtt_bot/io/` (history, baselines, mqtt_client, publisher,
   webxdc_io — anything with side effects), `mqtt_bot/util/`
   (pure utilities: config, durations, permissions, templating).
-  `plug.py` renamed to `mqtt_bot/core/twin.py` (the class is
-  still `PlugTwin`; only the file is renamed for honesty since
-  the engine has been class-agnostic since v0.2.0). Three pure
-  pieces extracted from bot.py into `mqtt_bot/{commands,
-  formatters,rehydrate}.py` (parser + display + startup
-  rehydration). The 2,096-line `test_mqtt_bot.py` becomes a
-  `tests/` package with one file per module under test, run via
-  `python3 -m unittest discover tests`. Architectural rules
-  unchanged; no production logic touched. 130 tests.
-- 2026-05-09 **v0.2.7 — unified chart style: connected dots +
-  min..max bars across all series**. Drops the v0.2.6 split
-  between line rendering (minute series) and bar rendering
-  (hour/day series). Every chart window now uses the same
-  primitives: a grey min..max bar per "on" bucket, a green dot at
-  avg, a red dot at the chart bottom for "off" buckets, and a
-  thin grey line connecting every consecutive pair of dots
-  (broken across offline gaps). At dense windows (12 h, 24 h,
-  31 d) the rendering converges to a continuous line; at sparse
-  windows (1 h, 7 d, 365 d) the dots and bars are individually
-  legible. Wire format unchanged. Pure UI commit. 130 tests.
-- 2026-05-09 **v0.2.6 — min..max bars on long charts**. Adds
-  `min_apower_w` column to `power_minute` (idempotent migration +
-  backfill from samples_raw, mirroring v0.2.2's max addition).
-  Snapshot's `power_history` entries grow to 5 elements
-  `[ts, min_w, max_w, avg_w, output]`; gap-filled buckets emit
-  `[ts, 0, 0, 0, null]`. App renders the hour (7 d, 31 d) and
-  day (365 d) series as vertical bars from min to max with a
-  center avg dot — making "intermittent vs. stable" readable at
-  a glance. Minute series (≤24 h) keeps line rendering. Drops
-  the 6-h window option (no info gain over 12 h). 130 tests.
-- 2026-05-09 **v0.2.5 — graph polish**. Adds "7 days" and
-  "365 days" options to the chart window picker. Fixes the
-  minute-resolution chart always ending at 0 W on the right
-  edge: the bot now appends the twin's live apower as a trailing
-  point in the minute series only (replacing the gap-filled zero
-  from the in-flight minute). Adds a day-bucket series in the
-  snapshot covering 365 days at one point per day. The app picks
-  resolution per window: minute (≤24 h, with live tail), hour
-  (7 d & 31 d — zig-zags preserved at 31 d to show whether
-  consumption is intermittent vs. stable), day (365 d). Snapshot
-  grows by ~9 KB/device for the day series. 130 tests.
-- 2026-05-09 **v0.2.4 — per-rule label shows actual elapsed time**.
-  v0.2.3 surfaced live observed values next to each rule but
-  always labelled them with the rule's full window
-  (`8.30 Wh in last 10m`), even on a freshly-created rule that
-  only had 1 minute of data. Now each rule tracks
-  `_observation_started_at` (set on creation, reset on the
-  direction-aware manual toggle) and the snapshot exposes
-  `current_window_s = min(now - obs_start, full_window)`. The
-  app reads it as `8.30Wh in 23m` (or `1m` for a fresh rule),
-  shorter format, no "last". Lets the user fine-tune rules by
-  watching observed values accumulate against the threshold from
-  rule creation onwards. Field is transient, not persisted; bot
-  restart falls back to the full window (matches rehydration
-  semantics). 128 tests.
-- 2026-05-09 **v0.2.3 — idle-rule fidelity + manual-toggle window
-  reset + actuals next to rules**. Three small fixes that together
-  make idle/consumed rules behave the way users naturally expect.
-  (1) Bot-restart rehydration of idle rules now reads raw samples
-  (samples_raw) instead of per-minute averages (power_minute), so
-  cycling-load devices like espresso machines no longer have their
-  off-rule spuriously armed at startup. (2) Manual ON resets the
-  transient state of every off-targeted rule on the twin (and
-  symmetrically, manual OFF resets on-targeted rules), so a "off
-  if idle for 30 min" rule always leaves the user a fresh 30-min
-  window after they manually switch the device on. None→True
-  (bot startup hydration of `output`) is excluded — only genuine
-  user-or-device edges trigger the reset. (3) The app's per-rule
-  display drops the redundant `consumed:5Wh:600s` rule-id span
-  and shows live observed values instead — `8.30 Wh in last 10m`
-  for consumed rules, `max 1219W in last 30m` for idle rules,
-  computed from the rule's _samples deque (consumed) or a
-  samples_raw query (idle). 125 tests.
-- 2026-05-09 **v0.2.2 — power chart shows peaks**. `power_minute`
-  gains `max_apower_w` column; per-minute aggregation tracks max
-  alongside avg. Chart switches to max-per-minute for windows up
-  to 12 h (rule-faithful, catches boiler-burst spikes that the
-  minute-average smooths away) and stays on avg for 24 h / 31 d
-  (typicality-faithful). Header reads
-  `max X W · avg Y W` from the visible points. Idempotent
-  migration backfills existing power_minute rows from samples_raw
-  on first boot. Snapshot's `power_history` entry shape changes
-  from `[ts, w, output]` to `[ts, max_w, avg_w, output]`. Energy
-  panels (`kWh consumed in last X`) unchanged — keep using
-  avg-based integration so they don't overstate. Fixes the "chart
-  says 800 W but the idle rule never fires" mystery for cycling-
-  load devices like espresso machines. 120 tests.
+  `plug.py` renamed to `mqtt_bot/core/twin.py` (the class stays
+  `PlugTwin`; only the file is renamed for honesty since the
+  engine has been class-agnostic since v0.2.0). Three pure pieces
+  extracted from bot.py into `mqtt_bot/{commands,formatters,
+  rehydrate}.py` (parser + display + startup rehydration). The
+  2,096-line `test_mqtt_bot.py` becomes a `tests/` package with
+  one file per module under test, run via `python3 -m unittest
+  discover tests`. Architectural rules unchanged; no production
+  logic touched. 130 tests.
 - 2026-05-08 **v0.2.1 — energy-storage simplification + quality**.
   Same-day follow-up to v0.2.0. Drops `aenergy_minute` and
   `energy_hour` tables from the code (rows in users' SQLite stay
