@@ -631,13 +631,15 @@ Each device payload includes:
 
 ## Provenance and history
 
-(Note: pre-v0.2 releases were originally tagged v1.x; renumbered
-during the v0.2.0 refactor to reflect the project's actual maturity
-as 0.x.)
+Only `v0.1.5` and `v0.2.1` correspond to actual git tags. Other
+labels in older entries are historical descriptive markers, not
+released versions; treat them as part of the prose. Going forward,
+provenance entries reference work by date and (where helpful) the
+short SHA — no invented version labels. Tags are reserved for
+stable major releases the user creates by hand.
 
-- 2026-05-09 **v0.2.2 — chart fidelity + rule fidelity + repo
-  cleanup**. Bundles every unreleased change since v0.2.1 into a
-  single tag.
+- 2026-05-09 **chart fidelity + rule fidelity + repo cleanup**
+  (commits `3938c14..fd414a2`, post-`v0.2.1`).
 
   *Power chart fidelity.* `power_minute` gains `max_apower_w` and
   `min_apower_w` columns (idempotent migrations + backfill from
@@ -715,7 +717,7 @@ as 0.x.)
   logic is unit-testable without bot.py globals. Added
   `.github/workflows/ci.yml` (test + check-config + xdc build +
   guards on engine.py / scheduler.py reappearing). 118 tests.
-- 2026-05-08 **v0.2.0 — digital-twin refactor**. `engine.py` and
+- 2026-05-08 **digital-twin refactor**. `engine.py` and
   `scheduler.py` deleted. New: `plug.py` (PlugTwin per device),
   `twins.py` (TwinRegistry), `snapshot.py` (single
   `build_for_chat`), `publisher.py` (single outbound stream),
@@ -731,10 +733,10 @@ as 0.x.)
   + Tuning UI; `events` SQLite table + Recent-events twistie;
   `history`/`events`/`set_param` webxdc actions; live-5min chart
   window. Net: roughly −500 lines across the repo. 84 tests.
-- 2026-05-07 v0.1.5 — rules persist forever by default; opt-in
-  `once` for fire-and-delete
+- 2026-05-07 **v0.1.5 — rules persist forever by default; opt-in
+  `once` for fire-and-delete** (real git tag).
   (`shelly_plug`), one webxdc app, full deployment scripts.
-- 2026-05-07 v1.1 — committed in same session. Added: SQLite-backed
+- 2026-05-07 SQLite-backed history. Added: SQLite-backed
   history (per-minute power, hourly energy, events table) with
   RETENTION_DAYS knob; segmented red/green chart with a 0-line for
   off periods; energy summary (last hour through lifetime); per-bucket
@@ -743,7 +745,7 @@ as 0.x.)
   shutdown hook to flush the in-minute buffer; basicConfig logging
   fix; the `<script src=webxdc.js>` fix; `/help` and `/id` bypass the
   allow-list; `/help` auto-posts on member-add. ~79 tests.
-- 2026-05-07 v1.2 — same-day. Parallel scheduled rules per
+- 2026-05-07 parallel scheduled rules. Parallel scheduled rules per
   (device, target_action), keyed by stable rule_id derived from
   policy contents. Each rule fires independently; redundant fires
   are intentionally posted to chat (audit trail > silence). New
@@ -751,7 +753,7 @@ as 0.x.)
   `{duration_human}`, `{window_human}` so messages spell out which
   rule tripped and why. App grows two `<details>` sections (Auto-off
   rules / Auto-on rules) with × delete buttons + Add-rule forms.
-- 2026-05-07 v1.3 — same-day. Maximalist data capture into SQLite:
+- 2026-05-07 maximalist SQLite capture. Maximalist data capture into SQLite:
   `samples_raw` (every status/switch:0 verbatim, lossless) and
   `energy_minute` (Shelly's authoritative `aenergy.by_minute[1..2]`
   in mWh per minute boundary). `energy_consumed_in` does a
@@ -765,7 +767,7 @@ as 0.x.)
   every visible device. App grows a 30-day daily-energy bar chart.
   Threshold tuning from the app can now persist to `devices.json`
   via a `set_param` request with `persist: true`.
-- 2026-05-07 v1.5 — same-day. **Rules are recurring by default.**
+- 2026-05-07 recurring rules by default. **Rules are recurring by default.**
   Schedule a rule once and it fires every time its condition is met
   again, until you cancel it. Opt-in `once` flag (chat keyword and
   app checkbox) preserves the old fire-and-delete behaviour.
@@ -780,7 +782,7 @@ as 0.x.)
   gains `once`. parse_policy strips a `once` keyword from anywhere
   in the clause. Engine surfaces `once` in the snapshot; /rules
   marks one-shot rules with `(once)`. 110 tests.
-- 2026-05-07 v1.4 — same-day. Rules persist to
+- 2026-05-07 rules.json persistence. Rules persist to
   `~/.config/<BOT_NAME>/rules.json`; load on startup re-arms recurring
   TODs and drops expired one-shots. **Rehydrate from history**: the
   engine backfills a consumed-rule's `_samples` deque (and an idle-rule's
