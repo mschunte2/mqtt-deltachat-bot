@@ -531,11 +531,12 @@ falls back to the 1.x API if `CallbackAPIVersion` isn't importable.
   plug counter (untouched by offset adjustment). This is the
   single source of truth for energy queries.
 - `power_minute(device, ts, avg_apower_w, sample_count, output,
-  max_apower_w)` — one row per minute, derived from the apower
-  stream in samples_raw. `avg_apower_w` is the mean over that
-  minute's samples; `max_apower_w` is the peak (added v0.2.2;
-  legacy rows backfilled idempotently from samples_raw on
-  startup). Used by the app's power chart and by rule
+  max_apower_w, min_apower_w)` — one row per minute, derived
+  from the apower stream in samples_raw. `avg_apower_w` is the
+  mean over that minute's samples; `max_apower_w` is the peak
+  (added v0.2.2); `min_apower_w` is the trough (added v0.2.6).
+  Both legacy rows are backfilled idempotently from samples_raw
+  on startup. Used by the app's power chart and by rule
   rehydration. `output` is the relay state (0/1/NULL).
 - `aenergy_offset_events(device, ts, delta_wh)` — append-only log
   of detected hardware counter resets. Each row's delta_wh is
@@ -578,24 +579,24 @@ Each device payload includes:
   for the bar chart.
 - `power_history: {minute, hour, day}` — three pre-aggregated
   series the app picks between based on the chart window. Each
-  entry is `[ts, max_w, avg_w, output]`. The app plots `max_w`
-  for short windows (≤12 h) so cycling-load peaks (espresso
-  boilers, etc.) are rule-faithful, and `avg_w` for ≥24 h so the
-  curve still shows typicality. Header always reads
-  `max X W · avg Y W` from the visible points. Buckets without a
-  `power_minute` row gap-fill as `[ts, 0, 0, null]` → grey on
+  entry is `[ts, min_w, max_w, avg_w, output]`. App rendering:
+  - **minute series (≤24 h)**: line plot. Plots `max_w` for ≤12 h
+    (cycling-load peaks rule-faithful), `avg_w` for 24 h
+    (typicality). A live trailing point at the twin's current
+    `apower` replaces the gap-filled zero of the in-flight
+    minute so the right edge reflects "now".
+  - **hour series (7 d, 31 d)**: vertical bars from
+    `min_w` to `max_w` with a center dot at `avg_w`. "Intermittent
+    vs. stable" reads at a glance — fat bars = cycling, thin
+    bars = steady. Zig-zags at 31 d are intentional.
+  - **day series (365 d)**: same bar style at day granularity.
+
+  Header always reads `max X W · avg Y W` from the visible
+  points, regardless of rendering mode. Buckets without a
+  `power_minute` row gap-fill as `[ts, 0, 0, 0, null]` → grey on
   the chart (offline). Energy panels (`kWh consumed in last X`)
   always use avg-based integration — not max — so they don't
   overstate consumption.
-
-  Window → series mapping (in `main.js`):
-  - `≤24 h` → `minute` (with a live trailing point at the twin's
-     current `apower` so the right edge reflects "now" instead of
-     the in-flight minute's gap-filled zero)
-  - `7 d`, `31 d` → `hour` (zig-zags at 31 d are intentional —
-     they show whether consumption is intermittent vs. stable)
-  - `365 d` → `day` (only feasible resolution at this scale;
-     ~3 KB / device of payload)
 
 ## Chat command additions
 
@@ -609,6 +610,16 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
+- 2026-05-09 **v0.2.6 — min..max bars on long charts**. Adds
+  `min_apower_w` column to `power_minute` (idempotent migration +
+  backfill from samples_raw, mirroring v0.2.2's max addition).
+  Snapshot's `power_history` entries grow to 5 elements
+  `[ts, min_w, max_w, avg_w, output]`; gap-filled buckets emit
+  `[ts, 0, 0, 0, null]`. App renders the hour (7 d, 31 d) and
+  day (365 d) series as vertical bars from min to max with a
+  center avg dot — making "intermittent vs. stable" readable at
+  a glance. Minute series (≤24 h) keeps line rendering. Drops
+  the 6-h window option (no info gain over 12 h). 130 tests.
 - 2026-05-09 **v0.2.5 — graph polish**. Adds "7 days" and
   "365 days" options to the chart window picker. Fixes the
   minute-resolution chart always ending at 0 W on the right

@@ -283,60 +283,123 @@ function renderSparkline() {
   const now = Math.floor(Date.now() / 1000);
   const xMax = now;
   const xMin = now - state.windowSeconds;
-  // Slice series to the window. Each point is [ts, max_w, avg_w, output].
+  // Each point is [ts, min_w, max_w, avg_w, output] (new) or
+  // [ts, max_w, avg_w, output] (legacy 4-tuple from older cached
+  // payloads). Helpers normalise the access.
+  const pAt = (p, key) => {
+    if (p.length >= 5) {
+      if (key === 'min') return p[1];
+      if (key === 'max') return p[2];
+      if (key === 'avg') return p[3];
+      return p[4];                              // output
+    }
+    // legacy 4-tuple: no min, fall back to avg
+    if (key === 'min') return p[2];
+    if (key === 'max') return p[1];
+    if (key === 'avg') return p[2];
+    return p[3];                                // output
+  };
   const pts = series.filter(p => p[0] >= xMin && p[0] <= xMax);
   if (pts.length < 2) {
     sparkline.innerHTML = ''; chartMax.textContent = '';
     chartFoot.textContent = '(no data in this window)';
     return;
   }
-  // Plot max-per-minute for short windows (rule-faithful: catches
-  // boiler-burst spikes etc.); avg for ≥24h (typicality-faithful).
-  // Hour buckets always plot avg — peaks at hour granularity are noise.
+  // Mode selection:
+  //   minute series (≤24 h) → line plot of max-per-bucket for ≤12 h,
+  //     avg-per-bucket for 24 h. Same as before — peaks per minute
+  //     are already rule-faithful.
+  //   hour & day series (7 d, 31 d, 365 d) → vertical bars from
+  //     min to max per bucket, with a center dot at avg. Makes
+  //     "intermittent vs. stable" instantly readable.
   const showMax = !useHour && state.windowSeconds <= 12 * 3600;
-  const pickW = (p) => showMax ? ((p[1] != null) ? p[1] : p[2]) : p[2];
+  const pickW = (p) => showMax ? (pAt(p, 'max') ?? pAt(p, 'avg'))
+                                : pAt(p, 'avg');
 
   const tSpan = Math.max(1, xMax - xMin);
-  const pMax = Math.max(1, ...pts.map(pickW));
+  const pMax = Math.max(1, ...pts.map(p => pAt(p, 'max') ?? pAt(p, 'avg')));
   const W = 200, H = 60;
   const yOff = H - 2;
+  const yOf = (w) => H - (w / pMax) * (H - 6) - 3;
 
-  const onSegs = [], offSegs = [], offlineSegs = [];
-  for (let i = 0; i < pts.length - 1; i++) {
-    const p1 = pts[i], p2 = pts[i + 1];
-    const t1 = p1[0], o1 = p1[3];
-    const x1 = ((t1 - xMin) / tSpan) * W;
-    const x2 = ((p2[0] - xMin) / tSpan) * W;
-    if (o1 === null) {
-      offlineSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
-    } else if (o1 === 0) {
-      offSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
-    } else {
-      const w1 = pickW(p1), w2 = pickW(p2);
-      const y1 = H - (w1 / pMax) * (H - 6) - 3;
-      const y2 = H - (w2 / pMax) * (H - 6) - 3;
-      onSegs.push(`M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)}`);
-    }
-  }
   let svg = '';
-  if (offlineSegs.length) {
-    svg += `<path fill="none" stroke="#8e8e93" stroke-width="2"
-                  stroke-linecap="round" d="${offlineSegs.join(' ')}"/>`;
-  }
-  if (offSegs.length) {
-    svg += `<path fill="none" stroke="#ff3b30" stroke-width="2"
-                  stroke-linecap="round" d="${offSegs.join(' ')}"/>`;
-  }
-  if (onSegs.length) {
-    svg += `<path fill="none" stroke="#34c759" stroke-width="1.5"
-                  stroke-linecap="round" d="${onSegs.join(' ')}"/>`;
+  if (useHour) {
+    // BAR MODE: per-bucket vertical bars from min..max, dot at avg.
+    const onBars = [], onDots = [];
+    const offSegs = [], offlineSegs = [];
+    const colW = (W / pts.length);
+    for (let i = 0; i < pts.length; i++) {
+      const p = pts[i];
+      const t = p[0], o = pAt(p, 'output');
+      const x = ((t - xMin) / tSpan) * W;
+      if (o === null) {
+        offlineSegs.push(`M${x.toFixed(1)},${yOff} h${colW.toFixed(1)}`);
+      } else if (o === 0) {
+        offSegs.push(`M${x.toFixed(1)},${yOff} h${colW.toFixed(1)}`);
+      } else {
+        const minW = pAt(p, 'min') ?? pAt(p, 'avg');
+        const maxW = pAt(p, 'max') ?? pAt(p, 'avg');
+        const avgW = pAt(p, 'avg');
+        const yA = yOf(avgW), yB = yOf(maxW), yC = yOf(minW);
+        // y is inverted (smaller = higher). Bar from yB (top, =max)
+        // down to yC (bottom, =min). If min==max, that's still a 1px
+        // tick.
+        onBars.push(`M${x.toFixed(1)},${yB.toFixed(1)} L${x.toFixed(1)},${yC.toFixed(1)}`);
+        onDots.push(`<circle cx="${x.toFixed(1)}" cy="${yA.toFixed(1)}" r="0.7" fill="#138a4a"/>`);
+      }
+    }
+    if (offlineSegs.length) {
+      svg += `<path fill="none" stroke="#8e8e93" stroke-width="2"
+                    stroke-linecap="round" d="${offlineSegs.join(' ')}"/>`;
+    }
+    if (offSegs.length) {
+      svg += `<path fill="none" stroke="#ff3b30" stroke-width="2"
+                    stroke-linecap="round" d="${offSegs.join(' ')}"/>`;
+    }
+    if (onBars.length) {
+      svg += `<path fill="none" stroke="#34c759" stroke-width="1.2"
+                    stroke-linecap="round" d="${onBars.join(' ')}"/>`;
+    }
+    if (onDots.length) {
+      svg += onDots.join('');
+    }
+  } else {
+    // LINE MODE (minute series).
+    const onSegs = [], offSegs = [], offlineSegs = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p1 = pts[i], p2 = pts[i + 1];
+      const t1 = p1[0], o1 = pAt(p1, 'output');
+      const x1 = ((t1 - xMin) / tSpan) * W;
+      const x2 = ((p2[0] - xMin) / tSpan) * W;
+      if (o1 === null) {
+        offlineSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
+      } else if (o1 === 0) {
+        offSegs.push(`M${x1.toFixed(1)},${yOff} L${x2.toFixed(1)},${yOff}`);
+      } else {
+        const y1 = yOf(pickW(p1));
+        const y2 = yOf(pickW(p2));
+        onSegs.push(`M${x1.toFixed(1)},${y1.toFixed(1)} L${x2.toFixed(1)},${y2.toFixed(1)}`);
+      }
+    }
+    if (offlineSegs.length) {
+      svg += `<path fill="none" stroke="#8e8e93" stroke-width="2"
+                    stroke-linecap="round" d="${offlineSegs.join(' ')}"/>`;
+    }
+    if (offSegs.length) {
+      svg += `<path fill="none" stroke="#ff3b30" stroke-width="2"
+                    stroke-linecap="round" d="${offSegs.join(' ')}"/>`;
+    }
+    if (onSegs.length) {
+      svg += `<path fill="none" stroke="#34c759" stroke-width="1.5"
+                    stroke-linecap="round" d="${onSegs.join(' ')}"/>`;
+    }
   }
   sparkline.innerHTML = svg;
   // Header always shows both max and avg from the visible points,
-  // computed from the underlying max_w / avg_w fields regardless of
-  // which one the line is plotting. `null` max falls back to avg.
-  const maxOfPts = Math.max(...pts.map(p => (p[1] != null) ? p[1] : p[2]));
-  const avgOfPts = pts.reduce((s, p) => s + p[2], 0) / pts.length;
+  // computed from the underlying max / avg fields regardless of
+  // rendering mode.
+  const maxOfPts = Math.max(...pts.map(p => pAt(p, 'max') ?? pAt(p, 'avg')));
+  const avgOfPts = pts.reduce((s, p) => s + pAt(p, 'avg'), 0) / pts.length;
   chartMax.textContent = `max ${maxOfPts.toFixed(0)} W · avg ${avgOfPts.toFixed(0)} W`;
   // Total kWh from energy summary if available, else integrate from points.
   const e = dev.energy;

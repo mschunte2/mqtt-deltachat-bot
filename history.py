@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS power_minute (
   sample_count INTEGER NOT NULL,
   output       INTEGER,
   max_apower_w REAL,
+  min_apower_w REAL,
   PRIMARY KEY (device, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_power_minute_ts ON power_minute (ts);
@@ -127,10 +128,12 @@ class History:
                 self._db.execute("ALTER TABLE power_minute ADD COLUMN output INTEGER")
             if "max_apower_w" not in cols:
                 self._db.execute("ALTER TABLE power_minute ADD COLUMN max_apower_w REAL")
-            # Idempotent backfill: any NULL max_apower_w gets the per-minute
-            # MAX from samples_raw. WHERE clause makes this a no-op on
-            # subsequent boots once everything's filled.
-            backfill = self._db.execute(
+            if "min_apower_w" not in cols:
+                self._db.execute("ALTER TABLE power_minute ADD COLUMN min_apower_w REAL")
+            # Idempotent backfill: any NULL max/min_apower_w gets the
+            # per-minute MAX/MIN from samples_raw. WHERE clauses make
+            # these no-ops on subsequent boots once filled.
+            backfill_max = self._db.execute(
                 "UPDATE power_minute "
                 "SET max_apower_w = ("
                 "  SELECT MAX(s.apower_w) FROM samples_raw s "
@@ -141,9 +144,23 @@ class History:
                 ") "
                 "WHERE max_apower_w IS NULL"
             )
-            if backfill.rowcount > 0:
+            if backfill_max.rowcount > 0:
                 log.info("history: backfilled max_apower_w for %d power_minute rows",
-                         backfill.rowcount)
+                         backfill_max.rowcount)
+            backfill_min = self._db.execute(
+                "UPDATE power_minute "
+                "SET min_apower_w = ("
+                "  SELECT MIN(s.apower_w) FROM samples_raw s "
+                "  WHERE s.device = power_minute.device "
+                "    AND s.ts >= power_minute.ts "
+                "    AND s.ts <  power_minute.ts + 60 "
+                "    AND s.apower_w IS NOT NULL"
+                ") "
+                "WHERE min_apower_w IS NULL"
+            )
+            if backfill_min.rowcount > 0:
+                log.info("history: backfilled min_apower_w for %d power_minute rows",
+                         backfill_min.rowcount)
             self._db.commit()
         log.info("history db at %s (retention_days=%s)",
                  db_path,
@@ -245,16 +262,17 @@ class History:
 
     def query_power(self, device: str, since_ts: int, until_ts: int,
                     max_points: int = 200,
-                    ) -> tuple[int, list[tuple[int, float | None, float, int | None]]]:
+                    ) -> tuple[int, list[tuple[int, float | None, float | None, float, int | None]]]:
         if self._closed:
             return (60, [])
-        """Return (bucket_seconds, [(ts, max_w, avg_w, output), ...]).
+        """Return (bucket_seconds, [(ts, min_w, max_w, avg_w, output), ...]).
 
-        `max_w` is the peak apower observed in the bucket (None for legacy
-        rows the migration couldn't reach — caller falls back to avg_w).
-        `avg_w` is the sample-count-weighted mean. `output` is MAX over
-        the bucket's minutes: 1 if on for any minute, 0 if every minute
-        off, NULL if no minutes had a known output.
+        `min_w` / `max_w` are the trough / peak apower observed in the
+        bucket (None for legacy rows the migration couldn't reach —
+        caller falls back to avg_w). `avg_w` is the sample-count-weighted
+        mean. `output` is MAX over the bucket's minutes: 1 if on for
+        any minute, 0 if every minute off, NULL if no minutes had a
+        known output.
         """
         if until_ts <= since_ts:
             return (60, [])
@@ -263,6 +281,7 @@ class History:
         with self._lock:
             cur = self._db.execute(
                 "SELECT (ts/?)*?, "
+                "       MIN(min_apower_w), "
                 "       MAX(max_apower_w), "
                 "       SUM(avg_apower_w * sample_count) / SUM(sample_count), "
                 "       MAX(output) "
@@ -275,10 +294,11 @@ class History:
             rows = cur.fetchall()
         return (bucket, [
             (int(t),
+             float(mn) if mn is not None else None,
              float(mx) if mx is not None else None,
              float(avg),
              int(o) if o is not None else None)
-            for t, mx, avg, o in rows if avg is not None
+            for t, mn, mx, avg, o in rows if avg is not None
         ])
 
     def query_power_raw(self, device: str, since_ts: int, until_ts: int
@@ -453,11 +473,14 @@ class History:
                 if samples:
                     avg = sum(samples) / len(samples)
                     mx = max(samples)
+                    mn = min(samples)
                     self._db.execute(
                         "INSERT OR REPLACE INTO power_minute "
-                        "(device, ts, avg_apower_w, sample_count, output, max_apower_w) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (device, prev_start, avg, len(samples), prev_output, mx),
+                        "(device, ts, avg_apower_w, sample_count, output, "
+                        " max_apower_w, min_apower_w) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (device, prev_start, avg, len(samples),
+                         prev_output, mx, mn),
                     )
                     self._db.commit()
                 self._minute[device] = (minute_start, [apower], output)
@@ -478,11 +501,13 @@ class History:
                 return
             avg = sum(samples) / len(samples)
             mx = max(samples)
+            mn = min(samples)
             self._db.execute(
                 "INSERT OR REPLACE INTO power_minute "
-                "(device, ts, avg_apower_w, sample_count, output, max_apower_w) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (device, minute_start, avg, len(samples), output, mx),
+                "(device, ts, avg_apower_w, sample_count, output, "
+                " max_apower_w, min_apower_w) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (device, minute_start, avg, len(samples), output, mx, mn),
             )
             self._db.commit()
 
