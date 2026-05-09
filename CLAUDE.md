@@ -600,6 +600,20 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
+- 2026-05-09 **v0.2.4 — per-rule label shows actual elapsed time**.
+  v0.2.3 surfaced live observed values next to each rule but
+  always labelled them with the rule's full window
+  (`8.30 Wh in last 10m`), even on a freshly-created rule that
+  only had 1 minute of data. Now each rule tracks
+  `_observation_started_at` (set on creation, reset on the
+  direction-aware manual toggle) and the snapshot exposes
+  `current_window_s = min(now - obs_start, full_window)`. The
+  app reads it as `8.30Wh in 23m` (or `1m` for a fresh rule),
+  shorter format, no "last". Lets the user fine-tune rules by
+  watching observed values accumulate against the threshold from
+  rule creation onwards. Field is transient, not persisted; bot
+  restart falls back to the full window (matches rehydration
+  semantics). 128 tests.
 - 2026-05-09 **v0.2.3 — idle-rule fidelity + manual-toggle window
   reset + actuals next to rules**. Three small fixes that together
   make idle/consumed rules behave the way users naturally expect.

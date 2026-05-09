@@ -418,18 +418,20 @@ function renderEnergySummary(dev) {
 }
 
 function currentObservedText(j) {
-  // Live observed values vs. the rule's threshold. Idle and consumed
-  // rules carry their own current_* field, populated by the bot's
-  // snapshot pipeline. If neither is present (timer/tod-only rules),
-  // we have nothing live to display.
+  // Live observed values vs. the rule's threshold. Each policy's
+  // current_window_s is the actual elapsed time since the rule
+  // started observing (or was last reset by a manual toggle),
+  // capped at the configured window. Falls back to the rule's
+  // full window if the bot hasn't sent current_window_s yet
+  // (older snapshot still in localStorage).
   const parts = [];
   if (j.idle && typeof j.idle.current_max_w === 'number') {
-    parts.push(`max ${j.idle.current_max_w.toFixed(0)}W in last `
-             + `${fmtSecs(j.idle.duration_s)}`);
+    const ws = j.idle.current_window_s ?? j.idle.duration_s;
+    parts.push(`max ${j.idle.current_max_w.toFixed(0)}W in ${fmtSecs(ws)}`);
   }
   if (j.consumed && typeof j.consumed.current_wh === 'number') {
-    parts.push(`${j.consumed.current_wh.toFixed(2)}Wh in last `
-             + `${fmtSecs(j.consumed.window_s)}`);
+    const ws = j.consumed.current_window_s ?? j.consumed.window_s;
+    parts.push(`${j.consumed.current_wh.toFixed(2)}Wh in ${fmtSecs(ws)}`);
   }
   return parts.join(' · ');
 }

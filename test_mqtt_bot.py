@@ -834,6 +834,76 @@ class TestPlugTwinTickTime(unittest.TestCase):
         self.assertIn("current_wh", consumed)
         self.assertAlmostEqual(consumed["current_wh"], 100.0 / 60.0, places=1)
 
+    def test_consumed_current_window_s_grows_then_caps(self):
+        # Fresh rule: actual elapsed grows from 0 toward window_s,
+        # then caps once observation has been active >= window_s.
+        twin, _, _ = _build_twin()
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(consumed_field="apower",
+                                  consumed_threshold_wh=10.0,
+                                  consumed_window_s=600),
+            12,
+        )
+        rule = twin.rules[0]
+        now = int(time.time())
+        # 1 minute into observation → current_window_s ≈ 60.
+        rule._observation_started_at = now - 60
+        out = twin.to_dict()
+        ws = out["scheduled_jobs"][0]["consumed"]["current_window_s"]
+        self.assertGreaterEqual(ws, 55)
+        self.assertLessEqual(ws, 65)
+        # 700 s in (past the 600 s window) → caps at 600.
+        rule._observation_started_at = now - 700
+        out = twin.to_dict()
+        ws = out["scheduled_jobs"][0]["consumed"]["current_window_s"]
+        self.assertEqual(ws, 600)
+
+    def test_idle_current_window_s_grows_then_caps(self):
+        # Same shape for idle rules. current_window_s is set regardless
+        # of whether history is available — only current_max_w (the
+        # SQL-derived peak) needs it.
+        twin, _, _ = _build_twin()  # history=None
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(idle_field="apower",
+                                  idle_threshold=5.0,
+                                  idle_duration_s=1800),
+            12,
+        )
+        rule = twin.rules[0]
+        now = int(time.time())
+        rule._observation_started_at = now - 120  # 2 min in
+        out = twin.to_dict()
+        ws = out["scheduled_jobs"][0]["idle"]["current_window_s"]
+        self.assertGreaterEqual(ws, 115)
+        self.assertLessEqual(ws, 125)
+        rule._observation_started_at = now - 3600  # past the 1800 s window
+        out = twin.to_dict()
+        ws = out["scheduled_jobs"][0]["idle"]["current_window_s"]
+        self.assertEqual(ws, 1800)
+
+    def test_observation_started_at_reset_on_manual_toggle(self):
+        # Manual ON resets _observation_started_at on off-target rules.
+        twin, _, _ = _build_twin()
+        twin.fields["output"] = False
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(consumed_field="apower",
+                                  consumed_threshold_wh=10.0,
+                                  consumed_window_s=600),
+            12,
+        )
+        rule = twin.rules[0]
+        long_ago = int(time.time()) - 7200
+        rule._observation_started_at = long_ago
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 0.5}).encode())
+        # After F→T edge, observation_started_at is bumped to ~now.
+        self.assertGreater(rule._observation_started_at, long_ago)
+        self.assertGreater(rule._observation_started_at,
+                           int(time.time()) - 5)
+
 
 # --- snapshot.build_for_chat --------------------------------------------
 

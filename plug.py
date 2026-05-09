@@ -376,6 +376,16 @@ class PlugTwin:
     def to_dict(self) -> dict[str, Any]:
         """The per-device payload included in the outbound snapshot."""
         now_ts = int(time.time())
+
+        def _actual_window(job, full_window_s: int) -> int:
+            """Time since this rule's observation began (or last reset),
+            capped at the rule's configured window. 0 means legacy/
+            loaded — caller should fall back to the full window."""
+            if job._observation_started_at <= 0:
+                return full_window_s
+            return min(full_window_s,
+                       max(0, now_ts - job._observation_started_at))
+
         with self._lock:
             fields = dict(self.fields)
             last_update_ts = self.last_update_ts
@@ -384,15 +394,22 @@ class PlugTwin:
             # we hold the lock — same locking invariant that protects
             # _eval_consumed).
             scheduled = []
-            idle_rules_pending: list[tuple[dict, int]] = []  # (snap, duration_s)
+            idle_rules_pending: list[tuple[dict, int, int]] = []  # (snap, duration_s, actual_window_s)
             for j in self.rules:
                 snap = j.to_snapshot()
                 if j.has_consumed():
                     cutoff = now_ts - j.consumed_window_s
                     wh = rules_mod.integrate_wh(j._samples, cutoff, now_ts)
                     snap["consumed"]["current_wh"] = float(wh)
+                    snap["consumed"]["current_window_s"] = _actual_window(
+                        j, j.consumed_window_s,
+                    )
                 if j.has_idle():
-                    idle_rules_pending.append((snap, j.idle_duration_s))
+                    actual_window_s = _actual_window(j, j.idle_duration_s)
+                    snap["idle"]["current_window_s"] = actual_window_s
+                    idle_rules_pending.append(
+                        (snap, j.idle_duration_s),
+                    )
                 scheduled.append(snap)
         # Outside the lock: idle rules need a samples_raw query for the
         # peak in their window. History has its own lock; keep it
@@ -580,6 +597,8 @@ class PlugTwin:
                 if job.has_consumed():
                     job._samples.clear()
                     job._consumed_started_at = now
+                if job.has_idle() or job.has_consumed():
+                    job._observation_started_at = now
 
     def _eval_idle(self, job, fields, now, fires) -> bool:
         v = fields.get(job.idle_field)

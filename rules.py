@@ -124,6 +124,13 @@ class ScheduledJob:
     _samples: deque = field(default_factory=lambda: deque(maxlen=2000))
     _consumed_started_at: int = 0
 
+    # When the rule's idle/consumed observation window started (or
+    # was last reset by manual-toggle). Used by snapshot to render
+    # the actual elapsed time next to live observed values, capped
+    # at the rule's configured window. 0 = legacy/loaded; display
+    # falls back to the full window. Transient — not persisted.
+    _observation_started_at: int = 0
+
     # Set by load_into to int(time.time()) on every rule restored from
     # rules.json. 0 for runtime-added rules. The twin's tick / state
     # eval skips firing while now - _loaded_at < GRACE_PERIOD_S.
@@ -166,6 +173,9 @@ class ScheduledJob:
             consumed_threshold_wh=policy.consumed_threshold_wh,
             consumed_window_s=policy.consumed_window_s,
             _consumed_started_at=now if policy.consumed_field else 0,
+            _observation_started_at=(
+                now if (policy.idle_field or policy.consumed_field) else 0
+            ),
         )
 
     def has_time(self) -> bool:
