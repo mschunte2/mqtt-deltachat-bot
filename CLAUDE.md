@@ -421,16 +421,15 @@ are rejected with a log line directing the user to `/apps` to refresh.
 
 ## Testing pattern
 
-`test_mqtt_bot.py` at the repo root, stdlib `unittest`. 57 tests in
-~15 ms. Pure modules need no stubs (they don't import deltachat2 or
-paho). Engine integration tests stub:
+`tests/` directory, stdlib `unittest`, one file per module under
+test (`tests/test_durations.py`, `tests/test_history.py`, …). 130
+tests in ~5 s. Shared fixtures live in `tests/_fixtures.py`
+(``CLASS_JSON_OK``, ``_build_twin``, ``_FakeHistory``); the
+``tests/__init__.py`` package init handles ``sys.path`` setup
+and stubs ``deltachat2`` so production modules import without
+the real package installed.
 
-- `deltachat2.MsgData` via `sys.modules` patch (so `import engine`
-  doesn't fail without the package installed)
-- `mqtt`, `webxdc`, `scheduler`, `bot.rpc` via small stub classes
-  that record calls
-
-Run with `python3 test_mqtt_bot.py`. Coverage: durations parser,
+Run with `python3 -m unittest discover tests`. Coverage: durations parser,
 templating regex (incl. JSON brace passthrough), state extraction
 (bool_text + json_path edges), permissions (global + per-device +
 fallback), scheduler.parse_policy (every form + restricted kinds),
