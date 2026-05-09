@@ -1546,20 +1546,45 @@ class TestSnapshotContract(unittest.TestCase):
                   "scheduled_jobs", "params", "energy",
                   "daily_energy_wh", "power_history"):
             self.assertIn(k, dev, f"missing top-level device key: {k}")
-        # power_history shape — minute @ ≤24h, hour @ ≤31d.
-        self.assertEqual(set(dev["power_history"].keys()), {"minute", "hour"})
+        # power_history shape — three resolutions: minute (≤24h),
+        # hour (≤31d), day (≤365d).
+        self.assertEqual(set(dev["power_history"].keys()),
+                          {"minute", "hour", "day"})
 
     def test_power_history_tuple_shape(self):
         snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
         ph = snap["devices"]["kitchen"]["power_history"]
         # Each entry is [ts:int, max_w:float|None, avg_w:float, output:0|1|None].
-        for series in (ph["minute"], ph["hour"]):
+        for series in (ph["minute"], ph["hour"], ph["day"]):
             for entry in series[:5]:  # first 5 are enough
                 self.assertEqual(len(entry), 4)
                 self.assertIsInstance(entry[0], int)
                 self.assertTrue(entry[1] is None or isinstance(entry[1], (int, float)))
                 self.assertIsInstance(entry[2], (int, float))
                 self.assertIn(entry[3], (0, 1, None))
+
+    def test_power_history_minute_has_live_tail(self):
+        # The right edge of the minute series should reflect the twin's
+        # live apower (42.0 W in setUp), not the gap-filled zero of the
+        # in-flight current minute.
+        snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
+        minute = snap["devices"]["kitchen"]["power_history"]["minute"]
+        self.assertGreater(len(minute), 0)
+        last = minute[-1]
+        self.assertAlmostEqual(last[1], 42.0)  # max
+        self.assertAlmostEqual(last[2], 42.0)  # avg
+        self.assertEqual(last[3], 1)            # output=on
+
+    def test_power_history_day_series_size(self):
+        snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
+        day = snap["devices"]["kitchen"]["power_history"]["day"]
+        # 365 days at 1-day buckets — gap-filled with zeros for the
+        # _FakeHistory which returns no rows.
+        self.assertGreaterEqual(len(day), 364)
+        self.assertLessEqual(len(day), 366)
+        # Bucket size is 86400 s.
+        if len(day) >= 2:
+            self.assertEqual(day[1][0] - day[0][0], 86400)
 
     def test_webxdc_io_wraps_payload_correctly(self):
         # webxdc.push_to_msgid is what the publisher actually calls.

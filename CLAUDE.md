@@ -576,17 +576,26 @@ Each device payload includes:
   requested start (app marks a `*` suffix).
 - `daily_energy_wh: [[ts, wh] * 30]` — last 30 days of daily totals
   for the bar chart.
-- `power_history: {minute, hour}` — two pre-aggregated series the
-  app picks between based on the chart window. Each entry is
-  `[ts, max_w, avg_w, output]`. The app plots `max_w` for short
-  windows (≤12 h) so cycling-load peaks (espresso boilers, etc.)
-  are rule-faithful, and `avg_w` for ≥24 h so the curve still
-  shows typicality. Header always reads
+- `power_history: {minute, hour, day}` — three pre-aggregated
+  series the app picks between based on the chart window. Each
+  entry is `[ts, max_w, avg_w, output]`. The app plots `max_w`
+  for short windows (≤12 h) so cycling-load peaks (espresso
+  boilers, etc.) are rule-faithful, and `avg_w` for ≥24 h so the
+  curve still shows typicality. Header always reads
   `max X W · avg Y W` from the visible points. Buckets without a
   `power_minute` row gap-fill as `[ts, 0, 0, null]` → grey on
   the chart (offline). Energy panels (`kWh consumed in last X`)
   always use avg-based integration — not max — so they don't
   overstate consumption.
+
+  Window → series mapping (in `main.js`):
+  - `≤24 h` → `minute` (with a live trailing point at the twin's
+     current `apower` so the right edge reflects "now" instead of
+     the in-flight minute's gap-filled zero)
+  - `7 d`, `31 d` → `hour` (zig-zags at 31 d are intentional —
+     they show whether consumption is intermittent vs. stable)
+  - `365 d` → `day` (only feasible resolution at this scale;
+     ~3 KB / device of payload)
 
 ## Chat command additions
 
@@ -600,6 +609,17 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
+- 2026-05-09 **v0.2.5 — graph polish**. Adds "7 days" and
+  "365 days" options to the chart window picker. Fixes the
+  minute-resolution chart always ending at 0 W on the right
+  edge: the bot now appends the twin's live apower as a trailing
+  point in the minute series only (replacing the gap-filled zero
+  from the in-flight minute). Adds a day-bucket series in the
+  snapshot covering 365 days at one point per day. The app picks
+  resolution per window: minute (≤24 h, with live tail), hour
+  (7 d & 31 d — zig-zags preserved at 31 d to show whether
+  consumption is intermittent vs. stable), day (365 d). Snapshot
+  grows by ~9 KB/device for the day series. 130 tests.
 - 2026-05-09 **v0.2.4 — per-rule label shows actual elapsed time**.
   v0.2.3 surfaced live observed values next to each rule but
   always labelled them with the rule's full window

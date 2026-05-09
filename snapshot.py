@@ -24,8 +24,9 @@ _MINUTE = 60
 _HOUR = 3600
 _DAY = 86400
 
-_HISTORY_MINUTE_WINDOW = 24 * _HOUR     # last 24 h at 1-min buckets
-_HISTORY_HOUR_WINDOW = 31 * _DAY        # last 31 d at 1-h buckets
+_HISTORY_MINUTE_WINDOW = 24 * _HOUR      # last 24 h at 1-min buckets
+_HISTORY_HOUR_WINDOW = 31 * _DAY         # last 31 d at 1-h buckets
+_HISTORY_DAY_WINDOW = 365 * _DAY         # last 365 d at 1-day buckets
 
 
 def build_for_chat(chat_id: int, class_name: str,
@@ -46,8 +47,18 @@ def build_for_chat(chat_id: int, class_name: str,
 
 # --- helpers (used by PlugTwin.to_dict) ---------------------------------
 
-def _power_history(history, device_name: str) -> dict[str, list]:
-    """Two resolutions, gap-filled with `null` output for missing buckets."""
+def _power_history(history, device_name: str,
+                   live_apower: float | None = None,
+                   live_output: bool | None = None,
+                   ) -> dict[str, list]:
+    """Three resolutions, gap-filled with `null` output for missing buckets.
+
+    minute (≤24 h, 1-min buckets) — gets a live trailing point so the
+        right edge reflects the current draw rather than the gap-filled
+        zero from the in-flight (un-flushed) minute.
+    hour   (≤31 d, 1-h buckets)
+    day    (≤365 d, 1-day buckets) — for the long-window view.
+    """
     now = int(time.time())
     minute = _gap_fill(
         history.query_power(device_name,
@@ -55,13 +66,31 @@ def _power_history(history, device_name: str) -> dict[str, list]:
                             max_points=1440)[1],
         since=now - _HISTORY_MINUTE_WINDOW, until=now, bucket=_MINUTE,
     )
+    if isinstance(live_apower, (int, float)):
+        out_int = (1 if live_output is True
+                   else 0 if live_output is False
+                   else None)
+        live_pt = [now, float(live_apower), float(live_apower), out_int]
+        # Replace any trailing gap-filled bucket with the live reading
+        # so the line ends at "now" instead of dipping to zero on the
+        # in-flight minute.
+        if minute and minute[-1][3] is None:
+            minute[-1] = live_pt
+        else:
+            minute.append(live_pt)
     hour = _gap_fill(
         history.query_power(device_name,
                             now - _HISTORY_HOUR_WINDOW, now,
                             max_points=750)[1],
         since=now - _HISTORY_HOUR_WINDOW, until=now, bucket=_HOUR,
     )
-    return {"minute": minute, "hour": hour}
+    day = _gap_fill(
+        history.query_power(device_name,
+                            now - _HISTORY_DAY_WINDOW, now,
+                            max_points=365)[1],
+        since=now - _HISTORY_DAY_WINDOW, until=now, bucket=_DAY,
+    )
+    return {"minute": minute, "hour": hour, "day": day}
 
 
 def _gap_fill(rows: list[tuple[int, float | None, float, int | None]],

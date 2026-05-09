@@ -256,9 +256,25 @@ function renderSparkline() {
     chartFoot.textContent = '(no data yet)';
     return;
   }
-  // Pick resolution based on window. ≤24h → minute, 7d+ → hour.
-  const useHour = state.windowSeconds >= 7 * 86400;
-  const series = useHour ? dev.power_history.hour : dev.power_history.minute;
+  // Pick resolution based on window:
+  //   ≤24h         → minute series (with live tail at "now")
+  //   7d, 31d      → hour series (zig-zags preserved at 31d so the
+  //                   user can see whether consumption is intermittent
+  //                   vs. stable)
+  //   ≥365d        → day series (only feasible resolution at this scale)
+  let series, useHour;
+  if (state.windowSeconds >= 365 * 86400) {
+    // Fall back to hour if the bot's snapshot predates the day series
+    // (older payload still in localStorage).
+    series = dev.power_history.day || dev.power_history.hour;
+    useHour = true;   // day buckets behave like hour for showMax logic below
+  } else if (state.windowSeconds >= 7 * 86400) {
+    series = dev.power_history.hour;
+    useHour = true;
+  } else {
+    series = dev.power_history.minute;
+    useHour = false;
+  }
   if (!Array.isArray(series) || series.length < 2) {
     sparkline.innerHTML = ''; chartMax.textContent = '';
     chartFoot.textContent = '(no data in this window)';

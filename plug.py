@@ -454,6 +454,8 @@ class PlugTwin:
             )
             payload["power_history"] = _power_history(
                 self.deps.history, self.name,
+                live_apower=fields.get("apower"),
+                live_output=fields.get("output"),
             )
         return payload
 
