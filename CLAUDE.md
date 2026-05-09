@@ -64,23 +64,40 @@ state.
 
 ## Module layout and design rules
 
-```
-bot.py          — Delta Chat hooks + routing glue + construction
-plug.py         — PlugTwin (digital twin per device); on_mqtt,
-                  dispatch, schedule, cancel, tick_time, snapshot
-twins.py        — TwinRegistry (dict + reverse topic lookup)
-rules.py        — ScheduledJob/Policy/Defaults; parse_policy;
-                  RulesSweeper daemon; rules.json persistence
-snapshot.py     — single function build_for_chat
-publisher.py    — Publisher class (the only outbound stream)
-config.py       — devices.json + devices/*/class.json loader
-state.py        — DeviceState + extraction (json_path, bool_text)
-permissions.py  — global + per-device allow-list
-mqtt_client.py  — paho wrapper (daemon thread, auto-resubscribe)
-webxdc_io.py    — app_msgids.json + send_apps + push_to_msgid
-history.py      — SQLite time series
-durations.py    — parse "30m" / "1h30m"
-templating.py   — {key} substitution that leaves JSON braces alone
+```text
+bot.py                       — entry point: env, construction, hooks, BotCli
+mqtt_bot/                    — the Python package
+├── __init__.py
+├── commands.py              — pure parser: /<dev> <verb> + replay-window consts
+├── formatters.py            — chat-reply display: device line, rule clauses
+├── rehydrate.py             — rule transient-state backfill on restart
+├── core/                    — declarative twin engine (class-agnostic)
+│   ├── twin.py              — PlugTwin: on_mqtt, dispatch, schedule, tick_time
+│   ├── twins.py             — TwinRegistry (dict + reverse topic lookup)
+│   ├── rules.py             — ScheduledJob/Policy/Defaults; parse_policy;
+│   │                          RulesSweeper daemon; rules.json persistence
+│   ├── snapshot.py          — single function build_for_chat
+│   └── state.py             — extract() pure function (json_path, bool_text)
+├── io/                      — modules with side effects
+│   ├── history.py           — SQLite time series
+│   ├── baselines.py         — baselines.json round-trip + legacy migration
+│   ├── mqtt_client.py       — paho wrapper (daemon thread, auto-resubscribe)
+│   ├── publisher.py         — Publisher class (the only outbound stream)
+│   └── webxdc_io.py         — app_msgids.json + send_apps + push_to_msgid
+└── util/                    — pure utilities, no side effects
+    ├── config.py            — devices.json + devices/*/class.json loader
+    ├── durations.py         — parse "30m" / "1h30m"
+    ├── permissions.py       — global + per-device allow-list
+    └── templating.py        — {key} substitution that leaves JSON braces alone
+
+devices/                     — declarative device classes (config + apps)
+├── shelly_plug/
+└── tasmota_plug/
+
+tests/                       — stdlib unittest, one file per module
+├── __init__.py              — sys.path + deltachat2 stub setup
+├── _fixtures.py             — CLASS_JSON_OK, _build_twin, _FakeHistory
+└── test_<module>.py         — per-module tests
 ```
 
 ### Design rules to keep when extending
@@ -94,11 +111,13 @@ templating.py   — {key} substitution that leaves JSON braces alone
 - **Single outbound assembly point** — `snapshot.build_for_chat` is
   the only function that produces an app payload. **Single outbound
   pipeline** — `Publisher` is the only thing that pushes to apps.
-- **Pure functions** in `state.py`, `templating.py`, `durations.py`,
-  `permissions.py`, `config.py` — easy to test, no I/O.
-- **Side effects** confined to `mqtt_client.py`, `webxdc_io.py`,
-  `rules.py` (its sweeper thread), `publisher.py` (its daemon),
-  `history.py`, and `bot.py` (Delta Chat RPC).
+- **Pure functions** live under `mqtt_bot/util/` (config, durations,
+  permissions, templating) and `mqtt_bot/core/state.py` — easy to
+  test, no I/O.
+- **Side effects** confined to `mqtt_bot/io/` (mqtt_client,
+  webxdc_io, history, baselines, publisher), the
+  `RulesSweeper` thread inside `mqtt_bot/core/rules.py`, and
+  `bot.py` (Delta Chat RPC + signal handling).
 - **One class per file** when classes appear; small free functions
   otherwise. No deep inheritance.
 - The Python module dependency graph is intentionally a DAG. Twins
@@ -616,6 +635,23 @@ Each device payload includes:
 during the v0.2.0 refactor to reflect the project's actual maturity
 as 0.x.)
 
+- 2026-05-09 **v0.2.2 — repo cleanup: hierarchical structure +
+  test split**. The 14 first-party Python modules at the project
+  root collapse into a single `mqtt_bot/` package with three
+  semantic sub-packages mirroring the design-rule split:
+  `mqtt_bot/core/` (twin engine + rules + state + snapshot),
+  `mqtt_bot/io/` (history, baselines, mqtt_client, publisher,
+  webxdc_io — anything with side effects), `mqtt_bot/util/`
+  (pure utilities: config, durations, permissions, templating).
+  `plug.py` renamed to `mqtt_bot/core/twin.py` (the class is
+  still `PlugTwin`; only the file is renamed for honesty since
+  the engine has been class-agnostic since v0.2.0). Three pure
+  pieces extracted from bot.py into `mqtt_bot/{commands,
+  formatters,rehydrate}.py` (parser + display + startup
+  rehydration). The 2,096-line `test_mqtt_bot.py` becomes a
+  `tests/` package with one file per module under test, run via
+  `python3 -m unittest discover tests`. Architectural rules
+  unchanged; no production logic touched. 130 tests.
 - 2026-05-09 **v0.2.7 — unified chart style: connected dots +
   min..max bars across all series**. Drops the v0.2.6 split
   between line rendering (minute series) and bar rendering

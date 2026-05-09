@@ -18,20 +18,28 @@ dropping in a new `devices/<class>/` directory, no Python edits.
 
 ```
 mqtt-bot/
-├── bot.py                         # Delta Chat hooks + routing glue + construction
-├── plug.py                        # PlugTwin — digital twin per device
-├── twins.py                       # TwinRegistry — dict + reverse topic lookup
-├── rules.py                       # ScheduledJob/Policy + parse_policy + sweeper + persistence
-├── snapshot.py                    # build_for_chat — single outbound assembly
-├── publisher.py                   # Publisher — single outbound stream
-├── config.py                      # devices.json + devices/*/class.json loader
-├── state.py                       # state-field extraction (json_path, bool_text)
-├── permissions.py                 # global ALLOWED_CHATS + per-device allow-list
-├── mqtt_client.py                 # paho wrapper (daemon thread, auto-resubscribe)
-├── webxdc_io.py                   # app_msgids.json + send_apps + push_to_msgid
-├── history.py                     # SQLite time series (samples_raw, power_minute, energy_*)
-├── durations.py                   # parse "30m" / "1h30m"
-├── templating.py                  # {key} substitution that leaves JSON braces alone
+├── bot.py                         # entry point (env, BotCli, hook registration)
+├── mqtt_bot/                      # the Python package
+│   ├── commands.py                # pure /<dev> <verb> parser
+│   ├── formatters.py              # chat-reply display helpers
+│   ├── rehydrate.py               # rule transient-state backfill on restart
+│   ├── core/                      # declarative twin engine
+│   │   ├── twin.py                # PlugTwin (digital twin per device)
+│   │   ├── twins.py               # TwinRegistry — dict + reverse topic lookup
+│   │   ├── rules.py               # ScheduledJob/Policy + parse_policy + sweeper
+│   │   ├── snapshot.py            # build_for_chat — single outbound assembly
+│   │   └── state.py               # state-field extraction (json_path, bool_text)
+│   ├── io/                        # modules with side effects
+│   │   ├── history.py             # SQLite time series
+│   │   ├── baselines.py           # baselines.json round-trip + legacy migration
+│   │   ├── mqtt_client.py         # paho wrapper (daemon, auto-resubscribe)
+│   │   ├── publisher.py           # Publisher — single outbound stream
+│   │   └── webxdc_io.py           # app_msgids.json + send_apps + push_to_msgid
+│   └── util/                      # pure utilities
+│       ├── config.py              # devices.json + devices/*/class.json loader
+│       ├── durations.py           # parse "30m" / "1h30m"
+│       ├── permissions.py         # global ALLOWED_CHATS + per-device allow-list
+│       └── templating.py          # {key} substitution that leaves JSON braces alone
 ├── devices/                       # device-class components (auto-discovered)
 │   └── shelly_plug/
 │       ├── class.json             # the class definition
