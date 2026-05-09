@@ -23,7 +23,7 @@ jobs:
       # bot.py --check-config short-circuits before its heavy
       # imports (deltachat2, paho, appdirs).
       - name: unit tests
-        run: python3 test_mqtt_bot.py
+        run: python3 -m unittest discover tests
 
       - name: --check-config
         run: python3 bot.py --check-config
