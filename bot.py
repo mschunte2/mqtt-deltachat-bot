@@ -294,9 +294,17 @@ def cancel_schedule(chat_id: int, device_name: str,
     if not twin.can_chat_see(chat_id, ALLOWED_CHATS):
         return False, "permission denied"
     cancelled = twin.cancel(target_action=target_action, rule_id=rule_id)
-    if not cancelled:
-        return True, f"no pending schedule for {device_name}"
-    return True, f"cancelled {len(cancelled)} schedule(s) for {device_name}"
+    if cancelled:
+        return True, f"cancelled {len(cancelled)} schedule(s) for {device_name}"
+    # No-op cancel: distinguish "device has no rules at all" from
+    # "device has rules but none matched" (e.g. duplicate × clicks
+    # in the app sending the same rule_id twice). Otherwise the
+    # second call's reply misleadingly implies all rules are gone.
+    remaining = len(twin.jobs_snapshot())
+    if remaining:
+        return True, (f"no matching schedule for {device_name} "
+                      f"({remaining} rule(s) still active)")
+    return True, f"no pending schedule for {device_name}"
 
 
 def list_devices(chat_id: int) -> str:
