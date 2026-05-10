@@ -138,6 +138,80 @@ class TestPlugTwinOnMqtt(unittest.TestCase):
         self.assertTrue(any("✅" in t for _, t in calls["posted"]))
 
 
+# --- online-edge debounce (suppress brief LWT flap from broker
+#     client-ID collisions during Wi-Fi blips) -----------------------------
+
+class TestOnlineFlapDebounce(unittest.TestCase):
+    """Build a twin whose class has an on_change rule for `online`
+    (the production `shelly_plug` does; the default test fixture
+    doesn't). Then drive online edges and assert the chat post is
+    debounced."""
+
+    ONLINE_RULE = {"type": "on_change", "field": "online",
+                   "values": {"true": "🟢 {name} back online",
+                              "false": "🔴 {name} went offline"}}
+
+    def _twin_with_online_rule(self):
+        # Inherit the fixture's chat_events and append the online rule.
+        # _build_twin's class_overrides REPLACES top-level keys, so we
+        # rebuild the full chat_events list.
+        from tests._fixtures import CLASS_JSON_OK
+        events = list(CLASS_JSON_OK["chat_events"]) + [self.ONLINE_RULE]
+        twin, calls, _ = _build_twin(class_overrides={"chat_events": events})
+        # Tighten the debounce so tests run fast.
+        twin.ONLINE_FLAP_DEBOUNCE_S = 0.05
+        return twin, calls
+
+    def _wait_for_pending(self, twin, timeout=1.0):
+        """Block until any queued offline-post timer has fired."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            t = twin._pending_offline_post
+            if t is None or not t.is_alive():
+                return
+            time.sleep(0.01)
+
+    def test_brief_flap_suppresses_both_posts(self):
+        twin, calls = self._twin_with_online_rule()
+        # Hydrate online=True so we get a real True→False edge.
+        twin.on_mqtt("online", b"true")
+        calls["posted"].clear()
+
+        twin.on_mqtt("online", b"false")  # offline edge — defer
+        twin.on_mqtt("online", b"true")   # quick recovery — cancel
+        self._wait_for_pending(twin)
+
+        self.assertEqual(calls["posted"], [],
+                         "brief flap should produce no chat posts")
+
+    def test_sustained_offline_posts_after_debounce(self):
+        twin, calls = self._twin_with_online_rule()
+        twin.on_mqtt("online", b"true")
+        calls["posted"].clear()
+
+        twin.on_mqtt("online", b"false")
+        # No post yet — still pending.
+        self.assertEqual(calls["posted"], [])
+        self._wait_for_pending(twin)
+        # Debounce window elapsed; offline should be posted.
+        self.assertEqual(calls["posted"], [("kitchen", "🔴 kitchen went offline")])
+
+        # Subsequent recovery posts the back-online message normally
+        # (no pending timer to suppress).
+        twin.on_mqtt("online", b"true")
+        self.assertEqual(calls["posted"][-1],
+                         ("kitchen", "🟢 kitchen back online"))
+
+    def test_app_broadcasts_immediately_on_offline_edge(self):
+        # Debounce only delays the chat post; the app should still see
+        # the offline state immediately.
+        twin, calls = self._twin_with_online_rule()
+        twin.on_mqtt("online", b"true")
+        broadcasts_before = len(calls["broadcasts"])
+        twin.on_mqtt("online", b"false")
+        self.assertGreater(len(calls["broadcasts"]), broadcasts_before)
+
+
 # --- dispatch: publish + react + broadcast --------------------------------
 
 class TestPlugTwinDispatch(unittest.TestCase):

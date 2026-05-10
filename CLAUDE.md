@@ -253,6 +253,16 @@ import bot/mqtt/webxdc/publisher — keeps the dep graph a clean DAG.
 - **on_change**: post a chat message when a state field transitions
   (`prev != new`). Boolean values are coerced to `"true"`/`"false"`
   for template lookup. Unknown value → no template → silent.
+  Special case for `online`: chat posts are debounced by
+  `PlugTwin.ONLINE_FLAP_DEBOUNCE_S` (10 s). A True→False edge schedules
+  the offline post; if `online` recovers to True before the timer fires,
+  both the offline and the back-online posts are suppressed. App
+  broadcasts still happen on every edge (debounce only affects chat).
+  Reason: brief Wi-Fi blips cause the plug to reconnect with the same
+  client ID, mosquitto kicks the old session ("Client X already
+  connected, closing old connection"), the LWT fires false, and the new
+  session immediately publishes true — net 1-2 s flap that's pure
+  noise to the user.
 - **threshold**: per-field latch. Above limit for ≥ duration → fires
   `above`. Drop below → fires `below` and resets. Limit + duration
   come from the *device*'s `params`; if omitted the rule is silently

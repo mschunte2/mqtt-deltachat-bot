@@ -70,6 +70,13 @@ class TwinDeps:
 # --- the digital twin ----------------------------------------------------
 
 class PlugTwin:
+    # Brief broker-side client-ID collisions (Wi-Fi blip → plug reconnects
+    # → mosquitto kicks the old session, firing the LWT) cause `online`
+    # to flap false→true within ~1-2s. We hold the offline chat post for
+    # this many seconds; if `online` recovers before it fires, both posts
+    # are suppressed. Class attribute so tests can monkey-patch it.
+    ONLINE_FLAP_DEBOUNCE_S = 10
+
     def __init__(self, cls: DeviceClass, cfg: Device, deps: TwinDeps) -> None:
         self.cls = cls
         self.cfg = cfg
@@ -100,6 +107,10 @@ class PlugTwin:
         # aenergy_at so the user sees a continuous effective value.
         self.last_seen_aenergy_wh: float | None = None
         self._lock = threading.Lock()
+        # Pending offline-edge chat post (see ONLINE_FLAP_DEBOUNCE_S).
+        # threading.Timer set on True→False; cancelled on False→True if
+        # it hasn't fired yet.
+        self._pending_offline_post: threading.Timer | None = None
 
     # --- inbound from MQTT ----------------------------------------------
 
@@ -485,8 +496,45 @@ class PlugTwin:
         text = templating.render(template, {
             "name": self.name, "value": new_value, "field": rule.field,
         })
-        self.deps.post_to_chats(self.cfg, text)
+        if rule.field == "online":
+            self._fire_online_change(key, text)
+        else:
+            self.deps.post_to_chats(self.cfg, text)
         return True
+
+    def _fire_online_change(self, key: str, text: str) -> None:
+        """Debounce online-edge chat posts to suppress brief broker
+        client-ID-collision flaps. Returning True (via the caller) is
+        unconditional so the app still broadcasts on every edge — only
+        the chat post is delayed."""
+        with self._lock:
+            pending = self._pending_offline_post
+            self._pending_offline_post = None
+        if key == "false":
+            if pending is not None:
+                pending.cancel()
+            t = threading.Timer(self.ONLINE_FLAP_DEBOUNCE_S,
+                                self._post_deferred_offline, args=[text])
+            t.daemon = True
+            with self._lock:
+                self._pending_offline_post = t
+            t.start()
+        else:
+            if pending is not None:
+                # Quick recovery — cancel the queued offline and skip
+                # the "back online" post too. The user never saw a flap.
+                pending.cancel()
+            else:
+                self.deps.post_to_chats(self.cfg, text)
+
+    def _post_deferred_offline(self, text: str) -> None:
+        """Timer body: re-check `online` and post only if still offline."""
+        with self._lock:
+            self._pending_offline_post = None
+            still_offline = (_coerce_value_key(self.fields.get("online"))
+                             == "false")
+        if still_offline:
+            self.deps.post_to_chats(self.cfg, text)
 
     def _fire_threshold(self, rule: ChatEventRule, value: Any, now: int) -> bool:
         if not isinstance(value, (int, float)):
