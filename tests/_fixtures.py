@@ -72,7 +72,8 @@ CLASS_JSON_OK = {
 }
 
 
-def _build_twin(class_overrides=None, params=None, allowed_chats=(12,)):
+def _build_twin(class_overrides=None, params=None, allowed_chats=(12,),
+                history=None):
     """Build a single ``PlugTwin`` against an in-memory class+device
     config and a stub ``TwinDeps``.
 
@@ -107,7 +108,7 @@ def _build_twin(class_overrides=None, params=None, allowed_chats=(12,)):
         save_baselines=lambda: calls.__setitem__(
             "baseline_saves", calls.get("baseline_saves", 0) + 1),
         react=lambda mid, e: calls["reactions"].append((mid, e)),
-        history=None,
+        history=history,
         client_id="tester",
     )
     twin = plug_mod.PlugTwin(
@@ -117,9 +118,20 @@ def _build_twin(class_overrides=None, params=None, allowed_chats=(12,)):
 
 
 class _FakeHistory:
-    """Minimal ``History`` stand-in: every read returns an empty
-    response so ``snapshot.build_for_chat`` populates every field
-    without exercising SQLite."""
+    """Minimal ``History`` stand-in. Defaults return empty/None;
+    tests that need specific values set the corresponding attribute
+    or override the method:
+
+        h = _FakeHistory()
+        h.consumed_wh = 42.0          # what energy_consumed_in returns
+        h.consumed_earliest_offset = 0  # earliest_ts = since + this offset
+        h.samples_raw_rows = [...]    # what query_samples_raw returns
+    """
+
+    def __init__(self):
+        self.consumed_wh: float = 0.0
+        self.consumed_earliest_offset: int | None = None  # None → no data
+        self.samples_raw_rows: list = []
 
     def query_power(self, *_a, **_kw):
         return (60, [])
@@ -127,11 +139,23 @@ class _FakeHistory:
     def daily_energy_kwh(self, *_a, **_kw):
         return [(0, 0.0)] * 30
 
-    def energy_consumed_in(self, *_a, **_kw):
-        return (0.0, None)
+    def energy_consumed_in(self, _device, since_ts, _until_ts):
+        if self.consumed_earliest_offset is None:
+            return (0.0, None)
+        return (self.consumed_wh,
+                int(since_ts) + self.consumed_earliest_offset)
 
     def aenergy_at(self, *_a, **_kw):
         return None
 
+    def query_samples_raw(self, *_a, **_kw):
+        return self.samples_raw_rows
+
     def record_offset_event(self, *_a, **_kw):
+        pass
+
+    def write_sample(self, *_a, **_kw):
+        pass
+
+    def record_status(self, *_a, **_kw):
         pass

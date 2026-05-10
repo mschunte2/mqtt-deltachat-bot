@@ -295,10 +295,18 @@ counter starts fresh.
 - **idle:** `state[idle_field] < idle_threshold` for ≥
   `idle_duration_s`. Evaluated inline by `twin.on_mqtt` after every
   state update.
-- **consumed:** `integral(field·dt)` over last `window_s` <
-  `threshold_wh`. Evaluated inline by `twin.on_mqtt`. Only fires
-  after the window has been populated (now ≥ `_consumed_started_at +
-  window_s`); zero samples ≠ "below threshold".
+- **consumed:** Wh delta of the plug's authoritative `aenergy.total`
+  counter over `[now - window_s, now]` < `threshold_wh`. Read via
+  `history.energy_consumed_in()` — the plug integrates at hardware
+  rate so brief bursts (espresso, kettle) are counted correctly.
+  Evaluated inline by `twin.on_mqtt`. Two gates protect against
+  spurious fires: (a) `_consumed_started_at` window-warmup — a
+  freshly created or just-reset rule must observe for one full
+  window before firing, so prior history that predates rule
+  creation can't satisfy the threshold; (b) history coverage — if
+  `samples_raw` doesn't extend back to the window start
+  (`earliest_ts > since`), don't fire (we'd be comparing a
+  partial-window delta against a full-window threshold).
 
 Time-based policies are mutually exclusive within one rule (timer
 XOR tod). Idle and consumed can each appear at most once. Policies
@@ -321,7 +329,8 @@ evaluated inline in `twin.on_mqtt`.
 Default since v0.1.5: rules persist across fires. `once: True` opts
 into one-shot. Recurring rules re-arm per policy: TOD → next
 occurrence; timer → `now + timer_seconds`; idle → `_below_since`
-reset; consumed → samples cleared, window restart.
+reset; consumed → `_consumed_started_at = now` (one-window cooldown
+before next fire eligibility).
 
 ### Persistence
 
@@ -331,9 +340,12 @@ Each `ScheduledJob` carries its `device_name`; load dispatches each
 to the matching twin via `twin.add_persisted_rule(...)`.
 
 On startup, expired one-shots are dropped, recurring TODs re-arm to
-the next occurrence, and `bot._rehydrate_rules_from_history()`
-backfills consumed/idle evaluation buffers from `power_minute` so
-restart doesn't force a fresh window.
+the next occurrence, and `mqtt_bot.rehydrate.rehydrate_rules_from_history`
+backfills idle-rule `_below_since` from `samples_raw` so an
+already-idle device doesn't have to wait a fresh window after
+restart. Consumed rules need no rehydration: their evaluator reads
+`history.energy_consumed_in()` directly, so the "observation
+buffer" lives in the database, not in memory.
 
 ## Templating
 
@@ -451,7 +463,7 @@ are rejected with a log line directing the user to `/apps` to refresh.
 ## Testing pattern
 
 `tests/` directory, stdlib `unittest`, one file per module under
-test (`tests/test_durations.py`, `tests/test_history.py`, …). 130
+test (`tests/test_durations.py`, `tests/test_history.py`, …). 135
 tests in ~5 s. Shared fixtures live in `tests/_fixtures.py`
 (``CLASS_JSON_OK``, ``_build_twin``, ``_FakeHistory``); the
 ``tests/__init__.py`` package init handles ``sys.path`` setup
@@ -462,7 +474,7 @@ Run with `python3 -m unittest discover tests`. Coverage: durations parser,
 templating regex (incl. JSON brace passthrough), state extraction
 (bool_text + json_path edges), permissions (global + per-device +
 fallback), scheduler.parse_policy (every form + restricted kinds),
-scheduler.integrate_wh, scheduler.next_tod_deadline, scheduler.tick
+scheduler.next_tod_deadline, scheduler.tick
 (idle fire + reset), config loader (every error path), engine
 (unknown device, permission denied, unknown action, publish, template
 substitution including JSON, dispatch preserves pending rules, threshold

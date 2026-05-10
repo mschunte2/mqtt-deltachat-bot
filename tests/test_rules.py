@@ -1,4 +1,4 @@
-"""Tests for the rules subsystem: parse_policy, integrate_wh,
+"""Tests for the rules subsystem: parse_policy,
 next_tod_deadline, save_all/load_into round-trip, and the grace
 period for rules just rehydrated from rules.json."""
 
@@ -128,27 +128,6 @@ class TestParsePolicy(unittest.TestCase):
         # but tod alone is fine
         p = sched.parse_policy("at 7h", self.d, allowed=frozenset({"timer", "tod"}))
         self.assertEqual(p.time_of_day, (7, 0))
-
-
-class TestIntegrate(unittest.TestCase):
-    def test_empty(self):
-        self.assertEqual(sched.integrate_wh([], 0, 60), 0.0)
-
-    def test_constant_one_sample(self):
-        # 100W constant for 60s = 100 * 60 / 3600 ≈ 1.667 Wh
-        wh = sched.integrate_wh([(0, 100.0)], 0, 60)
-        self.assertAlmostEqual(wh, 100 * 60 / 3600.0, places=4)
-
-    def test_two_samples(self):
-        # samples at t=0 and t=60, power 100→100, then extends to t=120 at 100W
-        wh = sched.integrate_wh([(0, 100.0), (60, 100.0)], 0, 120)
-        self.assertAlmostEqual(wh, 100 * 120 / 3600.0, places=4)
-
-    def test_window_trim(self):
-        # window starts at 30, sample at 0 should be ignored
-        wh = sched.integrate_wh([(0, 1000.0), (60, 100.0)], 30, 60)
-        # only (60, 100.0) inside window → constant 100W * 30s = ~0.833Wh
-        self.assertAlmostEqual(wh, 100 * 30 / 3600.0, places=4)
 
 
 class TestTodDeadline(unittest.TestCase):

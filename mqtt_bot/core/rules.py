@@ -4,8 +4,7 @@ Rules live on PlugTwin instances (one rule list per device). This
 module owns:
 
   - the dataclasses (ScheduledJob, ScheduledPolicy, PolicyDefaults)
-    and helpers (derive_rule_id, next_tod_deadline, integrate_wh,
-    _job_dormant)
+    and helpers (derive_rule_id, next_tod_deadline, _job_dormant)
   - parse_policy (chat-text clause → ScheduledPolicy)
   - Persistence: save_all(registry, path) writes a flat JSON list,
     load_into(registry, path) restores it onto the right twins
@@ -26,8 +25,7 @@ import os
 import re
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -121,7 +119,6 @@ class ScheduledJob:
     consumed_field: str | None = None
     consumed_threshold_wh: float | None = None
     consumed_window_s: int | None = None
-    _samples: deque = field(default_factory=lambda: deque(maxlen=2000))
     _consumed_started_at: int = 0
 
     # When the rule's idle/consumed observation window started (or
@@ -195,8 +192,9 @@ class ScheduledJob:
 
     def to_dict(self) -> dict[str, Any]:
         """Persistence shape — every non-transient field. Reverse of
-        from_dict. Transient state (_below_since, _samples,
-        _consumed_started_at) is intentionally omitted."""
+        from_dict. Transient state (_below_since,
+        _consumed_started_at, _observation_started_at) is
+        intentionally omitted."""
         return {
             "device_name": self.device_name,
             "chat_id_origin": self.chat_id_origin,
@@ -300,24 +298,6 @@ def next_tod_deadline(h: int, m: int, now: int) -> int:
         tom = time.localtime(now + 86400)
         target = time.mktime((tom.tm_year, tom.tm_mon, tom.tm_mday, h, m, 0, 0, 0, -1))
     return int(target)
-
-
-def integrate_wh(samples, window_start: int, now: int) -> float:
-    """Watt-hours over [window_start, now] via trapezoidal rule.
-    `samples` = iterable of (ts_seconds, watts) ordered by ts. Trailing
-    sample is extended to `now` at constant power. 0 for empty input."""
-    pts = [(t, p) for t, p in samples if t >= window_start]
-    if not pts:
-        return 0.0
-    if len(pts) == 1:
-        return pts[0][1] * (now - window_start) / 3600.0
-    ws = 0.0
-    pt, pp = pts[0]
-    for t, p in pts[1:]:
-        ws += (pp + p) / 2.0 * (t - pt)
-        pt, pp = t, p
-    ws += pp * (now - pt)
-    return ws / 3600.0
 
 
 # --- Parser --------------------------------------------------------------

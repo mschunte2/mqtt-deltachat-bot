@@ -72,14 +72,14 @@ class TestPlugTwinOnMqtt(unittest.TestCase):
         )
         rule = twin.rules[0]
         long_ago = int(time.time()) - 7200
-        rule._samples.append((long_ago, 100.0))
         rule._consumed_started_at = long_ago
+        rule._observation_started_at = long_ago
         twin.on_mqtt("status/switch:0",
                      json.dumps({"output": True, "apower": 50.0}).encode())
-        # Buffer cleared on reset; a fresh sample lands on the next
-        # _eval_consumed call inside on_mqtt — exactly one (now) entry.
-        self.assertEqual(len(rule._samples), 1)
+        # Manual ON edge resets the off-rule window-warmup gate so the
+        # user gets a fresh observation period.
         self.assertGreater(rule._consumed_started_at, long_ago)
+        self.assertGreater(rule._observation_started_at, long_ago)
 
     def test_manual_off_resets_on_rule_window(self):
         twin, _, _ = _build_twin()
@@ -323,24 +323,44 @@ class TestPlugTwinTickTime(unittest.TestCase):
         self.assertEqual(calls["published"], [])     # but did not fire
 
     def test_to_dict_includes_consumed_current_wh(self):
-        # Snapshot enrichment: every consumed rule gets a current_wh
-        # field computed from its _samples deque.
-        twin, _, _ = _build_twin()
+        # Snapshot enrichment: consumed rules get current_wh from
+        # history.energy_consumed_in (the plug's authoritative
+        # aenergy.total counter delta).
+        from tests._fixtures import _FakeHistory
+        h = _FakeHistory()
+        h.consumed_wh = 1.667
+        h.consumed_earliest_offset = 0  # earliest exactly at since
+        twin, _, _ = _build_twin(history=h)
         policy = sched.ScheduledPolicy(consumed_field="apower",
                                        consumed_threshold_wh=10.0,
                                        consumed_window_s=600)
         twin.schedule("off", policy, 12)
-        rule = twin.rules[0]
-        # Inject 100 W constant for 60 s → 100·60/3600 = 1.667 Wh
-        now = int(time.time())
-        for offset in range(60):
-            rule._samples.append((now - 60 + offset, 100.0))
         out = twin.to_dict()
         sched_jobs = out["scheduled_jobs"]
         self.assertEqual(len(sched_jobs), 1)
         consumed = sched_jobs[0]["consumed"]
         self.assertIn("current_wh", consumed)
-        self.assertAlmostEqual(consumed["current_wh"], 100.0 / 60.0, places=1)
+        self.assertAlmostEqual(consumed["current_wh"], 1.667, places=2)
+
+    def test_to_dict_omits_consumed_current_wh_when_history_partial(self):
+        # If history doesn't extend back to the window start
+        # (earliest_ts > since), don't show a current_wh — it would
+        # be misleadingly small.
+        from tests._fixtures import _FakeHistory
+        h = _FakeHistory()
+        h.consumed_wh = 0.0
+        h.consumed_earliest_offset = None  # no data at all
+        twin, _, _ = _build_twin(history=h)
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(consumed_field="apower",
+                                  consumed_threshold_wh=10.0,
+                                  consumed_window_s=600),
+            12,
+        )
+        out = twin.to_dict()
+        consumed = out["scheduled_jobs"][0]["consumed"]
+        self.assertNotIn("current_wh", consumed)
 
     def test_consumed_current_window_s_grows_then_caps(self):
         # Fresh rule: actual elapsed grows from 0 toward window_s,
@@ -411,6 +431,94 @@ class TestPlugTwinTickTime(unittest.TestCase):
         self.assertGreater(rule._observation_started_at, long_ago)
         self.assertGreater(rule._observation_started_at,
                            int(time.time()) - 5)
+
+
+# --- Consumed rule firing uses history.energy_consumed_in ----------------
+
+class TestConsumedRuleUsesHistory(unittest.TestCase):
+    """Verifies that consumed-rule evaluation reads from
+    ``history.energy_consumed_in`` (the plug's authoritative
+    aenergy.total counter) — not from any in-memory apower
+    integration. Burst-mode loads (espresso, kettles) draw power in
+    sub-second pulses that trapezoidal-on-apower-samples
+    overestimates by 3–4×; the aenergy counter integrates at
+    hardware rate and gets it right."""
+
+    def _setup(self, consumed_wh, earliest_offset=0):
+        from tests._fixtures import _FakeHistory
+        h = _FakeHistory()
+        h.consumed_wh = consumed_wh
+        h.consumed_earliest_offset = earliest_offset
+        twin, calls, _ = _build_twin(history=h)
+        # Pre-seed output=True so the on_mqtt below is NOT a F→T edge
+        # (which would otherwise reset the off-rule's warmup gate).
+        twin.fields["output"] = True
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(consumed_field="apower",
+                                  consumed_threshold_wh=150.0,
+                                  consumed_window_s=3600),
+            12,
+        )
+        rule = twin.rules[0]
+        # Bypass the post-creation warmup gate so the rule can fire now.
+        rule._consumed_started_at = int(time.time()) - 7200
+        rule._observation_started_at = int(time.time()) - 7200
+        return twin, rule, h, calls
+
+    def test_fires_when_history_below_threshold(self):
+        # Espresso burst pattern: hardware aenergy delta = 104 Wh in 1h
+        # (well under the 150 Wh threshold) — fire.
+        twin, _, _, calls = self._setup(consumed_wh=104.0)
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 3.0}).encode())
+        # Off command published.
+        published_payloads = [p for _t, p in calls["published"]]
+        self.assertIn("off", published_payloads,
+                      f"expected off command, got {calls['published']}")
+
+    def test_does_not_fire_when_history_above_threshold(self):
+        # 200 Wh > 150 Wh threshold — no fire.
+        twin, _, _, calls = self._setup(consumed_wh=200.0)
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 3.0}).encode())
+        self.assertEqual(calls["published"], [])
+
+    def test_does_not_fire_with_partial_history(self):
+        # earliest_offset > 0 means history doesn't extend back to
+        # window start — refuse to fire (we'd be comparing a partial-
+        # window delta against a full-window threshold).
+        twin, _, _, calls = self._setup(consumed_wh=10.0, earliest_offset=600)
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 3.0}).encode())
+        self.assertEqual(calls["published"], [])
+
+    def test_does_not_fire_during_warmup(self):
+        # Freshly-created rule: _consumed_started_at = now → must wait
+        # one full window before being eligible to fire.
+        twin, rule, _, calls = self._setup(consumed_wh=10.0)
+        rule._consumed_started_at = int(time.time())  # just created
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 3.0}).encode())
+        self.assertEqual(calls["published"], [])
+
+    def test_does_not_fire_when_history_is_none(self):
+        # Bot configured without history → consumed rules are inert
+        # (can't ground-truth without the plug's counter).
+        twin, calls, _ = _build_twin(history=None)
+        twin.fields["output"] = True
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(consumed_field="apower",
+                                  consumed_threshold_wh=150.0,
+                                  consumed_window_s=3600),
+            12,
+        )
+        rule = twin.rules[0]
+        rule._consumed_started_at = int(time.time()) - 7200
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 3.0}).encode())
+        self.assertEqual(calls["published"], [])
 
 
 # --- Resettable counter ---------------------------------------------------

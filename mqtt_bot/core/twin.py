@@ -398,20 +398,21 @@ class PlugTwin:
         with self._lock:
             fields = dict(self.fields)
             last_update_ts = self.last_update_ts
-            # Snapshot rules and enrich consumed entries with the current
-            # observed Wh (computed from the rule's _samples deque while
-            # we hold the lock — same locking invariant that protects
-            # _eval_consumed).
+            # Snapshot rules and stage post-lock enrichment work. Both
+            # consumed (current_wh) and idle (current_max_w) read from
+            # history; we keep history I/O outside our lock to avoid
+            # nested-lock weirdness.
             scheduled = []
+            consumed_rules_pending: list[tuple[dict, int, int]] = []  # (snap, window_s, observation_started_at)
             idle_rules_pending: list[tuple[dict, int, int]] = []  # (snap, duration_s, actual_window_s)
             for j in self.rules:
                 snap = j.to_snapshot()
                 if j.has_consumed():
-                    cutoff = now_ts - j.consumed_window_s
-                    wh = rules_mod.integrate_wh(j._samples, cutoff, now_ts)
-                    snap["consumed"]["current_wh"] = float(wh)
                     snap["consumed"]["current_window_s"] = _actual_window(
                         j, j.consumed_window_s,
+                    )
+                    consumed_rules_pending.append(
+                        (snap, j.consumed_window_s, j._observation_started_at),
                     )
                 if j.has_idle():
                     actual_window_s = _actual_window(j, j.idle_duration_s)
@@ -420,10 +421,25 @@ class PlugTwin:
                         (snap, j.idle_duration_s),
                     )
                 scheduled.append(snap)
-        # Outside the lock: idle rules need a samples_raw query for the
-        # peak in their window. History has its own lock; keep it
-        # outside ours to avoid nested-lock weirdness.
+        # Outside the lock: every read goes through `history`, which has
+        # its own lock. Keep it outside ours to avoid nested-lock
+        # weirdness.
         if self.deps.history is not None:
+            # Consumed: current_wh = aenergy delta from the plug's own
+            # cumulative counter over [now-window, now] (or since the
+            # rule's observation started, whichever is shorter — the
+            # plug's counter integrates at hardware rate so this is
+            # right even for sub-second burst loads).
+            for snap, window_s, obs_start in consumed_rules_pending:
+                since = now_ts - window_s
+                if obs_start > 0 and obs_start > since:
+                    since = obs_start
+                wh, earliest = self.deps.history.energy_consumed_in(
+                    self.name, since, now_ts,
+                )
+                if earliest is not None:
+                    snap["consumed"]["current_wh"] = float(wh)
+            # Idle: peak apower over the rule's window from samples_raw.
             for snap, duration_s in idle_rules_pending:
                 rows = self.deps.history.query_samples_raw(
                     self.name, now_ts - duration_s, now_ts,
@@ -573,22 +589,20 @@ class PlugTwin:
     def _tick_state_rules(self, fields: dict[str, Any], now: int) -> bool:
         """Evaluate idle and consumed rules after every state update.
         Mirrors what scheduler.tick used to do. Mutates job's transient
-        bookkeeping (`_below_since`, `_samples`, `_consumed_started_at`)
-        and the rules list (one-shot rules that fire are dropped).
+        bookkeeping (`_below_since`, `_consumed_started_at`) and the
+        rules list (one-shot rules that fire are dropped).
 
         Locking invariant
         -----------------
-        Transient per-job state — `_below_since`, `_samples`,
-        `_consumed_started_at` — is owned by `self._lock`. Both
-        `_eval_idle` and `_eval_consumed` MUST be called while
-        holding it, and `integrate_wh` MUST stay inside the lock
-        even though it's a pure function: another thread (DC
-        handler, sweeper) could otherwise prepend to `_samples`
-        between the cutoff trim and the integral, producing a
-        wrong Wh number. If you're tempted to release the lock
-        for a "perf win" — don't.
+        Transient per-job state — `_below_since`,
+        `_consumed_started_at` — is owned by `self._lock`. `_eval_idle`
+        runs inside the lock (purely transient bookkeeping). Consumed
+        evaluation reads from `history`, which has its own lock; we
+        run consumed eval OUTSIDE our lock to avoid nested-lock
+        weirdness, then briefly retake the lock to drop fired one-shots.
         """
         fires: list[tuple[rules_mod.ScheduledJob, str, dict[str, Any]]] = []
+        consumed_pending: list[rules_mod.ScheduledJob] = []
         mutated = False
         survivors: list[rules_mod.ScheduledJob] = []
         with self._lock:
@@ -598,28 +612,37 @@ class PlugTwin:
                 # while the device is already in the rule's target state.
                 if rules_mod._job_dormant(job, output):
                     job._below_since = None
-                    if job._samples:
-                        job._samples.clear()
                     job._consumed_started_at = now
                     survivors.append(job)
                     continue
                 # Grace period for rules just loaded from rules.json:
                 # don't fire on the first tick after restart even if
-                # rehydrated history already satisfies the condition.
+                # history already satisfies the condition.
                 if job.in_grace(now):
                     survivors.append(job)
                     continue
                 fired = False
                 if job.has_idle():
                     fired = self._eval_idle(job, fields, now, fires)
-                if not fired and job.has_consumed():
-                    fired = self._eval_consumed(job, fields, now, fires)
                 if fired and job.once:
                     mutated = True
                     continue  # drop one-shot fired job
+                if not fired and job.has_consumed():
+                    consumed_pending.append(job)
                 survivors.append(job)
             if len(survivors) != len(self.rules):
                 self.rules = survivors
+
+        # Consumed evaluation runs OUTSIDE the lock — it touches history.
+        consumed_dropped: set[int] = set()
+        for job in consumed_pending:
+            if self._eval_consumed(job, now, fires) and job.once:
+                consumed_dropped.add(id(job))
+        if consumed_dropped:
+            with self._lock:
+                self.rules = [j for j in self.rules
+                              if id(j) not in consumed_dropped]
+            mutated = True
 
         for job, mode, ctx in fires:
             self._fire_rule(job, mode, ctx)
@@ -643,7 +666,6 @@ class PlugTwin:
                 if job.has_idle():
                     job._below_since = None
                 if job.has_consumed():
-                    job._samples.clear()
                     job._consumed_started_at = now
                 if job.has_idle() or job.has_consumed():
                     job._observation_started_at = now
@@ -671,16 +693,32 @@ class PlugTwin:
             job._below_since = None
         return False
 
-    def _eval_consumed(self, job, fields, now, fires) -> bool:
-        v = fields.get(job.consumed_field)
-        if isinstance(v, (int, float)):
-            job._samples.append((now, float(v)))
-        cutoff = now - job.consumed_window_s
-        while job._samples and job._samples[0][0] < cutoff:
-            job._samples.popleft()
+    def _eval_consumed(self, job, now, fires) -> bool:
+        """Energy-window rule eval. Reads `history.energy_consumed_in`
+        — the plug's authoritative aenergy.total counter delta over
+        the window, integrated by the plug at hardware rate. Called
+        OUTSIDE self._lock (history has its own).
+
+        Two gates protect against firing on insufficient data:
+        - `_consumed_started_at` window-warmup: a freshly-created or
+          just-reset rule must observe for one full window before it
+          can fire (so prior history that predates rule creation
+          can't satisfy the threshold).
+        - `earliest_ts` coverage: history must extend back to (or
+          before) the window start. Otherwise we'd compute a delta
+          over a partial window that isn't comparable to the
+          threshold.
+        """
+        if self.deps.history is None:
+            return False
         if now - job._consumed_started_at < job.consumed_window_s:
             return False
-        wh = rules_mod.integrate_wh(job._samples, cutoff, now)
+        since = now - job.consumed_window_s
+        wh, earliest = self.deps.history.energy_consumed_in(
+            self.name, since, now,
+        )
+        if earliest is None or earliest > since:
+            return False  # insufficient history coverage
         if wh < job.consumed_threshold_wh:
             fires.append((job, "consumed", {
                 "value": float(wh),
@@ -689,8 +727,8 @@ class PlugTwin:
                 "window_human": durations.format(job.consumed_window_s),
                 "field": job.consumed_field,
             }))
-            job._samples.clear()
-            job._consumed_started_at = now
+            with self._lock:
+                job._consumed_started_at = now
             return True
         return False
 
