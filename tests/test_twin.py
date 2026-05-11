@@ -522,31 +522,40 @@ class TestConsumedRuleUsesHistory(unittest.TestCase):
         self.assertEqual(calls["published"], [])
 
 
-# --- Avg rule firing (mean apower over a window below threshold) ----------
+# --- Avg rule firing (max of 1-minute averages over a window) -------------
 
 class TestAvgRuleUsesHistory(unittest.TestCase):
     """Verifies that avg-rule evaluation reads from
-    ``history.query_samples_raw`` and fires when the window MEAN is
-    below threshold. Cycling-load case: bursts above threshold are
-    expected and the average is what matters."""
+    ``history.query_power_raw`` (per-minute averages) and fires when
+    MAX(avg_apower_w) over the window is below threshold — i.e. no
+    1-minute average breached the threshold. Designed to catch
+    minuscule events on cycling loads (e.g. one espresso) where the
+    hour-long mean is essentially unchanged but a single minute's
+    average spikes."""
 
-    def _setup(self, sample_apowers, window_s=600, threshold_w=5.0,
+    def _setup(self, minute_avgs, window_s=3600, threshold_w=500.0,
                coverage="full"):
-        """Build a twin whose history returns rows with the given
-        apower values evenly spaced across the window. coverage="full"
-        ⇒ first row at exactly `since`; "partial" ⇒ first row half a
-        window in (rule must refuse to fire)."""
+        """Build a twin whose history returns ``len(minute_avgs)``
+        per-minute rows evenly spaced over the window. coverage="full"
+        ⇒ enough rows to satisfy the 90% coverage gate; "sparse" ⇒
+        only enough rows for ~50% coverage (must refuse to fire)."""
         from tests._fixtures import _FakeHistory
         now = int(time.time())
-        since = now - window_s
-        first = since if coverage == "full" else since + window_s // 2
         h = _FakeHistory()
-        if sample_apowers:
-            step = max(1, (now - first) // max(1, len(sample_apowers) - 1))
-            h.samples_raw_rows = [
-                (first + i * step, float(w), 230.0, 0.0, 50.0, 0.0, 1, 25.0)
-                for i, w in enumerate(sample_apowers)
-            ]
+        expected = max(1, window_s // 60)
+        if coverage == "full":
+            count = expected
+        else:  # sparse — half the expected buckets
+            count = max(1, expected // 2)
+        # Lay out `count` rows of `avg` values picked from minute_avgs
+        # (repeated/truncated as needed) evenly across the window.
+        step = max(1, window_s // count)
+        rows = []
+        for i in range(count):
+            ts = now - window_s + i * step
+            w = float(minute_avgs[i % len(minute_avgs)])
+            rows.append((ts, w, 1, 4))  # (ts, avg_apower_w, output, sample_count)
+        h.power_minute_rows = rows
         twin, calls, _ = _build_twin(history=h)
         twin.fields["output"] = True  # not dormant; not a F→T edge
         twin.schedule(
@@ -562,37 +571,42 @@ class TestAvgRuleUsesHistory(unittest.TestCase):
         rule._observation_started_at = now - window_s - 1
         return twin, rule, h, calls
 
-    def test_fires_when_mean_below_threshold(self):
-        # Cycling load: 1, 1, 1, 30 W samples → mean = 8.25 W > 5 W
-        # but with a 4 W threshold (mean 8.25 ≥ 4) it should NOT fire.
-        # Use 1, 1, 1, 1, 12 → mean = 3.2 W < 5 W threshold.
-        twin, _, _, calls = self._setup([1.0, 1.0, 1.0, 1.0, 12.0])
+    def test_fires_when_every_minute_below_threshold(self):
+        # All minute averages at 470W, threshold 500W → max = 470 < 500
+        # → fire. Matches "espresso machine idle duty cycle, no shots
+        # drawn in the last hour".
+        twin, _, _, calls = self._setup([470.0])
         twin.on_mqtt("status/switch:0",
-                     json.dumps({"output": True, "apower": 12.0}).encode())
+                     json.dumps({"output": True, "apower": 470.0}).encode())
         published_payloads = [p for _t, p in calls["published"]]
         self.assertIn("off", published_payloads,
                       f"expected off command, got {calls['published']}")
 
-    def test_does_not_fire_when_mean_at_or_above_threshold(self):
-        # Mean = 6 W ≥ 5 W threshold → no fire (strict <).
-        twin, _, _, calls = self._setup([6.0, 6.0, 6.0])
+    def test_does_not_fire_when_any_minute_above_threshold(self):
+        # 59 minutes at 470W + 1 minute at 650W (an espresso shot).
+        # Hour mean is ~473W (still below 500W threshold) but max
+        # 1-min avg is 650W ≥ 500W → no fire.
+        avgs = [470.0] * 59 + [650.0]
+        twin, _, _, calls = self._setup(avgs)
         twin.on_mqtt("status/switch:0",
-                     json.dumps({"output": True, "apower": 6.0}).encode())
+                     json.dumps({"output": True, "apower": 470.0}).encode())
         self.assertEqual(calls["published"], [])
 
     def test_does_not_fire_during_warmup(self):
         # Freshly-created rule: _avg_started_at = now → must wait one
         # full window before being eligible to fire.
-        twin, rule, _, calls = self._setup([1.0, 1.0, 1.0])
+        twin, rule, _, calls = self._setup([1.0])
         rule._avg_started_at = int(time.time())  # just created
         twin.on_mqtt("status/switch:0",
                      json.dumps({"output": True, "apower": 1.0}).encode())
         self.assertEqual(calls["published"], [])
 
-    def test_does_not_fire_with_partial_history(self):
-        # earliest_ts > since → can't compare partial-window mean to
-        # full-window threshold; refuse to fire.
-        twin, _, _, calls = self._setup([1.0, 1.0, 1.0], coverage="partial")
+    def test_does_not_fire_with_sparse_coverage(self):
+        # < 90% of expected minute buckets present → can't trust that
+        # every minute was below threshold (plug was offline for too
+        # much of the window). Refuse to fire even if the max of the
+        # present buckets is below threshold.
+        twin, _, _, calls = self._setup([1.0], coverage="sparse")
         twin.on_mqtt("status/switch:0",
                      json.dumps({"output": True, "apower": 1.0}).encode())
         self.assertEqual(calls["published"], [])
@@ -635,16 +649,16 @@ class TestAvgRuleUsesHistory(unittest.TestCase):
         self.assertGreater(rule._avg_started_at, long_ago)
         self.assertGreater(rule._observation_started_at, long_ago)
 
-    def test_to_dict_includes_avg_current_avg_w(self):
-        # Snapshot enrichment: avg rule gets current_avg_w from
-        # history.query_samples_raw over the live window.
-        twin, _, _, _ = self._setup([1.0, 2.0, 3.0, 4.0])
+    def test_to_dict_includes_current_max_minute_avg_w(self):
+        # Snapshot enrichment: avg rule gets current_max_minute_avg_w
+        # from history.query_power_raw over the live window.
+        twin, _, _, _ = self._setup([300.0, 400.0, 650.0, 400.0])
         out = twin.to_dict()
         sched_jobs = out["scheduled_jobs"]
         self.assertEqual(len(sched_jobs), 1)
         avg = sched_jobs[0]["avg"]
-        self.assertIn("current_avg_w", avg)
-        self.assertAlmostEqual(avg["current_avg_w"], 2.5, places=2)
+        self.assertIn("current_max_minute_avg_w", avg)
+        self.assertAlmostEqual(avg["current_max_minute_avg_w"], 650.0, places=2)
         # Window field is in minutes at the boundary.
         self.assertIn("window_minutes", avg)
         self.assertIn("current_window_minutes", avg)

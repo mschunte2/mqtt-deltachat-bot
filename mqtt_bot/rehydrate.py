@@ -17,9 +17,10 @@ the live evaluator catches, which would falsely satisfy the
 first sample after restart. This was the v0.2.3 bug; rehydrate
 uses raw samples to match the live evaluator's semantics.
 
-Avg rules: same raw-sample read, but the live evaluator checks the
-*mean* (not every-sample) so we stamp ``_avg_started_at`` once the
-window's mean is below threshold and history covers the full window.
+Avg rules: read per-minute averages from ``power_minute`` and stamp
+``_avg_started_at`` once MAX(avg_apower_w) over the window is below
+threshold AND at least 90% of the expected minute buckets are
+present. Matches the live evaluator's max-of-1min-averages semantics.
 """
 
 from __future__ import annotations
@@ -54,17 +55,18 @@ def rehydrate_rules_from_history(registry, history) -> None:
                              len(raw_rows))
             if job.has_avg() and job.avg_field == "apower":
                 since = now - job.avg_window_s
-                raw_rows = history.query_samples_raw(twin.name, since, now)
-                vals = [r[1] for r in raw_rows
-                        if r[1] is not None] if raw_rows else []
-                if (raw_rows and raw_rows[0][0] <= since and vals
-                        and (sum(vals) / len(vals)) < job.avg_threshold_w):
+                minute_rows = history.query_power_raw(twin.name, since, now)
+                vals = [r[1] for r in minute_rows
+                        if r[1] is not None] if minute_rows else []
+                expected = max(1, job.avg_window_s // 60)
+                if (vals and len(vals) >= expected * 0.9
+                        and max(vals) < job.avg_threshold_w):
                     # Stamp at the window start so the warmup gate is
                     # already satisfied — the rule is immediately
                     # eligible to fire on the next state update.
                     job._avg_started_at = since
-                    log.info("rehydrated avg rule %s/%s — mean "
-                             "%.1fW < %.1fW over %ds (%d raw samples)",
+                    log.info("rehydrated avg rule %s/%s — max 1-min "
+                             "avg %.1fW < %.1fW over %ds (%d minute buckets)",
                              twin.name, job.rule_id,
-                             sum(vals) / len(vals), job.avg_threshold_w,
-                             job.avg_window_s, len(raw_rows))
+                             max(vals), job.avg_threshold_w,
+                             job.avg_window_s, len(minute_rows))

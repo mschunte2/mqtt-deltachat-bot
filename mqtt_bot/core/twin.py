@@ -457,22 +457,19 @@ class PlugTwin:
                 vals = [r[1] for r in rows if r[1] is not None]
                 if vals:
                     snap["idle"]["current_max_w"] = float(max(vals))
-            # Avg: live mean apower over the rule's actual observation
-            # window. Mirrors consumed/current_wh: the eval reads from
-            # samples_raw with the same windowing, so the user sees what
-            # the rule sees.
+            # Avg: live max of 1-minute averages over the rule's actual
+            # observation window. Mirrors the eval: same query, same
+            # aggregation, so the user sees the number the rule sees.
             for snap, window_s, obs_start in avg_rules_pending:
                 since = now_ts - window_s
                 if obs_start > 0 and obs_start > since:
                     since = obs_start
-                rows = self.deps.history.query_samples_raw(
+                rows = self.deps.history.query_power_raw(
                     self.name, since, now_ts,
                 )
                 vals = [r[1] for r in rows if r[1] is not None]
                 if vals:
-                    snap["avg"]["current_avg_w"] = float(
-                        sum(vals) / len(vals)
-                    )
+                    snap["avg"]["current_max_minute_avg_w"] = float(max(vals))
         params = dict(self.cfg.params)
         params.update(self.param_overrides)
         payload: dict[str, Any] = {
@@ -729,15 +726,20 @@ class PlugTwin:
         return False
 
     def _eval_avg(self, job, now, fires) -> bool:
-        """Average-power-below-threshold rule eval. Reads samples_raw
-        for [now - avg_window_s, now], computes the mean apower, and
-        fires when mean < avg_threshold_w. Same two gates as consumed:
+        """Max-of-1min-averages rule eval. Reads per-minute averages
+        from `power_minute` for [now - avg_window_s, now] and fires
+        when MAX(avg_apower_w) < avg_threshold_w — i.e. *every*
+        1-minute average in the window stayed below threshold.
 
+        Two gates:
         - `_avg_started_at` window-warmup: a freshly-created or just-
           reset rule must observe for one full window before it can
           fire (so prior history can't insta-satisfy).
-        - `earliest_ts` coverage: history must extend back to (or
-          before) the window start.
+        - Coverage: require ≥ 90% of the expected minute buckets to
+          be present. `power_minute` only has rows for minutes that
+          received at least one sample, so big offline gaps would
+          otherwise let a partial-window MAX satisfy the threshold
+          even though we don't know what the plug did while offline.
 
         Called OUTSIDE self._lock (history has its own).
         """
@@ -746,18 +748,17 @@ class PlugTwin:
         if now - job._avg_started_at < job.avg_window_s:
             return False
         since = now - job.avg_window_s
-        rows = self.deps.history.query_samples_raw(self.name, since, now)
-        if not rows:
-            return False
-        if rows[0][0] > since:
-            return False  # insufficient history coverage
+        rows = self.deps.history.query_power_raw(self.name, since, now)
         vals = [r[1] for r in rows if r[1] is not None]
         if not vals:
             return False
-        mean_w = sum(vals) / len(vals)
-        if mean_w < job.avg_threshold_w:
+        expected = max(1, job.avg_window_s // 60)
+        if len(vals) < expected * 0.9:
+            return False  # too many offline minutes
+        max_min_avg = max(vals)
+        if max_min_avg < job.avg_threshold_w:
             fires.append((job, "avg", {
-                "value": float(mean_w),
+                "value": float(max_min_avg),
                 "threshold": float(job.avg_threshold_w),
                 "seconds": job.avg_window_s,
                 "duration_human": durations.format(job.avg_window_s),
@@ -938,6 +939,6 @@ def _rule_clauses(job: rules_mod.ScheduledJob) -> list[str]:
         out.append(f"when used<{job.consumed_threshold_wh:g}Wh "
                    f"in {durations.format(job.consumed_window_s)}")
     if job.has_avg():
-        out.append(f"when avg<{job.avg_threshold_w:g}W "
+        out.append(f"when max-1min-avg<{job.avg_threshold_w:g}W "
                    f"in {durations.format(job.avg_window_s)}")
     return out

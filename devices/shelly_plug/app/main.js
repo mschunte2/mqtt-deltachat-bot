@@ -495,9 +495,9 @@ function currentObservedText(j) {
     const wm = j.consumed.current_window_minutes ?? j.consumed.window_minutes;
     parts.push(`${j.consumed.current_wh.toFixed(2)}Wh in ${fmtMins(wm)}`);
   }
-  if (j.avg && typeof j.avg.current_avg_w === 'number') {
+  if (j.avg && typeof j.avg.current_max_minute_avg_w === 'number') {
     const wm = j.avg.current_window_minutes ?? j.avg.window_minutes;
-    parts.push(`avg ${j.avg.current_avg_w.toFixed(1)}W in ${fmtMins(wm)}`);
+    parts.push(`max 1-min ${j.avg.current_max_minute_avg_w.toFixed(1)}W in ${fmtMins(wm)}`);
   }
   return parts.join(' · ');
 }
@@ -525,7 +525,7 @@ function describeRule(j) {
              + `${fmtMins(j.consumed.window_minutes)}`);
   }
   if (j.avg) {
-    parts.push(`when avg < ${j.avg.threshold_w}W in `
+    parts.push(`when max 1-min avg < ${j.avg.threshold_w}W in `
              + `${fmtMins(j.avg.window_minutes)}`);
   }
   let s = parts.join(' or ') || '(empty)';

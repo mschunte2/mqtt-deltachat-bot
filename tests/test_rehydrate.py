@@ -60,24 +60,28 @@ class TestRehydrateIdle(unittest.TestCase):
 
 
 class TestRehydrateAvg(unittest.TestCase):
-    def test_avg_rehydrated_when_mean_below_and_coverage_full(self):
+    def _set_minute_rows(self, h, since, count, avg_values):
+        """Populate ``count`` per-minute rows starting at ``since``
+        with apower values pulled from ``avg_values`` (cycled)."""
+        h.power_minute_rows = [
+            (since + i * 60, float(avg_values[i % len(avg_values)]), 1, 4)
+            for i in range(count)
+        ]
+
+    def test_avg_rehydrated_when_max_min_avg_below_and_coverage_full(self):
         h = _FakeHistory()
         now = int(time.time())
-        since = now - 600
-        # Cycling load: 1, 1, 1, 12 → mean = 3.75 W < 5 W threshold.
-        # Coverage: first sample at exactly `since`.
-        vals = [1.0, 1.0, 1.0, 12.0]
-        h.samples_raw_rows = [
-            (since + (i * 600) // (len(vals) - 1),
-             v, 230.0, 0.0, 50.0, 0.0, 1, 25.0)
-            for i, v in enumerate(vals)
-        ]
+        window_s = 600
+        since = now - window_s
+        # 10 minute buckets, all at 3 W → max = 3 W < 5 W threshold.
+        # Full coverage (10/10 expected).
+        self._set_minute_rows(h, since, 10, [3.0])
         twin, _, _ = _build_twin(history=h)
         twin.schedule(
             "off",
             sched.ScheduledPolicy(avg_field="apower",
                                   avg_threshold_w=5.0,
-                                  avg_window_s=600),
+                                  avg_window_s=window_s),
             12,
         )
         # Wipe the just-stamped _avg_started_at so we can verify
@@ -89,20 +93,21 @@ class TestRehydrateAvg(unittest.TestCase):
         # rule is immediately eligible on the next state update.
         self.assertLessEqual(twin.rules[0]._avg_started_at, since)
 
-    def test_avg_not_rehydrated_when_mean_above_threshold(self):
+    def test_avg_not_rehydrated_when_any_minute_above_threshold(self):
         h = _FakeHistory()
         now = int(time.time())
-        since = now - 600
-        h.samples_raw_rows = [
-            (since + i, 10.0, 230.0, 0.0, 50.0, 0.0, 1, 25.0)
-            for i in range(0, 600, 30)
-        ]
+        window_s = 600
+        since = now - window_s
+        # 9 minutes at 3 W + 1 minute at 10 W → max = 10 W ≥ 5 W.
+        # The hour mean is below threshold but the max-of-1min-avgs
+        # is not, so the rule must NOT be rehydrated.
+        self._set_minute_rows(h, since, 10, [3.0] * 9 + [10.0])
         twin, _, _ = _build_twin(history=h)
         twin.schedule(
             "off",
             sched.ScheduledPolicy(avg_field="apower",
                                   avg_threshold_w=5.0,
-                                  avg_window_s=600),
+                                  avg_window_s=window_s),
             12,
         )
         twin.rules[0]._avg_started_at = 0
@@ -112,19 +117,17 @@ class TestRehydrateAvg(unittest.TestCase):
     def test_avg_not_rehydrated_without_full_coverage(self):
         h = _FakeHistory()
         now = int(time.time())
-        since = now - 600
-        # First sample arrives 200 s after `since` → partial window,
-        # no rehydration even if the mean would qualify.
-        h.samples_raw_rows = [
-            (since + 200 + i, 1.0, 230.0, 0.0, 50.0, 0.0, 1, 25.0)
-            for i in range(0, 400, 30)
-        ]
+        window_s = 600
+        since = now - window_s
+        # Only 5 of 10 expected minute buckets present → < 90% coverage,
+        # no rehydration even if max-of-present is below threshold.
+        self._set_minute_rows(h, since, 5, [1.0])
         twin, _, _ = _build_twin(history=h)
         twin.schedule(
             "off",
             sched.ScheduledPolicy(avg_field="apower",
                                   avg_threshold_w=5.0,
-                                  avg_window_s=600),
+                                  avg_window_s=window_s),
             12,
         )
         twin.rules[0]._avg_started_at = 0

@@ -136,9 +136,16 @@ class _FakeHistory:
         self.consumed_wh: float = 0.0
         self.consumed_earliest_offset: int | None = None  # None → no data
         self.samples_raw_rows: list = []
+        # power_minute rows: list of (ts, avg_apower_w, output, sample_count).
+        # Used by the avg rule (max of 1-minute averages over the window).
+        self.power_minute_rows: list = []
 
     def query_power(self, *_a, **_kw):
         return (60, [])
+
+    def query_power_raw(self, _device, since_ts, until_ts):
+        return [r for r in self.power_minute_rows
+                if since_ts <= r[0] < until_ts]
 
     def daily_energy_kwh(self, *_a, **kw):
         return [(0, 0.0)] * int(kw.get("days", 30))
