@@ -66,6 +66,9 @@ class AutoOffConfig:
     default_consumed_field: str
     default_consumed_threshold_wh: float
     default_consumed_window_s: int
+    default_avg_field: str
+    default_avg_threshold_w: float
+    default_avg_window_s: int
     trigger_messages: dict[str, str]
 
 
@@ -298,7 +301,7 @@ def _parse_auto_off(cls: str, raw: Any, commands: dict[str, Command]) -> AutoOff
     msgs = raw.get("trigger_messages") or {}
     if not isinstance(msgs, dict):
         raise ConfigError(f"{cls}.auto_off.trigger_messages must be object")
-    required = {"timer", "tod", "idle", "consumed"}
+    required = {"timer", "tod", "idle", "consumed", "avg"}
     missing = required - set(msgs.keys())
     if missing:
         raise ConfigError(f"{cls}.auto_off.trigger_messages missing: {sorted(missing)}")
@@ -310,6 +313,9 @@ def _parse_auto_off(cls: str, raw: Any, commands: dict[str, Command]) -> AutoOff
         default_consumed_field=str(raw.get("default_consumed_field", "apower")),
         default_consumed_threshold_wh=float(raw.get("default_consumed_threshold_wh", 5)),
         default_consumed_window_s=int(raw.get("default_consumed_window_s", 600)),
+        default_avg_field=str(raw.get("default_avg_field", "apower")),
+        default_avg_threshold_w=float(raw.get("default_avg_threshold_w", 5)),
+        default_avg_window_s=int(raw.get("default_avg_window_s", 600)),
         trigger_messages=dict(msgs),
     )
 

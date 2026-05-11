@@ -58,9 +58,13 @@ CLASS_JSON_OK = {
         "default_consumed_field": "apower",
         "default_consumed_threshold_wh": 5.0,
         "default_consumed_window_s": 600,
+        "default_avg_field": "apower",
+        "default_avg_threshold_w": 5.0,
+        "default_avg_window_s": 600,
         "trigger_messages": {
             "timer": "🕐 {name} timer", "tod": "📅 {name} {hh}:{mm}",
             "idle": "💤 {name} idle", "consumed": "🔋 {name} consumed",
+            "avg": "📉 {name} avg {value:.1f}W",
         },
     },
     "auto_on": {

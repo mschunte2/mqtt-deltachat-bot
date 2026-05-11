@@ -489,11 +489,16 @@ def _schedule_from_app(chat_id: int, device_name: str, action: str,
 
 
 def _policy_from_app(raw: dict, section) -> rules_mod.ScheduledPolicy:
-    """Build a ScheduledPolicy from a webxdc app payload subobject."""
+    """Build a ScheduledPolicy from a webxdc app payload subobject.
+
+    The app speaks **minutes** at this boundary; we convert to seconds
+    once here and feed the engine its native unit downstream.
+    """
     defaults = _defaults_from_section(section)
     policy = rules_mod.ScheduledPolicy()
-    if isinstance(raw.get("timer_seconds"), (int, float)) and raw["timer_seconds"] > 0:
-        policy.timer_seconds = int(raw["timer_seconds"])
+    timer_m = raw.get("timer_minutes")
+    if isinstance(timer_m, (int, float)) and timer_m > 0:
+        policy.timer_seconds = int(round(float(timer_m) * 60))
     tod = raw.get("time_of_day")
     if isinstance(tod, list) and len(tod) == 2:
         h, m = int(tod[0]), int(tod[1])
@@ -504,14 +509,31 @@ def _policy_from_app(raw: dict, section) -> rules_mod.ScheduledPolicy:
     if isinstance(idle, dict):
         policy.idle_field = str(idle.get("field", defaults.idle_field))
         policy.idle_threshold = float(idle.get("threshold", defaults.idle_threshold))
-        policy.idle_duration_s = int(idle.get("duration_s", defaults.idle_duration_s))
+        idle_m = idle.get("duration_minutes")
+        if isinstance(idle_m, (int, float)):
+            policy.idle_duration_s = int(round(float(idle_m) * 60))
+        else:
+            policy.idle_duration_s = defaults.idle_duration_s
     consumed = raw.get("consumed")
     if isinstance(consumed, dict):
         policy.consumed_field = str(consumed.get("field", defaults.consumed_field))
         policy.consumed_threshold_wh = float(consumed.get(
             "threshold_wh", defaults.consumed_threshold_wh))
-        policy.consumed_window_s = int(consumed.get(
-            "window_s", defaults.consumed_window_s))
+        cons_m = consumed.get("window_minutes")
+        if isinstance(cons_m, (int, float)):
+            policy.consumed_window_s = int(round(float(cons_m) * 60))
+        else:
+            policy.consumed_window_s = defaults.consumed_window_s
+    avg = raw.get("avg")
+    if isinstance(avg, dict):
+        policy.avg_field = str(avg.get("field", defaults.avg_field))
+        policy.avg_threshold_w = float(avg.get(
+            "threshold_w", defaults.avg_threshold_w))
+        avg_m = avg.get("window_minutes")
+        if isinstance(avg_m, (int, float)):
+            policy.avg_window_s = int(round(float(avg_m) * 60))
+        else:
+            policy.avg_window_s = defaults.avg_window_s
     if raw.get("once") is True:
         policy.once = True
     if policy.is_empty():
@@ -528,6 +550,9 @@ def _defaults_from_section(section) -> rules_mod.PolicyDefaults:
             consumed_field=section.default_consumed_field,
             consumed_threshold_wh=section.default_consumed_threshold_wh,
             consumed_window_s=section.default_consumed_window_s,
+            avg_field=section.default_avg_field,
+            avg_threshold_w=section.default_avg_threshold_w,
+            avg_window_s=section.default_avg_window_s,
         )
     return rules_mod.PolicyDefaults()
 

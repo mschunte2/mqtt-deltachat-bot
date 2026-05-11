@@ -62,6 +62,9 @@ class PolicyDefaults:
     consumed_field: str = "apower"
     consumed_threshold_wh: float = 5.0
     consumed_window_s: int = 600
+    avg_field: str = "apower"
+    avg_threshold_w: float = 5.0
+    avg_window_s: int = 600
 
 
 @dataclass
@@ -78,6 +81,15 @@ class ScheduledPolicy:
     consumed_threshold_wh: float | None = None
     consumed_window_s: int | None = None
 
+    # avg: fire when MEAN apower over the last avg_window_s is strictly
+    # below avg_threshold_w. Distinct from `idle` (which requires
+    # *every* sample below threshold) — fits cycling loads where
+    # bursts above the threshold are expected and the average is
+    # what really matters.
+    avg_field: str | None = None
+    avg_threshold_w: float | None = None
+    avg_window_s: int | None = None
+
     # If True, the rule self-deletes on first fire. If False the rule
     # re-arms and keeps firing until cancelled (default since v0.1.5).
     once: bool = False
@@ -86,7 +98,8 @@ class ScheduledPolicy:
         return (self.timer_seconds is None
                 and self.time_of_day is None
                 and self.idle_field is None
-                and self.consumed_field is None)
+                and self.consumed_field is None
+                and self.avg_field is None)
 
 
 @dataclass
@@ -120,6 +133,12 @@ class ScheduledJob:
     consumed_threshold_wh: float | None = None
     consumed_window_s: int | None = None
     _consumed_started_at: int = 0
+
+    # avg policy (mean apower below threshold over a window).
+    avg_field: str | None = None
+    avg_threshold_w: float | None = None
+    avg_window_s: int | None = None
+    _avg_started_at: int = 0
 
     # When the rule's idle/consumed observation window started (or
     # was last reset by manual-toggle). Used by snapshot to render
@@ -170,8 +189,13 @@ class ScheduledJob:
             consumed_threshold_wh=policy.consumed_threshold_wh,
             consumed_window_s=policy.consumed_window_s,
             _consumed_started_at=now if policy.consumed_field else 0,
+            avg_field=policy.avg_field,
+            avg_threshold_w=policy.avg_threshold_w,
+            avg_window_s=policy.avg_window_s,
+            _avg_started_at=now if policy.avg_field else 0,
             _observation_started_at=(
-                now if (policy.idle_field or policy.consumed_field) else 0
+                now if (policy.idle_field or policy.consumed_field
+                        or policy.avg_field) else 0
             ),
         )
 
@@ -190,11 +214,14 @@ class ScheduledJob:
     def has_consumed(self) -> bool:
         return self.consumed_field is not None
 
+    def has_avg(self) -> bool:
+        return self.avg_field is not None
+
     def to_dict(self) -> dict[str, Any]:
         """Persistence shape — every non-transient field. Reverse of
         from_dict. Transient state (_below_since,
-        _consumed_started_at, _observation_started_at) is
-        intentionally omitted."""
+        _consumed_started_at, _avg_started_at, _observation_started_at)
+        is intentionally omitted."""
         return {
             "device_name": self.device_name,
             "chat_id_origin": self.chat_id_origin,
@@ -212,6 +239,9 @@ class ScheduledJob:
             "consumed_field": self.consumed_field,
             "consumed_threshold_wh": self.consumed_threshold_wh,
             "consumed_window_s": self.consumed_window_s,
+            "avg_field": self.avg_field,
+            "avg_threshold_w": self.avg_threshold_w,
+            "avg_window_s": self.avg_window_s,
         }
 
     @classmethod
@@ -240,23 +270,37 @@ class ScheduledJob:
             consumed_threshold_wh=d.get("consumed_threshold_wh"),
             consumed_window_s=d.get("consumed_window_s"),
             _consumed_started_at=int(time.time()) if d.get("consumed_field") else 0,
+            avg_field=d.get("avg_field"),
+            avg_threshold_w=d.get("avg_threshold_w"),
+            avg_window_s=d.get("avg_window_s"),
+            _avg_started_at=int(time.time()) if d.get("avg_field") else 0,
         )
 
     def to_snapshot(self) -> dict[str, Any]:
-        """JSON-safe snapshot for the webxdc app (countdowns, indicators)."""
+        """JSON-safe snapshot for the webxdc app (countdowns, indicators).
+
+        Durations are emitted in **minutes** (not seconds) at the app
+        boundary. Internal storage keeps seconds; conversion happens here.
+        """
         return {
             "rule_id": self.rule_id,
             "target_action": self.target_action,
             "deadline_ts": self.deadline_ts,
             "time_of_day": list(self.time_of_day) if self.time_of_day else None,
             "recurring_tod": self.recurring_tod,
-            "timer_seconds": self.timer_seconds,
+            "timer_minutes": _sec_to_min(self.timer_seconds),
             "once": self.once,
             "idle": ({"field": self.idle_field, "threshold": self.idle_threshold,
-                      "duration_s": self.idle_duration_s} if self.has_idle() else None),
+                      "duration_minutes": _sec_to_min(self.idle_duration_s)}
+                     if self.has_idle() else None),
             "consumed": ({"field": self.consumed_field,
                           "threshold_wh": self.consumed_threshold_wh,
-                          "window_s": self.consumed_window_s} if self.has_consumed() else None),
+                          "window_minutes": _sec_to_min(self.consumed_window_s)}
+                         if self.has_consumed() else None),
+            "avg": ({"field": self.avg_field,
+                     "threshold_w": self.avg_threshold_w,
+                     "window_minutes": _sec_to_min(self.avg_window_s)}
+                    if self.has_avg() else None),
         }
 
 
@@ -271,20 +315,38 @@ def _job_dormant(job: "ScheduledJob", output: Any) -> bool:
 
 
 def derive_rule_id(policy: ScheduledPolicy) -> str:
-    """Stable, human-readable id derived from policy contents."""
+    """Stable, human-readable id derived from policy contents.
+
+    Duration suffixes use `durations.format()` (`1m`, `30m`, `1h`,
+    `1h30m`, falling back to `Xs` only for sub-minute durations that
+    can't be expressed cleanly in minutes).
+    """
     parts: list[str] = []
     if policy.timer_seconds is not None:
-        parts.append(f"timer:{policy.timer_seconds}")
+        parts.append(f"timer:{durations.format(policy.timer_seconds)}")
     if policy.time_of_day is not None:
         h, m = policy.time_of_day
         suffix = "d" if policy.recurring_tod else ""
         parts.append(f"tod:{h:02d}{m:02d}{suffix}")
     if policy.idle_field is not None:
-        parts.append(f"idle:{policy.idle_threshold:g}W:{policy.idle_duration_s}s")
+        parts.append(f"idle:{policy.idle_threshold:g}W:"
+                     f"{durations.format(policy.idle_duration_s)}")
     if policy.consumed_field is not None:
         parts.append(f"consumed:{policy.consumed_threshold_wh:g}Wh:"
-                     f"{policy.consumed_window_s}s")
+                     f"{durations.format(policy.consumed_window_s)}")
+    if policy.avg_field is not None:
+        parts.append(f"avg:{policy.avg_threshold_w:g}W:"
+                     f"{durations.format(policy.avg_window_s)}")
     return ",".join(parts) or "empty"
+
+
+def _sec_to_min(seconds: int | None) -> float | None:
+    """Convert seconds → minutes for app-boundary emission. Returns
+    None unchanged. Values are rounded to 2 decimal places to avoid
+    floating-point noise like 0.49999999."""
+    if seconds is None:
+        return None
+    return round(seconds / 60, 2)
 
 
 # --- Time + integration helpers ------------------------------------------
@@ -302,7 +364,7 @@ def next_tod_deadline(h: int, m: int, now: int) -> int:
 
 # --- Parser --------------------------------------------------------------
 
-ALL_POLICY_KINDS = frozenset({"timer", "tod", "idle", "consumed"})
+ALL_POLICY_KINDS = frozenset({"timer", "tod", "idle", "consumed", "avg"})
 
 _TOD_RE = re.compile(
     r"^at\s+(\d{1,2})(?:h(\d{2})?|:(\d{2}))?\s*(daily)?$", re.IGNORECASE
@@ -314,6 +376,13 @@ _IDLE_RE = re.compile(
     r"(?:\s+in)?"                           # optional "in"
     r"\s+(.+?))?"                            # duration (rest)
     r"\s*$",
+    re.IGNORECASE,
+)
+# `avg 5W in 30m` / `avg 5W for 30m` / `if avg 5W in 30m`
+_AVG_RE = re.compile(
+    r"^(?:if\s+|until\s+)?avg"
+    r"\s+(\d+(?:\.\d+)?\s*[a-zA-Z]*)"      # value with optional unit (W expected)
+    r"\s+(?:in|for)\s+(.+?)\s*$",
     re.IGNORECASE,
 )
 _NUM_UNIT_RE = re.compile(r"^([0-9]*\.?[0-9]+)\s*([a-zA-Z]+)?$")
@@ -402,6 +471,19 @@ def _apply(part: str, policy: ScheduledPolicy,
             policy.consumed_window_s = duration
         else:
             raise ValueError(f"expected W/Wh/kWh, got {unit!r}")
+        return
+    if (m := _AVG_RE.match(part)):
+        if "avg" not in allowed:
+            raise ValueError(f"avg not allowed: {part!r}")
+        if policy.avg_field is not None:
+            raise ValueError("avg policy specified twice")
+        val, unit = _value_unit_split(m.group(1))
+        duration = durations.parse(m.group(2))
+        if unit not in {"", "w"}:
+            raise ValueError(f"avg expects watts, got {unit!r}")
+        policy.avg_field = d.avg_field
+        policy.avg_threshold_w = val
+        policy.avg_window_s = duration
         return
     raise ValueError(f"unrecognised schedule part: {part!r}")
 

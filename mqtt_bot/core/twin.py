@@ -405,20 +405,30 @@ class PlugTwin:
             scheduled = []
             consumed_rules_pending: list[tuple[dict, int, int]] = []  # (snap, window_s, observation_started_at)
             idle_rules_pending: list[tuple[dict, int, int]] = []  # (snap, duration_s, actual_window_s)
+            avg_rules_pending: list[tuple[dict, int, int]] = []   # (snap, window_s, observation_started_at)
             for j in self.rules:
                 snap = j.to_snapshot()
                 if j.has_consumed():
-                    snap["consumed"]["current_window_s"] = _actual_window(
-                        j, j.consumed_window_s,
+                    snap["consumed"]["current_window_minutes"] = round(
+                        _actual_window(j, j.consumed_window_s) / 60, 2,
                     )
                     consumed_rules_pending.append(
                         (snap, j.consumed_window_s, j._observation_started_at),
                     )
                 if j.has_idle():
                     actual_window_s = _actual_window(j, j.idle_duration_s)
-                    snap["idle"]["current_window_s"] = actual_window_s
+                    snap["idle"]["current_window_minutes"] = round(
+                        actual_window_s / 60, 2,
+                    )
                     idle_rules_pending.append(
                         (snap, j.idle_duration_s),
+                    )
+                if j.has_avg():
+                    snap["avg"]["current_window_minutes"] = round(
+                        _actual_window(j, j.avg_window_s) / 60, 2,
+                    )
+                    avg_rules_pending.append(
+                        (snap, j.avg_window_s, j._observation_started_at),
                     )
                 scheduled.append(snap)
         # Outside the lock: every read goes through `history`, which has
@@ -447,6 +457,22 @@ class PlugTwin:
                 vals = [r[1] for r in rows if r[1] is not None]
                 if vals:
                     snap["idle"]["current_max_w"] = float(max(vals))
+            # Avg: live mean apower over the rule's actual observation
+            # window. Mirrors consumed/current_wh: the eval reads from
+            # samples_raw with the same windowing, so the user sees what
+            # the rule sees.
+            for snap, window_s, obs_start in avg_rules_pending:
+                since = now_ts - window_s
+                if obs_start > 0 and obs_start > since:
+                    since = obs_start
+                rows = self.deps.history.query_samples_raw(
+                    self.name, since, now_ts,
+                )
+                vals = [r[1] for r in rows if r[1] is not None]
+                if vals:
+                    snap["avg"]["current_avg_w"] = float(
+                        sum(vals) / len(vals)
+                    )
         params = dict(self.cfg.params)
         params.update(self.param_overrides)
         payload: dict[str, Any] = {
@@ -602,7 +628,7 @@ class PlugTwin:
         weirdness, then briefly retake the lock to drop fired one-shots.
         """
         fires: list[tuple[rules_mod.ScheduledJob, str, dict[str, Any]]] = []
-        consumed_pending: list[rules_mod.ScheduledJob] = []
+        history_pending: list[rules_mod.ScheduledJob] = []
         mutated = False
         survivors: list[rules_mod.ScheduledJob] = []
         with self._lock:
@@ -613,6 +639,7 @@ class PlugTwin:
                 if rules_mod._job_dormant(job, output):
                     job._below_since = None
                     job._consumed_started_at = now
+                    job._avg_started_at = now
                     survivors.append(job)
                     continue
                 # Grace period for rules just loaded from rules.json:
@@ -627,21 +654,27 @@ class PlugTwin:
                 if fired and job.once:
                     mutated = True
                     continue  # drop one-shot fired job
-                if not fired and job.has_consumed():
-                    consumed_pending.append(job)
+                if not fired and (job.has_consumed() or job.has_avg()):
+                    history_pending.append(job)
                 survivors.append(job)
             if len(survivors) != len(self.rules):
                 self.rules = survivors
 
-        # Consumed evaluation runs OUTSIDE the lock — it touches history.
-        consumed_dropped: set[int] = set()
-        for job in consumed_pending:
-            if self._eval_consumed(job, now, fires) and job.once:
-                consumed_dropped.add(id(job))
-        if consumed_dropped:
+        # History-backed evaluation runs OUTSIDE the lock — it touches
+        # history (consumed + avg both query samples_raw / aenergy).
+        dropped: set[int] = set()
+        for job in history_pending:
+            fired = False
+            if job.has_consumed():
+                fired = self._eval_consumed(job, now, fires)
+            if not fired and job.has_avg():
+                fired = self._eval_avg(job, now, fires)
+            if fired and job.once:
+                dropped.add(id(job))
+        if dropped:
             with self._lock:
                 self.rules = [j for j in self.rules
-                              if id(j) not in consumed_dropped]
+                              if id(j) not in dropped]
             mutated = True
 
         for job, mode, ctx in fires:
@@ -654,7 +687,7 @@ class PlugTwin:
 
     def _reset_rule_windows_for(self, target_action: str,
                                  now: int) -> None:
-        """Zero idle/consumed transient state for every rule whose
+        """Zero idle/consumed/avg transient state for every rule whose
         target_action matches. Called from on_mqtt's output-edge
         handler so a manual ON gives off-rules a fresh window
         (and symmetrically for manual OFF + on-rules).
@@ -667,7 +700,9 @@ class PlugTwin:
                     job._below_since = None
                 if job.has_consumed():
                     job._consumed_started_at = now
-                if job.has_idle() or job.has_consumed():
+                if job.has_avg():
+                    job._avg_started_at = now
+                if job.has_idle() or job.has_consumed() or job.has_avg():
                     job._observation_started_at = now
 
     def _eval_idle(self, job, fields, now, fires) -> bool:
@@ -691,6 +726,46 @@ class PlugTwin:
                 return True
         else:
             job._below_since = None
+        return False
+
+    def _eval_avg(self, job, now, fires) -> bool:
+        """Average-power-below-threshold rule eval. Reads samples_raw
+        for [now - avg_window_s, now], computes the mean apower, and
+        fires when mean < avg_threshold_w. Same two gates as consumed:
+
+        - `_avg_started_at` window-warmup: a freshly-created or just-
+          reset rule must observe for one full window before it can
+          fire (so prior history can't insta-satisfy).
+        - `earliest_ts` coverage: history must extend back to (or
+          before) the window start.
+
+        Called OUTSIDE self._lock (history has its own).
+        """
+        if self.deps.history is None:
+            return False
+        if now - job._avg_started_at < job.avg_window_s:
+            return False
+        since = now - job.avg_window_s
+        rows = self.deps.history.query_samples_raw(self.name, since, now)
+        if not rows:
+            return False
+        if rows[0][0] > since:
+            return False  # insufficient history coverage
+        vals = [r[1] for r in rows if r[1] is not None]
+        if not vals:
+            return False
+        mean_w = sum(vals) / len(vals)
+        if mean_w < job.avg_threshold_w:
+            fires.append((job, "avg", {
+                "value": float(mean_w),
+                "threshold": float(job.avg_threshold_w),
+                "seconds": job.avg_window_s,
+                "duration_human": durations.format(job.avg_window_s),
+                "field": job.avg_field,
+            }))
+            with self._lock:
+                job._avg_started_at = now
+            return True
         return False
 
     def _eval_consumed(self, job, now, fires) -> bool:
@@ -862,4 +937,7 @@ def _rule_clauses(job: rules_mod.ScheduledJob) -> list[str]:
     if job.has_consumed():
         out.append(f"when used<{job.consumed_threshold_wh:g}Wh "
                    f"in {durations.format(job.consumed_window_s)}")
+    if job.has_avg():
+        out.append(f"when avg<{job.avg_threshold_w:g}W "
+                   f"in {durations.format(job.avg_window_s)}")
     return out

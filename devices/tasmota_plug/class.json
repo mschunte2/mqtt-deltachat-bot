@@ -50,6 +50,7 @@
       "tod":              "📅 {name}: scheduled time {hh}:{mm} reached; {action_verb}",
       "idle":             "💤 {name}: power {value:.1f} W < {threshold:.0f} W threshold for {duration_human}; {action_verb}",
       "consumed":         "🔋 {name}: consumed {value:.2f} Wh < {threshold:.1f} Wh threshold over last {window_human}; {action_verb}",
+      "avg":              "📉 {name}: avg power {value:.1f} W < {threshold:.0f} W over last {duration_human}; {action_verb}",
       "cancelled_manual": "↩️ {name}: pending auto-{action} cancelled (manually toggled)"
     }
   },

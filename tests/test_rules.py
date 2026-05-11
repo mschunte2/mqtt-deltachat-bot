@@ -18,6 +18,7 @@ class TestParsePolicy(unittest.TestCase):
         self.d = sched.PolicyDefaults(
             idle_field="apower", idle_threshold=5.0, idle_duration_s=60,
             consumed_field="apower", consumed_threshold_wh=5.0, consumed_window_s=600,
+            avg_field="apower", avg_threshold_w=5.0, avg_window_s=600,
         )
 
     def test_timer(self):
@@ -112,6 +113,49 @@ class TestParsePolicy(unittest.TestCase):
         p = sched.parse_policy("for 1h or if idle", self.d)
         self.assertEqual(p.timer_seconds, 3600)
         self.assertIsNotNone(p.idle_field)
+
+    def test_avg_clause(self):
+        p = sched.parse_policy("avg 5W in 30m", self.d)
+        self.assertEqual(p.avg_field, "apower")
+        self.assertEqual(p.avg_threshold_w, 5.0)
+        self.assertEqual(p.avg_window_s, 1800)
+        # `avg` is distinct from `idle` — no idle policy set.
+        self.assertIsNone(p.idle_field)
+
+    def test_avg_clause_for_synonym(self):
+        p = sched.parse_policy("avg 7.5W for 1h", self.d)
+        self.assertEqual(p.avg_threshold_w, 7.5)
+        self.assertEqual(p.avg_window_s, 3600)
+
+    def test_avg_clause_if_prefix(self):
+        p = sched.parse_policy("if avg 5W in 10m", self.d)
+        self.assertEqual(p.avg_threshold_w, 5.0)
+        self.assertEqual(p.avg_window_s, 600)
+
+    def test_avg_unit_must_be_watts(self):
+        with self.assertRaises(ValueError):
+            sched.parse_policy("avg 5Wh in 10m", self.d)
+
+    def test_avg_rule_id_format(self):
+        p = sched.parse_policy("avg 5W in 30m", self.d)
+        # Minutes-formatted suffix, post-Part-3.
+        self.assertEqual(sched.derive_rule_id(p), "avg:5W:30m")
+
+    def test_idle_rule_id_uses_minutes(self):
+        p = sched.parse_policy("if idle 5W in 60s", self.d)
+        # 60s formats as "1m".
+        self.assertEqual(sched.derive_rule_id(p), "idle:5W:1m")
+
+    def test_consumed_rule_id_uses_minutes(self):
+        p = sched.parse_policy("if idle 5Wh in 10m", self.d)
+        self.assertEqual(sched.derive_rule_id(p), "consumed:5Wh:10m")
+
+    def test_avg_with_idle_or_combination(self):
+        # idle + avg can be OR-combined in a single rule.
+        p = sched.parse_policy("if idle or avg 3W in 5m", self.d)
+        self.assertIsNotNone(p.idle_field)
+        self.assertEqual(p.avg_threshold_w, 3.0)
+        self.assertEqual(p.avg_window_s, 300)
 
     def test_two_time_policies_rejected(self):
         with self.assertRaises(ValueError):

@@ -113,7 +113,7 @@ function readRuleForm(direction) {
   const policy = {};
   if (mode === 'timer') {
     const mins = parseInt(root.querySelector(`.${direction}-timer-min`).value, 10) || 0;
-    policy.timer_seconds = mins * 60;
+    policy.timer_minutes = mins;
   } else if (mode === 'tod') {
     const v = root.querySelector(`.${direction}-tod`).value || '22:00';
     const [h, m] = v.split(':').map(n => parseInt(n, 10));
@@ -122,12 +122,17 @@ function readRuleForm(direction) {
   } else if (mode === 'idle') {
     policy.idle = {
       threshold: parseFloat(root.querySelector(`.${direction}-idle-w`).value),
-      duration_s: parseInt(root.querySelector(`.${direction}-idle-s`).value, 10),
+      duration_minutes: parseInt(root.querySelector(`.${direction}-idle-min`).value, 10),
     };
   } else if (mode === 'consumed') {
     policy.consumed = {
       threshold_wh: parseFloat(root.querySelector(`.${direction}-cons-wh`).value),
-      window_s: parseInt(root.querySelector(`.${direction}-cons-min`).value, 10) * 60,
+      window_minutes: parseInt(root.querySelector(`.${direction}-cons-min`).value, 10),
+    };
+  } else if (mode === 'avg') {
+    policy.avg = {
+      threshold_w: parseFloat(root.querySelector(`.${direction}-avg-w`).value),
+      window_minutes: parseInt(root.querySelector(`.${direction}-avg-min`).value, 10),
     };
   }
   const onceBox = root.querySelector(`.${direction}-once`);
@@ -462,19 +467,22 @@ function renderEnergySummary(dev) {
 
 function currentObservedText(j) {
   // Live observed values vs. the rule's threshold. Each policy's
-  // current_window_s is the actual elapsed time since the rule
+  // current_window_minutes is the actual elapsed time since the rule
   // started observing (or was last reset by a manual toggle),
-  // capped at the configured window. Falls back to the rule's
-  // full window if the bot hasn't sent current_window_s yet
-  // (older snapshot still in localStorage).
+  // capped at the configured window. The bot now speaks minutes at
+  // this boundary; internal seconds are converted once on send.
   const parts = [];
   if (j.idle && typeof j.idle.current_max_w === 'number') {
-    const ws = j.idle.current_window_s ?? j.idle.duration_s;
-    parts.push(`max ${j.idle.current_max_w.toFixed(0)}W in ${fmtSecs(ws)}`);
+    const wm = j.idle.current_window_minutes ?? j.idle.duration_minutes;
+    parts.push(`max ${j.idle.current_max_w.toFixed(0)}W in ${fmtMins(wm)}`);
   }
   if (j.consumed && typeof j.consumed.current_wh === 'number') {
-    const ws = j.consumed.current_window_s ?? j.consumed.window_s;
-    parts.push(`${j.consumed.current_wh.toFixed(2)}Wh in ${fmtSecs(ws)}`);
+    const wm = j.consumed.current_window_minutes ?? j.consumed.window_minutes;
+    parts.push(`${j.consumed.current_wh.toFixed(2)}Wh in ${fmtMins(wm)}`);
+  }
+  if (j.avg && typeof j.avg.current_avg_w === 'number') {
+    const wm = j.avg.current_window_minutes ?? j.avg.window_minutes;
+    parts.push(`avg ${j.avg.current_avg_w.toFixed(1)}W in ${fmtMins(wm)}`);
   }
   return parts.join(' · ');
 }
@@ -495,11 +503,15 @@ function describeRule(j) {
   }
   if (j.idle) {
     parts.push(`when ${j.idle.field || 'apower'} < ${j.idle.threshold}W `
-             + `for ${fmtSecs(j.idle.duration_s)}`);
+             + `for ${fmtMins(j.idle.duration_minutes)}`);
   }
   if (j.consumed) {
     parts.push(`when used < ${j.consumed.threshold_wh}Wh in `
-             + `${fmtSecs(j.consumed.window_s)}`);
+             + `${fmtMins(j.consumed.window_minutes)}`);
+  }
+  if (j.avg) {
+    parts.push(`when avg < ${j.avg.threshold_w}W in `
+             + `${fmtMins(j.avg.window_minutes)}`);
   }
   let s = parts.join(' or ') || '(empty)';
   if (j.once) s += ' · once';
@@ -544,6 +556,15 @@ function fmtSecs(s) {
   const h = Math.floor(s / 3600);
   const m = Math.round((s % 3600) / 60);
   return m ? `${h}h${m}m` : `${h}h`;
+}
+
+function fmtMins(m) {
+  if (m == null) return '—';
+  if (m < 1) return `${Math.round(m * 60)}s`;
+  if (m < 60) return Number.isInteger(m) ? `${m}m` : `${m.toFixed(1)}m`;
+  const h = Math.floor(m / 60);
+  const rem = Math.round(m - h * 60);
+  return rem ? `${h}h${rem}m` : `${h}h`;
 }
 
 // --- Inbound -----------------------------------------------------------

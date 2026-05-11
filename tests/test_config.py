@@ -54,6 +54,7 @@ CLASS_JSON_OK = {
             "tod":              "{name} auto-off ({hh}:{mm})",
             "idle":             "{name} auto-off (idle: {field}={value:.1f}W for {seconds}s)",
             "consumed":         "{name} auto-off (used {value:.2f}Wh)",
+            "avg":              "{name} auto-off (avg<{threshold:.0f}W over {duration_human})",
         },
     },
 }

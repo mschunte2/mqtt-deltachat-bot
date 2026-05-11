@@ -362,9 +362,10 @@ class TestPlugTwinTickTime(unittest.TestCase):
         consumed = out["scheduled_jobs"][0]["consumed"]
         self.assertNotIn("current_wh", consumed)
 
-    def test_consumed_current_window_s_grows_then_caps(self):
-        # Fresh rule: actual elapsed grows from 0 toward window_s,
-        # then caps once observation has been active >= window_s.
+    def test_consumed_current_window_minutes_grows_then_caps(self):
+        # Fresh rule: actual elapsed grows from 0 toward the full window,
+        # then caps once observation has been active for the full window.
+        # The bot speaks minutes at the snapshot boundary.
         twin, _, _ = _build_twin()
         twin.schedule(
             "off",
@@ -375,20 +376,20 @@ class TestPlugTwinTickTime(unittest.TestCase):
         )
         rule = twin.rules[0]
         now = int(time.time())
-        # 1 minute into observation → current_window_s ≈ 60.
+        # 1 minute into observation → current_window_minutes ≈ 1.
         rule._observation_started_at = now - 60
         out = twin.to_dict()
-        ws = out["scheduled_jobs"][0]["consumed"]["current_window_s"]
-        self.assertGreaterEqual(ws, 55)
-        self.assertLessEqual(ws, 65)
-        # 700 s in (past the 600 s window) → caps at 600.
+        wm = out["scheduled_jobs"][0]["consumed"]["current_window_minutes"]
+        self.assertGreaterEqual(wm, 0.9)
+        self.assertLessEqual(wm, 1.1)
+        # 700 s in (past the 600 s window) → caps at 10 minutes.
         rule._observation_started_at = now - 700
         out = twin.to_dict()
-        ws = out["scheduled_jobs"][0]["consumed"]["current_window_s"]
-        self.assertEqual(ws, 600)
+        wm = out["scheduled_jobs"][0]["consumed"]["current_window_minutes"]
+        self.assertEqual(wm, 10)
 
-    def test_idle_current_window_s_grows_then_caps(self):
-        # current_window_s is set regardless of whether history is
+    def test_idle_current_window_minutes_grows_then_caps(self):
+        # current_window_minutes is set regardless of whether history is
         # available — only current_max_w (the SQL-derived peak)
         # needs it.
         twin, _, _ = _build_twin()  # history=None
@@ -403,13 +404,13 @@ class TestPlugTwinTickTime(unittest.TestCase):
         now = int(time.time())
         rule._observation_started_at = now - 120  # 2 min in
         out = twin.to_dict()
-        ws = out["scheduled_jobs"][0]["idle"]["current_window_s"]
-        self.assertGreaterEqual(ws, 115)
-        self.assertLessEqual(ws, 125)
+        wm = out["scheduled_jobs"][0]["idle"]["current_window_minutes"]
+        self.assertGreaterEqual(wm, 1.9)
+        self.assertLessEqual(wm, 2.1)
         rule._observation_started_at = now - 3600  # past the 1800 s window
         out = twin.to_dict()
-        ws = out["scheduled_jobs"][0]["idle"]["current_window_s"]
-        self.assertEqual(ws, 1800)
+        wm = out["scheduled_jobs"][0]["idle"]["current_window_minutes"]
+        self.assertEqual(wm, 30)
 
     def test_observation_started_at_reset_on_manual_toggle(self):
         # Manual ON resets _observation_started_at on off-target rules.
@@ -519,6 +520,134 @@ class TestConsumedRuleUsesHistory(unittest.TestCase):
         twin.on_mqtt("status/switch:0",
                      json.dumps({"output": True, "apower": 3.0}).encode())
         self.assertEqual(calls["published"], [])
+
+
+# --- Avg rule firing (mean apower over a window below threshold) ----------
+
+class TestAvgRuleUsesHistory(unittest.TestCase):
+    """Verifies that avg-rule evaluation reads from
+    ``history.query_samples_raw`` and fires when the window MEAN is
+    below threshold. Cycling-load case: bursts above threshold are
+    expected and the average is what matters."""
+
+    def _setup(self, sample_apowers, window_s=600, threshold_w=5.0,
+               coverage="full"):
+        """Build a twin whose history returns rows with the given
+        apower values evenly spaced across the window. coverage="full"
+        ⇒ first row at exactly `since`; "partial" ⇒ first row half a
+        window in (rule must refuse to fire)."""
+        from tests._fixtures import _FakeHistory
+        now = int(time.time())
+        since = now - window_s
+        first = since if coverage == "full" else since + window_s // 2
+        h = _FakeHistory()
+        if sample_apowers:
+            step = max(1, (now - first) // max(1, len(sample_apowers) - 1))
+            h.samples_raw_rows = [
+                (first + i * step, float(w), 230.0, 0.0, 50.0, 0.0, 1, 25.0)
+                for i, w in enumerate(sample_apowers)
+            ]
+        twin, calls, _ = _build_twin(history=h)
+        twin.fields["output"] = True  # not dormant; not a F→T edge
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(avg_field="apower",
+                                  avg_threshold_w=threshold_w,
+                                  avg_window_s=window_s),
+            12,
+        )
+        rule = twin.rules[0]
+        # Bypass the post-creation warmup gate so the rule can fire now.
+        rule._avg_started_at = now - window_s - 1
+        rule._observation_started_at = now - window_s - 1
+        return twin, rule, h, calls
+
+    def test_fires_when_mean_below_threshold(self):
+        # Cycling load: 1, 1, 1, 30 W samples → mean = 8.25 W > 5 W
+        # but with a 4 W threshold (mean 8.25 ≥ 4) it should NOT fire.
+        # Use 1, 1, 1, 1, 12 → mean = 3.2 W < 5 W threshold.
+        twin, _, _, calls = self._setup([1.0, 1.0, 1.0, 1.0, 12.0])
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 12.0}).encode())
+        published_payloads = [p for _t, p in calls["published"]]
+        self.assertIn("off", published_payloads,
+                      f"expected off command, got {calls['published']}")
+
+    def test_does_not_fire_when_mean_at_or_above_threshold(self):
+        # Mean = 6 W ≥ 5 W threshold → no fire (strict <).
+        twin, _, _, calls = self._setup([6.0, 6.0, 6.0])
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 6.0}).encode())
+        self.assertEqual(calls["published"], [])
+
+    def test_does_not_fire_during_warmup(self):
+        # Freshly-created rule: _avg_started_at = now → must wait one
+        # full window before being eligible to fire.
+        twin, rule, _, calls = self._setup([1.0, 1.0, 1.0])
+        rule._avg_started_at = int(time.time())  # just created
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 1.0}).encode())
+        self.assertEqual(calls["published"], [])
+
+    def test_does_not_fire_with_partial_history(self):
+        # earliest_ts > since → can't compare partial-window mean to
+        # full-window threshold; refuse to fire.
+        twin, _, _, calls = self._setup([1.0, 1.0, 1.0], coverage="partial")
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 1.0}).encode())
+        self.assertEqual(calls["published"], [])
+
+    def test_does_not_fire_when_history_is_none(self):
+        # Bot configured without history → avg rules are inert.
+        twin, calls, _ = _build_twin(history=None)
+        twin.fields["output"] = True
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(avg_field="apower",
+                                  avg_threshold_w=5.0,
+                                  avg_window_s=600),
+            12,
+        )
+        rule = twin.rules[0]
+        rule._avg_started_at = int(time.time()) - 7200
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 1.0}).encode())
+        self.assertEqual(calls["published"], [])
+
+    def test_manual_on_resets_avg_window(self):
+        # Manual F→T edge re-stamps _avg_started_at and
+        # _observation_started_at — symmetric with consumed.
+        twin, _, _ = _build_twin()
+        twin.fields["output"] = False
+        twin.schedule(
+            "off",
+            sched.ScheduledPolicy(avg_field="apower",
+                                  avg_threshold_w=5.0,
+                                  avg_window_s=600),
+            12,
+        )
+        rule = twin.rules[0]
+        long_ago = int(time.time()) - 7200
+        rule._avg_started_at = long_ago
+        rule._observation_started_at = long_ago
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"output": True, "apower": 50.0}).encode())
+        self.assertGreater(rule._avg_started_at, long_ago)
+        self.assertGreater(rule._observation_started_at, long_ago)
+
+    def test_to_dict_includes_avg_current_avg_w(self):
+        # Snapshot enrichment: avg rule gets current_avg_w from
+        # history.query_samples_raw over the live window.
+        twin, _, _, _ = self._setup([1.0, 2.0, 3.0, 4.0])
+        out = twin.to_dict()
+        sched_jobs = out["scheduled_jobs"]
+        self.assertEqual(len(sched_jobs), 1)
+        avg = sched_jobs[0]["avg"]
+        self.assertIn("current_avg_w", avg)
+        self.assertAlmostEqual(avg["current_avg_w"], 2.5, places=2)
+        # Window field is in minutes at the boundary.
+        self.assertIn("window_minutes", avg)
+        self.assertIn("current_window_minutes", avg)
 
 
 # --- Resettable counter ---------------------------------------------------

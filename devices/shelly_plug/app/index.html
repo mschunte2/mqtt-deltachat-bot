@@ -100,10 +100,13 @@
         <label class="sub"><input type="checkbox" class="off-tod-daily"> daily</label></label>
       <label class="opt"><input type="radio" name="off-mode" value="idle">
         when below <input type="number" class="off-idle-w" value="5" min="0" step="0.1"> W
-        for <input type="number" class="off-idle-s" value="60" min="5"> s</label>
+        for <input type="number" class="off-idle-min" value="1" min="1"> min</label>
       <label class="opt"><input type="radio" name="off-mode" value="consumed">
         when used &lt; <input type="number" class="off-cons-wh" value="5" min="0" step="0.1"> Wh
         in <input type="number" class="off-cons-min" value="10" min="1"> min</label>
+      <label class="opt"><input type="radio" name="off-mode" value="avg">
+        when avg below <input type="number" class="off-avg-w" value="5" min="0" step="0.1"> W
+        for <input type="number" class="off-avg-min" value="10" min="1"> min</label>
       <label class="once"><input type="checkbox" class="off-once">
         only once (delete after first fire; default is recurring)</label>
       <button type="button" class="add-rule-btn" data-action="off">Add auto-off rule</button>
