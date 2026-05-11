@@ -127,8 +127,10 @@ def _gap_fill(rows: list[tuple[int, float | None, float | None, float, int | Non
 
 
 def _daily_energy_wh(history, device_name: str) -> list[tuple[int, float]]:
+    # 365 days so the app's 365d window has a full year of bars to
+    # render. ~6 KB per device per snapshot — negligible.
     return history.daily_energy_kwh(
-        device_name, _local_midnight(int(time.time())), days=30,
+        device_name, _local_midnight(int(time.time())), days=365,
     )
 
 

@@ -55,8 +55,7 @@ const stateIcon = $('state-icon');
 const stateText = $('state-text');
 const statePower = $('state-power');
 const sparkline = $('sparkline');
-const dailyBars = $('daily-bars');
-const dailyFoot = $('daily-foot');
+const chartLabel = $('chart-label');
 const chartMax = $('chart-max');
 const chartFoot = $('chart-foot');
 const windowPick = $('window-pick');
@@ -240,7 +239,6 @@ function render() {
     typeof f.apower === 'number' ? `${f.apower.toFixed(0)} W` : '— W';
 
   renderSparkline();
-  renderDailyBars(dev);
   renderEnergySummary(dev);
   renderRulesList(dev);
   renderAge();
@@ -256,22 +254,31 @@ function renderAge() {
 
 function renderSparkline() {
   const dev = activeDevice();
-  if (!dev || !dev.power_history) {
+  if (!dev) {
+    sparkline.innerHTML = ''; chartMax.textContent = '';
+    chartFoot.textContent = '(no data yet)';
+    return;
+  }
+  // At long windows the per-bucket power chart conveys little; switch
+  // to a daily-Wh bar chart (counter-diff per day, no trapezoid).
+  if (state.windowSeconds >= 31 * 86400) {
+    if (chartLabel) chartLabel.textContent = 'Energy';
+    renderDailyEnergyChart(dev,
+      Math.round(state.windowSeconds / 86400));
+    return;
+  }
+  if (chartLabel) chartLabel.textContent = 'Power';
+  if (!dev.power_history) {
     sparkline.innerHTML = ''; chartMax.textContent = '';
     chartFoot.textContent = '(no data yet)';
     return;
   }
   // Pick resolution based on window:
-  //   ≤24h         → minute series (with live tail at "now")
-  //   7d, 31d      → hour series
-  //   ≥365d        → day series (only feasible resolution at this scale)
-  // Rendering style is identical across all three (see below).
+  //   ≤24h    → minute series (with live tail at "now")
+  //   7d      → hour series
+  // 31d / 365d branches handled above as daily energy bars.
   let series;
-  if (state.windowSeconds >= 365 * 86400) {
-    // Fall back to hour if the bot's snapshot predates the day series
-    // (older payload still in localStorage).
-    series = dev.power_history.day || dev.power_history.hour;
-  } else if (state.windowSeconds >= 7 * 86400) {
+  if (state.windowSeconds >= 7 * 86400) {
     series = dev.power_history.hour;
   } else {
     series = dev.power_history.minute;
@@ -385,30 +392,38 @@ function renderSparkline() {
   chartFoot.textContent = `${pts.length} pts${tail}`;
 }
 
-function renderDailyBars(dev) {
-  if (!dailyBars) return;
-  const days = dev.daily_energy_wh;
-  if (!Array.isArray(days) || days.length < 2) {
-    dailyBars.innerHTML = '';
-    if (dailyFoot) dailyFoot.textContent = '';
+function renderDailyEnergyChart(dev, days) {
+  // Daily-Wh bar chart that replaces the power chart at long windows.
+  // Reads `daily_energy_wh` (counter-diff per day; no trapezoid) and
+  // renders the last `days` entries.
+  const all = dev.daily_energy_wh;
+  if (!Array.isArray(all) || all.length < 1) {
+    sparkline.innerHTML = ''; chartMax.textContent = '';
+    chartFoot.textContent = '(no daily energy data yet)';
     return;
   }
-  const W = 200, H = 36;
-  const maxWh = Math.max(1, ...days.map(d => d[1]));
-  const w = W / days.length;
+  const slice = all.slice(Math.max(0, all.length - days));
+  if (slice.length < 1) {
+    sparkline.innerHTML = ''; chartMax.textContent = '';
+    chartFoot.textContent = '(no data in this window)';
+    return;
+  }
+  const W = 200, H = 60;
+  const maxWh = Math.max(1, ...slice.map(d => d[1]));
+  const w = W / slice.length;
   let totalWh = 0;
-  const rects = days.map(([_ts, wh], i) => {
+  const rects = slice.map(([_ts, wh], i) => {
     totalWh += wh;
     const h = (wh / maxWh) * (H - 2);
     return `<rect x="${(i * w).toFixed(2)}" y="${(H - h).toFixed(2)}" `
          + `width="${(w * 0.85).toFixed(2)}" height="${h.toFixed(2)}" `
          + `fill="#5ac8fa"/>`;
   }).join('');
-  dailyBars.innerHTML = rects + `<text x="${W - 2}" y="10" font-size="9" `
-    + `text-anchor="end" fill="#888">peak ${maxWh.toFixed(0)} Wh</text>`;
-  if (dailyFoot) {
-    dailyFoot.textContent = `30-day total: ${(totalWh / 1000).toFixed(2)} kWh`;
-  }
+  sparkline.innerHTML = rects;
+  chartMax.textContent =
+    `max ${maxWh.toFixed(0)} Wh/day`;
+  chartFoot.textContent =
+    `${slice.length}-day total: ${(totalWh / 1000).toFixed(2)} kWh`;
 }
 
 function fmtKwh(kwh) {

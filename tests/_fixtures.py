@@ -140,8 +140,8 @@ class _FakeHistory:
     def query_power(self, *_a, **_kw):
         return (60, [])
 
-    def daily_energy_kwh(self, *_a, **_kw):
-        return [(0, 0.0)] * 30
+    def daily_energy_kwh(self, *_a, **kw):
+        return [(0, 0.0)] * int(kw.get("days", 30))
 
     def energy_consumed_in(self, _device, since_ts, _until_ts):
         if self.consumed_earliest_offset is None:

@@ -153,6 +153,13 @@ class TestSnapshotContract(unittest.TestCase):
         if len(day) >= 2:
             self.assertEqual(day[1][0] - day[0][0], 86400)
 
+    def test_daily_energy_wh_carries_365_days(self):
+        # The app's 365-day window reads daily_energy_wh and renders
+        # one bar per day. Snapshot must ship 365 entries.
+        snap = snap_mod.build_for_chat(12, "tplug", self.registry, set())
+        days = snap["devices"]["kitchen"]["daily_energy_wh"]
+        self.assertEqual(len(days), 365)
+
     def test_webxdc_io_wraps_payload_correctly(self):
         # webxdc.push_to_msgid is what the publisher actually calls.
         # It must serialise to {"payload": <snapshot>} with NO extra
