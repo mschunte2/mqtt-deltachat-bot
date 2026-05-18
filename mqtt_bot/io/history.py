@@ -121,6 +121,8 @@ CREATE TABLE IF NOT EXISTS app_telemetry (
   nav_to_script_ms  INTEGER,
   nav_to_render_ms  INTEGER,
   nav_to_paint_ms   INTEGER,
+  nav_to_load_ms    INTEGER,
+  nav_to_listener_ms INTEGER,
   replay_count      INTEGER,
   replay_total_ms   INTEGER,
   start_serial      INTEGER,
@@ -165,7 +167,8 @@ class History:
             tcols = {row[1] for row in
                      self._db.execute("PRAGMA table_info(app_telemetry)")}
             for col in ("nav_to_script_ms", "nav_to_render_ms",
-                        "nav_to_paint_ms", "nav_to_head_ms"):
+                        "nav_to_paint_ms", "nav_to_head_ms",
+                        "nav_to_load_ms", "nav_to_listener_ms"):
                 if col not in tcols:
                     self._db.execute(
                         f"ALTER TABLE app_telemetry ADD COLUMN {col} INTEGER"
@@ -323,9 +326,10 @@ class History:
                 "(ts, chat_id, msgid, class_name, cold_start, "
                 " cache_size_bytes, cache_hydrate_ms, first_render_ms, "
                 " nav_to_head_ms, nav_to_script_ms, nav_to_render_ms, "
-                " nav_to_paint_ms, replay_count, replay_total_ms, "
+                " nav_to_paint_ms, nav_to_load_ms, nav_to_listener_ms, "
+                " replay_count, replay_total_ms, "
                 " start_serial, app_build_ts, metrics_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     int(ts), int(chat_id), int(msgid),
                     class_name if class_name is None else str(class_name),
@@ -337,6 +341,8 @@ class History:
                     _coerce_int(m.get("nav_to_script_ms")),
                     _coerce_int(m.get("nav_to_render_ms")),
                     _coerce_int(m.get("nav_to_paint_ms")),
+                    _coerce_int(m.get("nav_to_load_ms")),
+                    _coerce_int(m.get("nav_to_listener_ms")),
                     _coerce_int(m.get("replay_count")),
                     _coerce_int(m.get("replay_total_ms")),
                     _coerce_int(m.get("start_serial")),

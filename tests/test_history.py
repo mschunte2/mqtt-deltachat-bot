@@ -320,6 +320,7 @@ class TestHistory(unittest.TestCase):
                 "cache_hydrate_ms": 7, "first_render_ms": 23,
                 "nav_to_head_ms": 50, "nav_to_script_ms": 4200,
                 "nav_to_render_ms": 4250, "nav_to_paint_ms": 4380,
+                "nav_to_load_ms": 4500, "nav_to_listener_ms": 9200,
                 "replay_count": 4, "replay_total_ms": 180,
                 "start_serial": 99, "app_build_ts": 1779494400,
             },
@@ -328,7 +329,8 @@ class TestHistory(unittest.TestCase):
             "SELECT ts, chat_id, msgid, class_name, cold_start, "
             " cache_size_bytes, cache_hydrate_ms, first_render_ms, "
             " nav_to_head_ms, nav_to_script_ms, nav_to_render_ms, "
-            " nav_to_paint_ms, replay_count, replay_total_ms, "
+            " nav_to_paint_ms, nav_to_load_ms, nav_to_listener_ms, "
+            " replay_count, replay_total_ms, "
             " start_serial, app_build_ts, metrics_json "
             "FROM app_telemetry"
         ))
@@ -346,11 +348,13 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(r[9], 4200)          # nav_to_script_ms
         self.assertEqual(r[10], 4250)         # nav_to_render_ms
         self.assertEqual(r[11], 4380)         # nav_to_paint_ms
-        self.assertEqual(r[12], 4)            # replay_count
-        self.assertEqual(r[13], 180)          # replay_total_ms
-        self.assertEqual(r[14], 99)           # start_serial
-        self.assertEqual(r[15], 1779494400)   # app_build_ts
-        self.assertIn('"cold_start":1', r[16])
+        self.assertEqual(r[12], 4500)         # nav_to_load_ms
+        self.assertEqual(r[13], 9200)         # nav_to_listener_ms
+        self.assertEqual(r[14], 4)            # replay_count
+        self.assertEqual(r[15], 180)          # replay_total_ms
+        self.assertEqual(r[16], 99)           # start_serial
+        self.assertEqual(r[17], 1779494400)   # app_build_ts
+        self.assertIn('"cold_start":1', r[18])
 
     def test_record_app_telemetry_tolerates_missing_fields(self):
         # Only one numeric field; the rest land as NULL but the row inserts.

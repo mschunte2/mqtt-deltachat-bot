@@ -21,17 +21,21 @@ const SERIAL_KEY = 'lastSerial';
 
 // Bump on substantive main.js / index.html changes; emitted in telemetry
 // so server-side stats can be grouped by build.
-const APP_BUILD_TS = 1779494600; // 2026-05-18 c
+const APP_BUILD_TS = 1779494700; // 2026-05-18 d — chess-pattern test
 
 // Telemetry collected during boot, sent once ~2s after script load.
 // nav_to_*_ms are performance.now() snapshots, relative to navigation
 // start. They decompose the user-visible boot timeline:
-//   nav_to_head_ms   : earliest observable point (inline <head> script
-//                      before style.css / webxdc.js / <body>)
-//   nav_to_script_ms : main.js entry (after style.css + webxdc.js +
-//                      <body> parse + main.js download)
-//   nav_to_render_ms : just before first render() call
-//   nav_to_paint_ms  : first requestAnimationFrame after render
+//   nav_to_head_ms     : earliest observable point (inline <head> script
+//                        before style.css / webxdc.js / <body>)
+//   nav_to_script_ms   : main.js entry (after style.css + webxdc.js +
+//                        <body> parse + main.js download)
+//   nav_to_render_ms   : just before first render() call
+//   nav_to_paint_ms    : first requestAnimationFrame after render
+//   nav_to_load_ms     : window.load fires (post-paint, all subresources done)
+//   nav_to_listener_ms : webxdc.setUpdateListener() returns (after the
+//                        suspected synchronous chat-DB scan)
+// See ANDROID-COLDSTART.md for the hypothesis these last two fields test.
 const telemetry = {
   cold_start: 0,
   cache_size_bytes: 0,
@@ -41,6 +45,8 @@ const telemetry = {
   nav_to_script_ms: 0,
   nav_to_render_ms: 0,
   nav_to_paint_ms: 0,
+  nav_to_load_ms: 0,
+  nav_to_listener_ms: 0,
   replay_count: 0,
   replay_total_ms: 0,
   start_serial: 0,
@@ -663,7 +669,7 @@ function flushRender() {
   render();
 }
 
-window.webxdc.setUpdateListener((update) => {
+function inboundHandler(update) {
   const p = update.payload;
   // The bot pushes {class, server_ts, devices} at the top level of
   // `payload`. (No wrapping `snapshot` key — that would be one extra
@@ -696,10 +702,11 @@ window.webxdc.setUpdateListener((update) => {
     if (pendingRenderTimer) clearTimeout(pendingRenderTimer);
     pendingRenderTimer = setTimeout(flushRender, 50);
   }
-}, startSerial);
+}
 
-// On first paint render whatever we hydrated from localStorage, then
-// fire one refresh request to pull fresh data from the bot.
+// Render cached data SYNCHRONOUSLY. Touches no webxdc API, so the
+// suspected Android chat-DB-scan block (see ANDROID-COLDSTART.md)
+// cannot delay this paint.
 {
   const t0 = performance.now();
   telemetry.nav_to_render_ms = Math.round(t0);
@@ -707,29 +714,59 @@ window.webxdc.setUpdateListener((update) => {
   telemetry.first_render_ms = Math.round(performance.now() - t0);
 }
 // First requestAnimationFrame after render: closest we can get to "the
-// user actually sees pixels". If nav_to_paint_ms ≫ nav_to_render_ms,
-// the compositor / OS-side webview is buffering — not our code.
+// user actually sees pixels".
 try {
   requestAnimationFrame(() => {
     telemetry.nav_to_paint_ms = Math.round(performance.now());
   });
 } catch (_) { /* no rAF? skip */ }
-sendRefresh();
 
-// Send one telemetry payload after a settle delay. Best-effort: any
-// failure (sendUpdate throwing, webxdc shim missing) is swallowed so
-// telemetry can never break the app.
-setTimeout(() => {
-  try {
-    window.webxdc.sendUpdate({
-      payload: { request: {
-        action: 'telemetry',
-        ts: Math.floor(Date.now() / 1000),
-        metrics: telemetry,
-      }}
-    }, '');
-  } catch (_) { /* swallow */ }
-}, 2000);
+// DEFERRED BOOT: webxdc.setUpdateListener + sendRefresh + telemetry
+// dispatch wait until window.load (chess-app pattern). On Android,
+// setUpdateListener registration appears to block for seconds while
+// Delta Chat scans the chat's webxdc-updates table; deferring it past
+// onload keeps that block out of the first-paint critical path.
+//
+// Updates that arrive between registration and now are buffered by
+// the messenger and replayed once we register, so we don't lose any.
+function deferredBoot() {
+  const tBeforeListener = performance.now();
+  window.webxdc.setUpdateListener(inboundHandler, startSerial);
+  telemetry.nav_to_listener_ms = Math.round(performance.now());
+  // Snapshot listener-register cost separately too, so it survives
+  // even if other clocks drift weirdly.
+  // (nav_to_listener_ms - nav_to_load_ms is the block of interest.)
+  void tBeforeListener;
+  sendRefresh();
+  // Telemetry send: 2s after listener registration to let any
+  // post-registration replay burst settle.
+  setTimeout(() => {
+    try {
+      window.webxdc.sendUpdate({
+        payload: { request: {
+          action: 'telemetry',
+          ts: Math.floor(Date.now() / 1000),
+          metrics: telemetry,
+        }}
+      }, '');
+    } catch (_) { /* swallow */ }
+  }, 2000);
+}
+
+function onLoadFired() {
+  telemetry.nav_to_load_ms = Math.round(performance.now());
+  // Defer the actual webxdc work one more tick so the load handler
+  // returns quickly and the browser has a chance to paint anything
+  // queued behind us before we make the (possibly blocking) bridge
+  // call.
+  setTimeout(deferredBoot, 0);
+}
+
+if (document.readyState === 'complete') {
+  onLoadFired();
+} else {
+  window.addEventListener('load', onLoadFired, { once: true });
+}
 
 // Live age + countdown updates.
 setInterval(() => {
