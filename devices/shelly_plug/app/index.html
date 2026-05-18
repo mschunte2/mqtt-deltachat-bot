@@ -1,6 +1,12 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <!-- Earliest observable point in the document lifecycle: snap
+       performance.now() before any other resource (style.css,
+       webxdc.js, the body) is processed. main.js reads this back
+       and emits it as nav_to_head_ms in telemetry. -->
+  <script>window.__navHead =
+    (window.performance && performance.now) ? performance.now() : 0;</script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Shelly Plug</title>

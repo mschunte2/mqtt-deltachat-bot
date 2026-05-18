@@ -1,5 +1,14 @@
 'use strict';
 
+// FIRST: snap performance.now() before any const declaration costs us
+// microseconds. The truly earliest snapshot, window.__navHead, was
+// taken by an inline <script> at the top of <head> (see index.html);
+// this second snap (nav_to_script_ms) captures the cost of everything
+// between that head script and main.js execution: style.css load,
+// webxdc.js eval, <body> parse, main.js download/parse.
+const _NAV_SCRIPT_NOW = (window.performance && performance.now)
+  ? performance.now() : 0;
+
 // One outbound message kind from the bot: a `snapshot` payload that
 // bundles everything we need to render. We cache the latest in
 // localStorage so a reload paints last-known state instantly, then
@@ -12,19 +21,23 @@ const SERIAL_KEY = 'lastSerial';
 
 // Bump on substantive main.js / index.html changes; emitted in telemetry
 // so server-side stats can be grouped by build.
-const APP_BUILD_TS = 1779494500; // 2026-05-18 b
+const APP_BUILD_TS = 1779494600; // 2026-05-18 c
 
 // Telemetry collected during boot, sent once ~2s after script load.
 // nav_to_*_ms are performance.now() snapshots, relative to navigation
 // start. They decompose the user-visible boot timeline:
-//   nav_to_script_ms : webview spawn + html parse + js download
-//   nav_to_render_ms : script eval + cache hydrate
-//   nav_to_paint_ms  : compositor delay after first render
+//   nav_to_head_ms   : earliest observable point (inline <head> script
+//                      before style.css / webxdc.js / <body>)
+//   nav_to_script_ms : main.js entry (after style.css + webxdc.js +
+//                      <body> parse + main.js download)
+//   nav_to_render_ms : just before first render() call
+//   nav_to_paint_ms  : first requestAnimationFrame after render
 const telemetry = {
   cold_start: 0,
   cache_size_bytes: 0,
   cache_hydrate_ms: 0,
   first_render_ms: 0,
+  nav_to_head_ms: 0,
   nav_to_script_ms: 0,
   nav_to_render_ms: 0,
   nav_to_paint_ms: 0,
@@ -34,10 +47,15 @@ const telemetry = {
   app_build_ts: APP_BUILD_TS,
 };
 
-// First snap: navigation → first executable line of this script.
-// Captures pre-script time: webview spawn, html parse, css load, js
-// download/decode. Everything between "user tapped the app" and here.
-try { telemetry.nav_to_script_ms = Math.round(performance.now()); } catch (_) {}
+// nav_to_head_ms came from the inline head script in index.html.
+try {
+  if (typeof window.__navHead === 'number') {
+    telemetry.nav_to_head_ms = Math.round(window.__navHead);
+  }
+} catch (_) {}
+// nav_to_script_ms was captured in module-scope `let` above, before any
+// other work in main.js. Rounded into telemetry here.
+telemetry.nav_to_script_ms = Math.round(_NAV_SCRIPT_NOW);
 
 const state = {
   active: null,
