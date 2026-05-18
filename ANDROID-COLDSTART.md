@@ -1,7 +1,8 @@
 # Hypothesis — Android cold-start cost from pre-load `setUpdateListener`
 
 **Date:** 2026-05-18
-**Status:** Under test (this commit deploys the candidate fix).
+**Status:** **REFUTED** (2026-05-18, see Result section below).
+Reverted to synchronous-listener boot in build `1779494800`.
 
 ## Symptom
 
@@ -145,3 +146,65 @@ remain in the low hundreds; an Android row with `listener_block_ms`
 - An upstream Delta Chat issue would be the right follow-up if the
   fix here works — it would let other webxdc developers benefit
   without contorting their app structure.
+
+## Result (2026-05-18, build `1779494700`)
+
+**Hypothesis refuted.** Reverted in build `1779494800`.
+
+Two observations from the field test:
+
+1. **The deferred-boot pattern broke the data flow.** With
+   `setUpdateListener` registered inside the `window.load` handler,
+   the inbound handler never fired on a fresh `/apps` install. The
+   user saw the rendered chrome (header, buttons, energy grid, rules
+   section) but `state.devices` stayed `{}`: empty device picker,
+   placeholder "—" everywhere, "Refresh" button had no effect.
+   No `app_telemetry` rows were generated on the Pi, indicating that
+   the deferred `setTimeout` never fired either. Either the
+   `window.load` event isn't reliably reaching us in the Delta Chat
+   webview, or it does but `webxdc.sendUpdate` from within the load
+   handler isn't reaching the bot. The chess app survives this
+   pattern because its app is self-contained and doesn't need
+   round-trip data from a remote bot; ours does.
+
+2. **The Android delay is non-deterministic.** The user reports the
+   same app *sometimes* opens fast on Android and sometimes takes
+   ~8 s, with no behavioural change between opens. After explicit
+   delete + reinstall via `/apps`, the cold start was still ~8 s.
+   That non-determinism rules out a fixed cost we could pin to
+   `setUpdateListener` registration (which would be either always
+   slow or always fast for identical chat state). It's consistent
+   with the OS deciding to keep or kill the Android System WebView
+   process between opens — when warm: fast; when cold: 8 s of
+   spawn before navigation start. `performance.now()` cannot
+   observe time before navigation start, so this cost is invisible
+   to any in-page instrumentation.
+
+### What the test actually showed us
+
+- Whatever takes 8 s on Android lives **before** the page begins
+  parsing, not inside `setUpdateListener`. Otherwise the deferred
+  pattern would have shifted the delay to *after* first paint
+  rather than leaving the user with permanently-empty state.
+- The earlier conclusion from telemetry — that
+  `nav_to_paint_ms` is consistently sub-300 ms even on the
+  suspected-Android row — was already pointing at pre-navigation
+  cost. The chess comparison provided a tempting alternative
+  explanation that turned out to be a coincidence (chess differs
+  from us in many ways; "post-`onload` listener" was just one of
+  them, and not the one that matters).
+
+### Next steps
+
+- Nothing actionable in this codebase. Pre-navigation WebView
+  spawn is owned by Android System WebView + Delta Chat.
+- An upstream Delta Chat for Android issue is the right home for
+  this finding — a warm WebView pool (or even a single retained
+  instance) would benefit every webxdc app, not just ours.
+- The telemetry columns added during this investigation
+  (`nav_to_head_ms`, `nav_to_script_ms`, `nav_to_render_ms`,
+  `nav_to_paint_ms`) stay in `app_telemetry`. They're cheap to
+  collect and useful as a regression guard. The deferred-boot
+  columns `nav_to_load_ms` and `nav_to_listener_ms` remain in the
+  schema (idempotent ALTER history is easier to read than to
+  rewrite); new rows will leave them NULL.
