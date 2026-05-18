@@ -8,6 +8,23 @@
 const STORAGE_KEY = 'latestSnapshot';
 const WINDOW_KEY = 'windowSeconds';
 const ACTIVE_KEY = 'activeDevice';
+const SERIAL_KEY = 'lastSerial';
+
+// Bump on substantive main.js / index.html changes; emitted in telemetry
+// so server-side stats can be grouped by build.
+const APP_BUILD_TS = 1779494400; // 2026-05-18
+
+// Telemetry collected during boot, sent once ~2s after script load.
+const telemetry = {
+  cold_start: 0,
+  cache_size_bytes: 0,
+  cache_hydrate_ms: 0,
+  first_render_ms: 0,
+  replay_count: 0,
+  replay_total_ms: 0,
+  start_serial: 0,
+  app_build_ts: APP_BUILD_TS,
+};
 
 const state = {
   active: null,
@@ -36,15 +53,33 @@ try {
 // Hydrate from cached snapshot if present, so the app renders before
 // any refresh roundtrip lands.
 try {
+  const t0 = performance.now();
   const cached = localStorage.getItem(STORAGE_KEY);
   if (cached) {
+    telemetry.cache_size_bytes = cached.length;
+    telemetry.cold_start = 1;
     const obj = JSON.parse(cached);
     if (obj && obj.devices) {
       state.devices = obj.devices;
       state.serverTs = obj.server_ts || 0;
     }
   }
+  telemetry.cache_hydrate_ms = Math.round(performance.now() - t0);
 } catch (_) { /* corrupt cache: ignore */ }
+
+// Restore last-known update serial. Passed to setUpdateListener so the
+// messenger replays only NEW updates since the last open — without this
+// every cold start replays the full chat history of bot pushes (one
+// render per replay, ~20s on a busy chat).
+let startSerial = 0;
+try {
+  const saved = localStorage.getItem(SERIAL_KEY);
+  if (saved !== null) {
+    const n = parseInt(saved, 10);
+    if (Number.isFinite(n) && n >= 0) startSerial = n;
+  }
+} catch (_) { /* ignore */ }
+telemetry.start_serial = startSerial;
 
 const $ = (id) => document.getElementById(id);
 const picker = $('device-picker');
@@ -584,6 +619,19 @@ function fmtMins(m) {
 
 // --- Inbound -----------------------------------------------------------
 
+// Coalesce replayed snapshots into a single render. The messenger
+// replays N stored updates back-to-back on cold start when startSerial
+// is behind max_serial; rendering each one redundantly overwrites the
+// same end state. State + localStorage update on every fire (cheap,
+// keeps latest persisted) but render() is deferred until either
+// max_serial confirms we're caught up or a trailing 50ms debounce fires.
+let replayStartedAt = null;
+let pendingRenderTimer = null;
+function flushRender() {
+  if (pendingRenderTimer) { clearTimeout(pendingRenderTimer); pendingRenderTimer = null; }
+  render();
+}
+
 window.webxdc.setUpdateListener((update) => {
   const p = update.payload;
   // The bot pushes {class, server_ts, devices} at the top level of
@@ -597,13 +645,51 @@ window.webxdc.setUpdateListener((update) => {
       server_ts: state.serverTs, devices: state.devices,
     }));
   } catch (_) { /* ignore quota / disabled */ }
-  render();
-}, 0);
+  try {
+    if (typeof update.serial === 'number') {
+      localStorage.setItem(SERIAL_KEY, String(update.serial));
+    }
+  } catch (_) { /* ignore */ }
+  // Telemetry: replay counters (count + burst duration).
+  if (replayStartedAt == null) replayStartedAt = performance.now();
+  telemetry.replay_count += 1;
+  telemetry.replay_total_ms = Math.round(performance.now() - replayStartedAt);
+  // Render coalescing: render immediately when caught up to max_serial,
+  // otherwise trailing-edge debounce 50ms.
+  const caughtUp = typeof update.serial === 'number'
+                && typeof update.max_serial === 'number'
+                && update.serial >= update.max_serial;
+  if (caughtUp) {
+    flushRender();
+  } else {
+    if (pendingRenderTimer) clearTimeout(pendingRenderTimer);
+    pendingRenderTimer = setTimeout(flushRender, 50);
+  }
+}, startSerial);
 
 // On first paint render whatever we hydrated from localStorage, then
 // fire one refresh request to pull fresh data from the bot.
-render();
+{
+  const t0 = performance.now();
+  render();
+  telemetry.first_render_ms = Math.round(performance.now() - t0);
+}
 sendRefresh();
+
+// Send one telemetry payload after a settle delay. Best-effort: any
+// failure (sendUpdate throwing, webxdc shim missing) is swallowed so
+// telemetry can never break the app.
+setTimeout(() => {
+  try {
+    window.webxdc.sendUpdate({
+      payload: { request: {
+        action: 'telemetry',
+        ts: Math.floor(Date.now() / 1000),
+        metrics: telemetry,
+      }}
+    }, '');
+  } catch (_) { /* swallow */ }
+}, 2000);
 
 // Live age + countdown updates.
 setInterval(() => {

@@ -312,6 +312,74 @@ class TestHistory(unittest.TestCase):
         finally:
             h.close()
 
+    def test_record_app_telemetry_round_trip(self):
+        self.h.record_app_telemetry(
+            ts=1700000000, chat_id=12, msgid=345, class_name="shelly_plug",
+            metrics={
+                "cold_start": 1, "cache_size_bytes": 12345,
+                "cache_hydrate_ms": 7, "first_render_ms": 23,
+                "replay_count": 4, "replay_total_ms": 180,
+                "start_serial": 99, "app_build_ts": 1779494400,
+            },
+        )
+        rows = list(self.h._db.execute(
+            "SELECT ts, chat_id, msgid, class_name, cold_start, "
+            " cache_size_bytes, cache_hydrate_ms, first_render_ms, "
+            " replay_count, replay_total_ms, start_serial, "
+            " app_build_ts, metrics_json "
+            "FROM app_telemetry"
+        ))
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r[0], 1700000000)
+        self.assertEqual(r[1], 12)
+        self.assertEqual(r[2], 345)
+        self.assertEqual(r[3], "shelly_plug")
+        self.assertEqual(r[4], 1)             # cold_start
+        self.assertEqual(r[5], 12345)         # cache_size_bytes
+        self.assertEqual(r[6], 7)             # cache_hydrate_ms
+        self.assertEqual(r[7], 23)            # first_render_ms
+        self.assertEqual(r[8], 4)             # replay_count
+        self.assertEqual(r[9], 180)           # replay_total_ms
+        self.assertEqual(r[10], 99)           # start_serial
+        self.assertEqual(r[11], 1779494400)   # app_build_ts
+        self.assertIn('"cold_start":1', r[12])
+
+    def test_record_app_telemetry_tolerates_missing_fields(self):
+        # Only one numeric field; the rest land as NULL but the row inserts.
+        self.h.record_app_telemetry(
+            ts=1700000001, chat_id=1, msgid=2, class_name=None,
+            metrics={"cold_start": 0},
+        )
+        rows = list(self.h._db.execute(
+            "SELECT cold_start, replay_count, cache_hydrate_ms, class_name "
+            "FROM app_telemetry"
+        ))
+        self.assertEqual(rows, [(0, None, None, None)])
+
+    def test_record_app_telemetry_truncates_oversized_metrics_json(self):
+        big = {"k": "x" * 5000}
+        self.h.record_app_telemetry(
+            ts=1700000002, chat_id=1, msgid=3, class_name="c",
+            metrics=big,
+        )
+        (blob,) = next(self.h._db.execute(
+            "SELECT metrics_json FROM app_telemetry"
+        ))
+        self.assertLessEqual(len(blob), 2048)
+
+    def test_record_app_telemetry_non_dict_metrics_writes_empty_blob(self):
+        # Coerced to {} so the row still inserts but typed columns are NULL.
+        self.h.record_app_telemetry(
+            ts=1700000003, chat_id=1, msgid=4, class_name="c",
+            metrics="not a dict",  # type: ignore[arg-type]
+        )
+        (blob, cold) = next(self.h._db.execute(
+            "SELECT metrics_json, cold_start FROM app_telemetry"
+        ))
+        self.assertEqual(blob, "{}")
+        self.assertIsNone(cold)
+
 
 if __name__ == "__main__":
     unittest.main()

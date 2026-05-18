@@ -399,6 +399,13 @@ def handle_webxdc_request(chat_id: int, msgid: int,
         publisher.push_unicast(chat_id, msgid, cls_for_msg)
         return
 
+    # Telemetry: device may be unset; record + return. Class resolves
+    # from msgid (same as refresh). Never let a bad payload escape into
+    # the rest of the handler.
+    if action == "telemetry":
+        _record_telemetry(chat_id, msgid, cls_for_msg, request)
+        return
+
     if not device_name or not action:
         return
 
@@ -566,6 +573,47 @@ def _reset_counter(chat_id: int, device_name: str) -> bool:
         return False
     twin.reset_counter()
     return True
+
+
+def _record_telemetry(chat_id: int, msgid: int, class_name: str,
+                      request: dict) -> None:
+    """Persist one app_telemetry row. The webxdc app posts a `telemetry`
+    payload ~2s after boot with cold-start timings + replay counters;
+    used to monitor offline-cold-start performance server-side.
+
+    Best-effort: any error is logged and swallowed. Replay protection
+    (MAX_APP_AGE_SECONDS, MAX_CLOCK_SKEW_SECONDS) is enforced upstream
+    in _on_webxdc_update before this is called."""
+    metrics = request.get("metrics")
+    if not isinstance(metrics, dict):
+        log.debug("telemetry from chat=%d msgid=%d missing/bad metrics",
+                  chat_id, msgid)
+        return
+    try:
+        history.record_app_telemetry(
+            ts=int(request.get("ts") or time.time()),
+            chat_id=chat_id,
+            msgid=msgid,
+            class_name=class_name,
+            metrics=metrics,
+        )
+    except Exception:
+        log.exception("record_app_telemetry failed (chat=%d msgid=%d)",
+                      chat_id, msgid)
+        return
+    log.info(
+        "app_telemetry chat=%d msgid=%d cls=%s cold=%s replay=%s "
+        "replay_ms=%s hydrate_ms=%s first_render_ms=%s cache=%sB serial=%s build=%s",
+        chat_id, msgid, class_name,
+        metrics.get("cold_start"),
+        metrics.get("replay_count"),
+        metrics.get("replay_total_ms"),
+        metrics.get("cache_hydrate_ms"),
+        metrics.get("first_render_ms"),
+        metrics.get("cache_size_bytes"),
+        metrics.get("start_serial"),
+        metrics.get("app_build_ts"),
+    )
 
 
 def _refresh_chat(chat_id: int, only_class: str | None = None) -> int:

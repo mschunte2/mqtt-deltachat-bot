@@ -99,6 +99,28 @@ CREATE TABLE IF NOT EXISTS aenergy_offset_events (
 );
 CREATE INDEX IF NOT EXISTS idx_aenergy_offset_events_ts
   ON aenergy_offset_events (ts);
+
+-- One row per webxdc app boot. The app posts a telemetry payload ~2s
+-- after script load with timings + replay counters. Used to monitor
+-- offline cold-start performance server-side. Forever-retained: ~one
+-- row per app open, trivial size.
+CREATE TABLE IF NOT EXISTS app_telemetry (
+  ts                INTEGER NOT NULL,
+  chat_id           INTEGER NOT NULL,
+  msgid             INTEGER NOT NULL,
+  class_name        TEXT,
+  cold_start        INTEGER,
+  cache_size_bytes  INTEGER,
+  cache_hydrate_ms  INTEGER,
+  first_render_ms   INTEGER,
+  replay_count      INTEGER,
+  replay_total_ms   INTEGER,
+  start_serial      INTEGER,
+  app_build_ts      INTEGER,
+  metrics_json      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_app_telemetry_ts
+  ON app_telemetry (ts);
 """
 
 
@@ -257,6 +279,49 @@ class History:
         now = now if now is not None else int(time.time())
         for device in list(self._minute.keys()):
             self._flush_minute(device, now=now)
+
+    def record_app_telemetry(self, *, ts: int, chat_id: int, msgid: int,
+                             class_name: str | None,
+                             metrics: dict[str, Any]) -> None:
+        """Append one app_telemetry row. Called from the webxdc telemetry
+        handler in bot.py. Unknown / non-numeric metric values land in
+        metrics_json only; the typed columns get NULL.
+
+        Best-effort; never raises. metrics_json is capped at ~2 KB to
+        defend against a malicious or buggy client."""
+        if self._closed:
+            return
+        try:
+            blob = json.dumps(metrics if isinstance(metrics, dict) else {},
+                              separators=(",", ":"))
+        except (TypeError, ValueError):
+            blob = "{}"
+        if len(blob) > 2048:
+            blob = blob[:2048]
+        m = metrics if isinstance(metrics, dict) else {}
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO app_telemetry "
+                "(ts, chat_id, msgid, class_name, cold_start, "
+                " cache_size_bytes, cache_hydrate_ms, first_render_ms, "
+                " replay_count, replay_total_ms, start_serial, "
+                " app_build_ts, metrics_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    int(ts), int(chat_id), int(msgid),
+                    class_name if class_name is None else str(class_name),
+                    _coerce_int(m.get("cold_start")),
+                    _coerce_int(m.get("cache_size_bytes")),
+                    _coerce_int(m.get("cache_hydrate_ms")),
+                    _coerce_int(m.get("first_render_ms")),
+                    _coerce_int(m.get("replay_count")),
+                    _coerce_int(m.get("replay_total_ms")),
+                    _coerce_int(m.get("start_serial")),
+                    _coerce_int(m.get("app_build_ts")),
+                    blob,
+                ),
+            )
+            self._db.commit()
 
     # --- reads -----------------------------------------------------------
 
@@ -557,6 +622,19 @@ def _coerce_bool_int(v: Any) -> int | None:
         return 1
     if v is False:
         return 0
+    return None
+
+
+def _coerce_int(v: Any) -> int | None:
+    if isinstance(v, bool):
+        return 1 if v else 0
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        try:
+            return int(v)
+        except (OverflowError, ValueError):
+            return None
     return None
 
 

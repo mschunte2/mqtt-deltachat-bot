@@ -170,3 +170,6 @@ class _FakeHistory:
 
     def record_status(self, *_a, **_kw):
         pass
+
+    def record_app_telemetry(self, *_a, **_kw):
+        pass
