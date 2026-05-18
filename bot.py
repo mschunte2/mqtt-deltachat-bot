@@ -603,13 +603,18 @@ def _record_telemetry(chat_id: int, msgid: int, class_name: str,
         return
     log.info(
         "app_telemetry chat=%d msgid=%d cls=%s cold=%s replay=%s "
-        "replay_ms=%s hydrate_ms=%s first_render_ms=%s cache=%sB serial=%s build=%s",
+        "replay_ms=%s hydrate_ms=%s first_render_ms=%s "
+        "nav_script=%s nav_render=%s nav_paint=%s "
+        "cache=%sB serial=%s build=%s",
         chat_id, msgid, class_name,
         metrics.get("cold_start"),
         metrics.get("replay_count"),
         metrics.get("replay_total_ms"),
         metrics.get("cache_hydrate_ms"),
         metrics.get("first_render_ms"),
+        metrics.get("nav_to_script_ms"),
+        metrics.get("nav_to_render_ms"),
+        metrics.get("nav_to_paint_ms"),
         metrics.get("cache_size_bytes"),
         metrics.get("start_serial"),
         metrics.get("app_build_ts"),

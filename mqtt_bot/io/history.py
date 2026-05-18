@@ -104,6 +104,10 @@ CREATE INDEX IF NOT EXISTS idx_aenergy_offset_events_ts
 -- after script load with timings + replay counters. Used to monitor
 -- offline cold-start performance server-side. Forever-retained: ~one
 -- row per app open, trivial size.
+--
+-- nav_to_*_ms decompose the wall-clock boot timeline (performance.now()
+-- snapshots, relative to webview navigation start). All other *_ms
+-- fields measure internal durations.
 CREATE TABLE IF NOT EXISTS app_telemetry (
   ts                INTEGER NOT NULL,
   chat_id           INTEGER NOT NULL,
@@ -113,6 +117,9 @@ CREATE TABLE IF NOT EXISTS app_telemetry (
   cache_size_bytes  INTEGER,
   cache_hydrate_ms  INTEGER,
   first_render_ms   INTEGER,
+  nav_to_script_ms  INTEGER,
+  nav_to_render_ms  INTEGER,
+  nav_to_paint_ms   INTEGER,
   replay_count      INTEGER,
   replay_total_ms   INTEGER,
   start_serial      INTEGER,
@@ -152,6 +159,15 @@ class History:
                 self._db.execute("ALTER TABLE power_minute ADD COLUMN max_apower_w REAL")
             if "min_apower_w" not in cols:
                 self._db.execute("ALTER TABLE power_minute ADD COLUMN min_apower_w REAL")
+            # Idempotent migration: nav_to_*_ms columns added to
+            # app_telemetry after the initial deploy.
+            tcols = {row[1] for row in
+                     self._db.execute("PRAGMA table_info(app_telemetry)")}
+            for col in ("nav_to_script_ms", "nav_to_render_ms", "nav_to_paint_ms"):
+                if col not in tcols:
+                    self._db.execute(
+                        f"ALTER TABLE app_telemetry ADD COLUMN {col} INTEGER"
+                    )
             # Idempotent backfill: any NULL max/min_apower_w gets the
             # per-minute MAX/MIN from samples_raw. WHERE clauses make
             # these no-ops on subsequent boots once filled.
@@ -304,9 +320,10 @@ class History:
                 "INSERT INTO app_telemetry "
                 "(ts, chat_id, msgid, class_name, cold_start, "
                 " cache_size_bytes, cache_hydrate_ms, first_render_ms, "
+                " nav_to_script_ms, nav_to_render_ms, nav_to_paint_ms, "
                 " replay_count, replay_total_ms, start_serial, "
                 " app_build_ts, metrics_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     int(ts), int(chat_id), int(msgid),
                     class_name if class_name is None else str(class_name),
@@ -314,6 +331,9 @@ class History:
                     _coerce_int(m.get("cache_size_bytes")),
                     _coerce_int(m.get("cache_hydrate_ms")),
                     _coerce_int(m.get("first_render_ms")),
+                    _coerce_int(m.get("nav_to_script_ms")),
+                    _coerce_int(m.get("nav_to_render_ms")),
+                    _coerce_int(m.get("nav_to_paint_ms")),
                     _coerce_int(m.get("replay_count")),
                     _coerce_int(m.get("replay_total_ms")),
                     _coerce_int(m.get("start_serial")),

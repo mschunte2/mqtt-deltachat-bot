@@ -318,6 +318,8 @@ class TestHistory(unittest.TestCase):
             metrics={
                 "cold_start": 1, "cache_size_bytes": 12345,
                 "cache_hydrate_ms": 7, "first_render_ms": 23,
+                "nav_to_script_ms": 4200, "nav_to_render_ms": 4250,
+                "nav_to_paint_ms": 4380,
                 "replay_count": 4, "replay_total_ms": 180,
                 "start_serial": 99, "app_build_ts": 1779494400,
             },
@@ -325,6 +327,7 @@ class TestHistory(unittest.TestCase):
         rows = list(self.h._db.execute(
             "SELECT ts, chat_id, msgid, class_name, cold_start, "
             " cache_size_bytes, cache_hydrate_ms, first_render_ms, "
+            " nav_to_script_ms, nav_to_render_ms, nav_to_paint_ms, "
             " replay_count, replay_total_ms, start_serial, "
             " app_build_ts, metrics_json "
             "FROM app_telemetry"
@@ -339,11 +342,14 @@ class TestHistory(unittest.TestCase):
         self.assertEqual(r[5], 12345)         # cache_size_bytes
         self.assertEqual(r[6], 7)             # cache_hydrate_ms
         self.assertEqual(r[7], 23)            # first_render_ms
-        self.assertEqual(r[8], 4)             # replay_count
-        self.assertEqual(r[9], 180)           # replay_total_ms
-        self.assertEqual(r[10], 99)           # start_serial
-        self.assertEqual(r[11], 1779494400)   # app_build_ts
-        self.assertIn('"cold_start":1', r[12])
+        self.assertEqual(r[8], 4200)          # nav_to_script_ms
+        self.assertEqual(r[9], 4250)          # nav_to_render_ms
+        self.assertEqual(r[10], 4380)         # nav_to_paint_ms
+        self.assertEqual(r[11], 4)            # replay_count
+        self.assertEqual(r[12], 180)          # replay_total_ms
+        self.assertEqual(r[13], 99)           # start_serial
+        self.assertEqual(r[14], 1779494400)   # app_build_ts
+        self.assertIn('"cold_start":1', r[15])
 
     def test_record_app_telemetry_tolerates_missing_fields(self):
         # Only one numeric field; the rest land as NULL but the row inserts.

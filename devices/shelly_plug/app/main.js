@@ -12,19 +12,32 @@ const SERIAL_KEY = 'lastSerial';
 
 // Bump on substantive main.js / index.html changes; emitted in telemetry
 // so server-side stats can be grouped by build.
-const APP_BUILD_TS = 1779494400; // 2026-05-18
+const APP_BUILD_TS = 1779494500; // 2026-05-18 b
 
 // Telemetry collected during boot, sent once ~2s after script load.
+// nav_to_*_ms are performance.now() snapshots, relative to navigation
+// start. They decompose the user-visible boot timeline:
+//   nav_to_script_ms : webview spawn + html parse + js download
+//   nav_to_render_ms : script eval + cache hydrate
+//   nav_to_paint_ms  : compositor delay after first render
 const telemetry = {
   cold_start: 0,
   cache_size_bytes: 0,
   cache_hydrate_ms: 0,
   first_render_ms: 0,
+  nav_to_script_ms: 0,
+  nav_to_render_ms: 0,
+  nav_to_paint_ms: 0,
   replay_count: 0,
   replay_total_ms: 0,
   start_serial: 0,
   app_build_ts: APP_BUILD_TS,
 };
+
+// First snap: navigation → first executable line of this script.
+// Captures pre-script time: webview spawn, html parse, css load, js
+// download/decode. Everything between "user tapped the app" and here.
+try { telemetry.nav_to_script_ms = Math.round(performance.now()); } catch (_) {}
 
 const state = {
   active: null,
@@ -671,9 +684,18 @@ window.webxdc.setUpdateListener((update) => {
 // fire one refresh request to pull fresh data from the bot.
 {
   const t0 = performance.now();
+  telemetry.nav_to_render_ms = Math.round(t0);
   render();
   telemetry.first_render_ms = Math.round(performance.now() - t0);
 }
+// First requestAnimationFrame after render: closest we can get to "the
+// user actually sees pixels". If nav_to_paint_ms ≫ nav_to_render_ms,
+// the compositor / OS-side webview is buffering — not our code.
+try {
+  requestAnimationFrame(() => {
+    telemetry.nav_to_paint_ms = Math.round(performance.now());
+  });
+} catch (_) { /* no rAF? skip */ }
 sendRefresh();
 
 // Send one telemetry payload after a settle delay. Best-effort: any
