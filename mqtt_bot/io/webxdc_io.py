@@ -111,16 +111,19 @@ class WebxdcIO:
         chat_apps = self._map.setdefault(chat_id, {})
         available = {cls: path for cls, path in self.discover_xdcs()}
 
+        # Old msgids whose registry entry has been superseded/dropped and
+        # must be deleted from the chat. We collect them here and only
+        # delete AFTER the new map is persisted (see below) — deletes are
+        # irreversible, so persisting first means a crash can leave a
+        # lingering duplicate but never a pointer to a deleted message.
+        to_delete: list[tuple[str, int]] = []
+
         # Retract anything tracked but no longer servable to this chat.
         for cls in list(chat_apps.keys()):
             if cls in available and cls in classes_visible:
                 continue
-            old = chat_apps.pop(cls)
-            try:
-                bot.rpc.delete_messages_for_all(accid, [old])
-                retracted.append(cls)
-            except Exception as ex:
-                log.warning("retract %s msgid=%d chat=%d failed: %s", cls, old, chat_id, ex)
+            to_delete.append((cls, chat_apps.pop(cls)))
+            retracted.append(cls)
 
         for cls, path in available.items():
             if cls not in classes_visible:
@@ -135,14 +138,21 @@ class WebxdcIO:
             sent.append(cls)
             log.info("sent app %s to chat %d msgid=%d", cls, chat_id, new)
             if old is not None:
-                try:
-                    bot.rpc.delete_messages_for_all(accid, [old])
-                except Exception as ex:
-                    log.warning("delete prior %s msgid=%d chat=%d failed: %s",
-                                cls, old, chat_id, ex)
+                to_delete.append((cls, old))
 
+        # Persist the new pointers BEFORE deleting any old message. If
+        # this raises we return without deleting, keeping the live (if
+        # stale) pointers intact.
         if sent or retracted:
             self._save()
+
+        for cls, old in to_delete:
+            try:
+                bot.rpc.delete_messages_for_all(accid, [old])
+            except Exception as ex:
+                log.warning("delete old %s msgid=%d chat=%d failed: %s",
+                            cls, old, chat_id, ex)
+
         return sent, retracted
 
     # --- push -------------------------------------------------------------
