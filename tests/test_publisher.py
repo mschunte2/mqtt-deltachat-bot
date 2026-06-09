@@ -25,6 +25,45 @@ class TestPublisher(unittest.TestCase):
         self.assertEqual(builds, [(12, "tplug"), (14, "tplug")])
         self.assertEqual([(c, m) for c, m, _ in sent], [(12, 1001), (14, 2002)])
 
+    def test_periodic_loop_refreshes_unchanged_snapshot(self):
+        """The periodic tick must re-push even when the snapshot body is
+        unchanged, so the app's 'data N ago' indicator (derived from
+        server_ts) stays fresh on a quiet/steady-state device. Edge
+        broadcasts dedup by content hash; the heartbeat must not."""
+        sends = []
+
+        def fake_build(chat, cls):
+            return {"class": cls, "devices": {"k": {"x": 1}}, "server_ts": 0}
+
+        pub = publisher_mod.Publisher(
+            build=fake_build,
+            msgids=lambda: {12: {"tplug": 1001}},
+            send=lambda c, m, p: (sends.append((c, m)), True)[1],
+            interval_s=300,
+        )
+        # Prime the dedup hash as a prior identical push would.
+        pub.broadcast(force=True)
+        self.assertEqual(len(sends), 1)
+        # A non-forced broadcast dedups identical content (skipped).
+        pub.broadcast()
+        self.assertEqual(len(sends), 1)
+
+        # Drive exactly one periodic loop iteration.
+        class _OneShotStop:
+            def __init__(self):
+                self._n = 0
+
+            def wait(self, _interval):
+                self._n += 1
+                return self._n > 1  # run body once, then stop
+
+            def set(self):
+                pass
+
+        pub._stop = _OneShotStop()
+        pub._loop()
+        self.assertEqual(len(sends), 2)  # heartbeat re-pushed identical body
+
     def test_push_unicast_skips_when_build_returns_none(self):
         sent = []
         pub = publisher_mod.Publisher(

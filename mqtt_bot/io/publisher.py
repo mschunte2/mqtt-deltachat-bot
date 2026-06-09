@@ -34,8 +34,10 @@ log = logging.getLogger("mqtt_bot.publisher")
 def _content_hash(payload: dict) -> int:
     """Hash the snapshot's content excluding the always-changing
     server_ts. Two snapshots taken seconds apart on an offline device
-    will hash equal — the periodic skip uses this to avoid re-pushing
-    identical payloads."""
+    will hash equal — the non-forced /apps onboarding fan-out uses this
+    to avoid re-pushing identical payloads to instances that already
+    have the current state. The periodic heartbeat forces past it so the
+    app's freshness indicator stays current."""
     body = {k: v for k, v in payload.items() if k != "server_ts"}
     return hash(json.dumps(body, sort_keys=True, default=str))
 
@@ -119,9 +121,14 @@ class Publisher:
     # --- daemon ----------------------------------------------------------
 
     def _loop(self) -> None:
-        # wait(interval) returns True when stop() is called
+        # wait(interval) returns True when stop() is called.
+        # force=True so the heartbeat refreshes server_ts even when the
+        # snapshot body is unchanged — otherwise a quiet/steady-state
+        # device's app would show an ever-growing "data N ago" while the
+        # bot is perfectly healthy. The content-hash dedup still guards
+        # the /apps onboarding fan-out (publisher.broadcast(), force=False).
         while not self._stop.wait(self._interval):
             try:
-                self.broadcast()
+                self.broadcast(force=True)
             except Exception:
                 log.exception("periodic broadcast failed")
