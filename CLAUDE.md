@@ -1,5 +1,18 @@
 # CLAUDE.md — Project context for LLM sessions
 
+## Skill: deltachat-app-and-bots
+
+This project follows the patterns documented in the
+`deltachat-app-and-bots` skill at
+`~/.claude/skills/deltachat-app-and-bots/SKILL.md`. Consult it when
+modifying the bot↔app protocol, state/cache/refresh logic, replay
+protection, permission gates, or Linux hosting setup. When the code
+in this repo drifts from those patterns (e.g. inline replay-window
+constants, two snapshot assemblers, missing `ts` checks, snapshot
+push outside the Publisher), proactively flag the deviation and
+propose a cleanup commit — but follow the granular-commit and TDD
+rules in the skill rather than rolling a sweeping refactor.
+
 ## What this project is
 
 `mqtt-bot` is a Delta Chat ↔ MQTT bridge that runs as a Python daemon
@@ -494,6 +507,27 @@ The build script can take an explicit class directory or build all of
 into the temp staging dir; it tolerates the file not existing yet.
 Without `-m`, realpath would fail on a fresh build.
 
+### Why the `.xdc` is gitignored (and the deploy consequence)
+
+The `.xdc` is a **build artifact, not source** — a deterministic zip of
+`devices/<class>/app/` that `build-xdc.sh` reproduces from tracked
+files. It's gitignored on purpose: committing it would duplicate the
+source, drift whenever someone edits `app/` but forgets to rebuild, and
+bloat history with unreviewable binary blobs (zips change wholesale and
+embed metadata).
+
+**Consequence for deploy: pulling source is not enough — you must
+rebuild on the target.** The bot serves the `.xdc` from disk, so a
+`git pull` that updates `app/` without re-running `build-xdc.sh` leaves
+the old artifact in place and `/apps` keeps shipping the stale build.
+The target needs `zip` + `realpath` (the Pi has both). See *Updating a
+running deployment* below.
+
+(Alternative, not currently used: attach the built `.xdc` as a GitHub
+Release asset so no-`zip` targets can `gh release download` it instead
+of building. Overkill while every target can build; revisit only if a
+deploy host can't run `build-xdc.sh`.)
+
 ## --check-config dry run
 
 `python3 bot.py --check-config` validates `devices.json` +
@@ -517,6 +551,23 @@ check. Useful for CI / pre-commit / a quick check on a fresh clone.
 systemd unit name: `deltabot-${BOT_NAME}.service`. Multiple bot
 instances on one host work as long as `BOT_NAME` differs (each gets
 its own `~/.config/<name>/` and unit name).
+
+### Updating a running deployment
+
+The user's live host is `pi@gatekeeper`, repo at `/home/pi/mqtt-bot`,
+unit `deltabot-mqtt-bot.service`. To ship a change:
+
+```
+ssh pi@gatekeeper 'cd ~/mqtt-bot \
+  && git pull --ff-only origin main \
+  && ./build-xdc.sh devices/shelly_plug'          # rebuild — see Build system
+sudo systemctl restart deltabot-mqtt-bot.service   # (on the pi)
+```
+
+Then **`/apps` in the chat** to reinstall the app: a rebuilt `.xdc`
+does nothing until each chat re-installs it (webxdc instances don't
+self-update). If only Python changed and `app/` didn't, the
+`build-xdc.sh` step and `/apps` are unnecessary — a restart suffices.
 
 `paho-mqtt>=2.0` is required (pinned in `lib/common.sh`). The 2.x
 API requires `callback_api_version=`; we pass `VERSION1` because
