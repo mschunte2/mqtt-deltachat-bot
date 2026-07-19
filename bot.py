@@ -92,6 +92,7 @@ from mqtt_bot.core.twins import TwinRegistry  # noqa: E402
 from mqtt_bot.io import baselines as baselines_mod  # noqa: E402
 from mqtt_bot.io.history import History  # noqa: E402
 from mqtt_bot.io.mqtt_client import MqttClient  # noqa: E402
+from mqtt_bot.io import dc_config  # noqa: E402
 from mqtt_bot.io.publisher import Publisher  # noqa: E402
 from mqtt_bot.io.webxdc_io import WebxdcIO  # noqa: E402
 from mqtt_bot.util import durations, permissions  # noqa: E402
@@ -104,6 +105,7 @@ BASELINES_PATH = STATE_DIR / "baselines.json"
 
 CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", BOT_NAME)
 PUBLISH_INTERVAL_S = int(os.environ.get("PUBLISH_INTERVAL_S", "10800"))
+DC_DELETE_DEVICE_AFTER_DAYS = int(os.environ.get("DC_DELETE_DEVICE_AFTER_DAYS", "14"))
 
 
 # --- Late-bound bot reference --------------------------------------------
@@ -1032,6 +1034,14 @@ def _on_start(bot, _args):
     state.bot = bot
     state.accid = accid
 
+    # Bound dc.db growth: Delta Chat prunes local messages (incl. the
+    # webxdc status-update carriers the Publisher emits) older than this
+    # window. Never let a config-set failure abort startup.
+    try:
+        dc_config.apply_retention(bot.rpc, accid, DC_DELETE_DEVICE_AFTER_DAYS)
+    except Exception:
+        bot.logger.exception("failed to set delete_device_after retention")
+
     # Restore persisted rules onto twins, then backfill consumed/idle
     # evaluation buffers from history so they don't have to wait a fresh
     # window before being able to fire.
@@ -1048,9 +1058,9 @@ def _on_start(bot, _args):
 
     bot.logger.info(
         "mqtt-bot up; classes=%s devices=%s allowed_chats=%s "
-        "publish_interval=%ds",
+        "publish_interval=%ds delete_device_after=%dd",
         sorted(cfg.classes), sorted(cfg.devices), sorted(ALLOWED_CHATS),
-        PUBLISH_INTERVAL_S,
+        PUBLISH_INTERVAL_S, DC_DELETE_DEVICE_AFTER_DAYS,
     )
     if not ALLOWED_CHATS:
         bot.logger.warning(
