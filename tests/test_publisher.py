@@ -64,6 +64,21 @@ class TestPublisher(unittest.TestCase):
         pub._loop()
         self.assertEqual(len(sends), 2)  # heartbeat re-pushed identical body
 
+    def test_interval_clamp_bounds(self):
+        """The periodic interval is clamped to [60s, 24h]. The 24h ceiling
+        lets an idle-heartbeat cadence of hours through (3h = 10800s);
+        the 60s floor keeps a misconfigured tiny value sane."""
+        def mk(interval_s):
+            return publisher_mod.Publisher(
+                build=lambda c, cl: None,
+                msgids=lambda: {},
+                send=lambda c, m, p: True,
+                interval_s=interval_s,
+            )
+        self.assertEqual(mk(10800)._interval, 10800)   # 3h honored (was clamped to 900)
+        self.assertEqual(mk(999999)._interval, 86400)  # ceiling 24h
+        self.assertEqual(mk(1)._interval, 60)          # floor 60s
+
     def test_push_unicast_skips_when_build_returns_none(self):
         sent = []
         pub = publisher_mod.Publisher(

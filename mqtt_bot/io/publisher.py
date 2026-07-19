@@ -53,7 +53,11 @@ class Publisher:
         self._build = build
         self._msgids = msgids
         self._send = send
-        self._interval = max(60, min(int(interval_s), 900))
+        # Clamp to [60s, 24h]. The heartbeat is an idle-freshness tick, not
+        # the live path (state edges + refresh push immediately), so a cadence
+        # of hours is fine — the 24h ceiling lets PUBLISH_INTERVAL_S=10800 (3h)
+        # through, keeping dc.db growth from frequent full-snapshot carriers low.
+        self._interval = max(60, min(int(interval_s), 86400))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         # Last successfully-pushed content hash per (chat_id, msgid).
