@@ -456,6 +456,17 @@ Tracked in `~/.config/<BOT_NAME>/app_msgids.json` as
 has never recorded are dropped with a log line — points the user at
 `/apps`.
 
+**Retention interaction (`DC_DELETE_DEVICE_AFTER_DAYS`, default 14).**
+Delta Chat's `delete_device_after` prunes *all* local messages older
+than the window — including the webxdc app-container message a msgid
+points at. Pushing status updates to a container does not refresh its
+age, so an install left untouched past the window ages out: the next
+push fails with "Message Msg#N does not exist" (the same dangling-msgid
+outage as an unrecorded msgid) and that install goes silent until a
+`/apps` re-seed. `/apps` is always-resend, so re-running it heals a
+staled install. The 3 h heartbeat means a staled container surfaces in
+the log within one tick.
+
 ## Replay protection
 
 Three windows, all enforced in `bot.py`:
@@ -573,6 +584,25 @@ self-update). If only Python changed and `app/` didn't, the
 API requires `callback_api_version=`; we pass `VERSION1` because
 that's the signature our handlers are written for. `mqtt_client.py`
 falls back to the 1.x API if `CallbackAPIVersion` isn't importable.
+
+### Maintenance: reclaiming dc.db space
+
+`dc.db` (the Delta Chat core DB at `~/.config/<BOT_NAME>/accounts/*/dc.db`)
+grows from retained webxdc status-update carriers. Two knobs bound it:
+`PUBLISH_INTERVAL_S` (fewer idle heartbeats) and
+`DC_DELETE_DEVICE_AFTER_DAYS` (prune old messages). The DB runs with
+`PRAGMA auto_vacuum = INCREMENTAL`, so once retention prunes messages,
+Delta Chat's housekeeping returns the freed pages to the filesystem on
+its own — **no `VACUUM` needed**. Watch it drop with `du -h dc.db` over a
+few days after enabling retention. If it stalls, reclaim in-place during
+a brief stop (a full `VACUUM` is unnecessary and needs 2× the free
+space):
+
+```
+sudo systemctl stop deltabot-mqtt-bot.service
+sqlite3 ~/.config/mqtt-bot/accounts/*/dc.db 'PRAGMA incremental_vacuum;'
+sudo systemctl start deltabot-mqtt-bot.service
+```
 
 ## Known limitations / accepted trade-offs
 
