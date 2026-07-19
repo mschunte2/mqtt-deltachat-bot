@@ -43,5 +43,12 @@ class TestApplyRetention(unittest.TestCase):
         self.assertEqual(rpc.calls, [(7, "delete_device_after", "0")])
 
 
+class TestEnsureBotMode(unittest.TestCase):
+    def test_sets_bot_1(self):
+        rpc = _FakeRpc()
+        dc_config.ensure_bot_mode(rpc, 3)
+        self.assertEqual(rpc.calls, [(3, "bot", "1")])
+
+
 if __name__ == "__main__":
     unittest.main()

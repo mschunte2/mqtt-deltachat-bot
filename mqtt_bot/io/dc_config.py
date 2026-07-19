@@ -15,6 +15,17 @@ from __future__ import annotations
 _SECONDS_PER_DAY = 86400
 
 
+def ensure_bot_mode(rpc, accid: int) -> None:
+    """Put the account in Delta Chat bot mode (`bot=1`), idempotently.
+
+    deltabot-cli sets this only on its `init`/configure path — an account
+    imported from a backup does NOT get it, so unknown contacts' first
+    messages are parked as contact requests and group-membership events
+    never arrive, making the bot look dead to new users. Setting it when
+    already set is a harmless no-op."""
+    rpc.set_config(accid, "bot", "1")
+
+
 def delete_device_after_seconds(days: int) -> int:
     """Convert a retention window in days to the seconds value Delta Chat
     expects. 0 (and any nonsense negative) means "never delete"."""

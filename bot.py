@@ -1034,13 +1034,16 @@ def _on_start(bot, _args):
     state.bot = bot
     state.accid = accid
 
-    # Bound dc.db growth: Delta Chat prunes local messages (incl. the
-    # webxdc status-update carriers the Publisher emits) older than this
-    # window. Never let a config-set failure abort startup.
+    # Account config a backup import doesn't set for us. `bot=1` so unknown
+    # contacts are delivered + group events arrive; `delete_device_after`
+    # bounds dc.db by pruning old messages (incl. the webxdc status-update
+    # carriers the Publisher emits). Never let a config-set failure abort
+    # startup.
     try:
+        dc_config.ensure_bot_mode(bot.rpc, accid)
         dc_config.apply_retention(bot.rpc, accid, DC_DELETE_DEVICE_AFTER_DAYS)
     except Exception:
-        bot.logger.exception("failed to set delete_device_after retention")
+        bot.logger.exception("failed to apply Delta Chat account config")
 
     # Restore persisted rules onto twins, then backfill consumed/idle
     # evaluation buffers from history so they don't have to wait a fresh
