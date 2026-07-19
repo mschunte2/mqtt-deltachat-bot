@@ -21,7 +21,7 @@ const SERIAL_KEY = 'lastSerial';
 
 // Bump on substantive main.js / index.html changes; emitted in telemetry
 // so server-side stats can be grouped by build.
-const APP_BUILD_TS = 1779494800; // 2026-05-18 e — revert chess-pattern test
+const APP_BUILD_TS = 1784468620; // 2026-07-19 — fix stateEnergy crash on empty-cache boot
 
 // Telemetry collected during boot, sent once ~2s after script load.
 // nav_to_*_ms are performance.now() snapshots, relative to navigation
@@ -266,7 +266,6 @@ function render() {
   if (!dev) {
     stateText.textContent = '—';
     statePower.textContent = '— W';
-    stateEnergy.textContent = '';
     onlineDot.textContent = '⚪';
     stateIcon.className = 'state-icon off';
     return;
