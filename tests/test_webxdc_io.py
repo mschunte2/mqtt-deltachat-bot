@@ -132,5 +132,54 @@ class TestSendAppsOrdering(unittest.TestCase):
         self.assertEqual(rpc.deleted, [])
 
 
+class _StatusUpdateRpc:
+    """rpc whose send_webxdc_status_update either succeeds or raises a
+    chosen exception, for exercising push_to_msgid's self-heal path."""
+
+    def __init__(self, exc=None):
+        self._exc = exc
+
+    def send_webxdc_status_update(self, accid, msgid, body, info):
+        if self._exc is not None:
+            raise self._exc
+
+
+class TestPushSelfHeal(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.state_dir = root / "state"
+        self.state_dir.mkdir()
+        self.devices_dir = root / "devices"
+        self.devices_dir.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _push(self, exc):
+        io = WebxdcIO(self.state_dir, self.devices_dir)
+        fired = []
+        ok = io.push_to_msgid(
+            _FakeBot(_StatusUpdateRpc(exc)), accid=1, msgid=999,
+            payload={"x": 1}, on_missing=lambda: fired.append(True),
+        )
+        return ok, fired
+
+    def test_on_missing_fires_for_does_not_exist(self):
+        ok, fired = self._push(RuntimeError("Message Msg#999 does not exist"))
+        self.assertFalse(ok)
+        self.assertEqual(fired, [True])
+
+    def test_on_missing_not_fired_for_transient_error(self):
+        ok, fired = self._push(RuntimeError("connection reset by peer"))
+        self.assertFalse(ok)
+        self.assertEqual(fired, [])
+
+    def test_on_missing_not_fired_on_success(self):
+        ok, fired = self._push(None)
+        self.assertTrue(ok)
+        self.assertEqual(fired, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,14 @@ from pathlib import Path
 log = logging.getLogger("mqtt_bot.webxdc")
 
 
+def _is_missing_message(ex: Exception) -> bool:
+    """True if the RPC failure means the target message no longer exists
+    (Delta Chat reports "Message Msg#N does not exist"). This is the
+    dangling-msgid case that a re-seed can heal — as opposed to a
+    transient RPC/network error, which a retry handles."""
+    return "does not exist" in str(ex).lower()
+
+
 class WebxdcIO:
     def __init__(self, state_dir: Path, devices_dir: Path) -> None:
         """state_dir: where app_msgids.json lives (per-bot config dir).
@@ -157,13 +165,24 @@ class WebxdcIO:
 
     # --- push -------------------------------------------------------------
 
-    def push_to_msgid(self, bot, accid: int, msgid: int, payload: dict) -> bool:
+    def push_to_msgid(self, bot, accid: int, msgid: int, payload: dict,
+                      on_missing=None) -> bool:
+        """Push a webxdc status update to one msgid. If the push fails
+        because the message no longer exists (e.g. the app-container aged
+        out under delete_device_after), invoke `on_missing()` so the caller
+        can re-seed the app — pushes to a dangling msgid would otherwise
+        fail forever until a manual /apps. Other failures are logged only."""
         body = json.dumps({"payload": payload})
         try:
             bot.rpc.send_webxdc_status_update(accid, msgid, body, "")
             return True
         except Exception as ex:
             log.warning("push to msgid=%d failed: %s", msgid, ex)
+            if on_missing is not None and _is_missing_message(ex):
+                try:
+                    on_missing()
+                except Exception:
+                    log.exception("on_missing handler for msgid=%d failed", msgid)
             return False
 
     def map_snapshot(self) -> dict[int, dict[str, int]]:

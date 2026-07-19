@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 
 # Wire our package loggers (mqtt_bot.*) to stderr — deltabot-cli only
@@ -210,14 +211,49 @@ _twins = [
 registry = TwinRegistry(_twins)
 sweeper = rules_mod.RulesSweeper(registry)
 
+# Re-seed re-entrancy guard: a push that fails on a stale msgid triggers
+# send_apps, whose own seeding pushes could fail again for the same chat.
+# One in-flight re-seed per chat; concurrent/repeat failures coalesce.
+_reseed_lock = threading.Lock()
+_reseeding: set[int] = set()
+
+
+def _reseed_stale_chat(chat_id: int, msgid: int) -> None:
+    """A push to `msgid` failed because the message is gone (aged out under
+    delete_device_after, or user-deleted). Re-deliver the chat's apps and
+    seed the fresh instances, so pushes resume without a manual /apps."""
+    with _reseed_lock:
+        if chat_id in _reseeding:
+            return
+        _reseeding.add(chat_id)
+    try:
+        visible = registry.visible_classes_for(chat_id, ALLOWED_CHATS)
+        if not visible:
+            return
+        log.info("msgid=%d gone in chat=%d; re-seeding apps", msgid, chat_id)
+        sent, _ = webxdc.send_apps(state.bot, state.accid, chat_id, visible)
+        for cls in sent:
+            new_msgid = webxdc.map_snapshot().get(chat_id, {}).get(cls)
+            if new_msgid is not None:
+                publisher.push_unicast(chat_id, new_msgid, cls)
+    finally:
+        with _reseed_lock:
+            _reseeding.discard(chat_id)
+
+
+def _publisher_send(chat_id: int, msgid: int, payload: dict) -> bool:
+    return webxdc.push_to_msgid(
+        state.bot, state.accid, msgid, payload,
+        on_missing=lambda: _reseed_stale_chat(chat_id, msgid),
+    )
+
+
 publisher = Publisher(
     build=lambda chat_id, class_name: snap_mod.build_for_chat(
         chat_id, class_name, registry, ALLOWED_CHATS,
     ),
     msgids=lambda: webxdc.map_snapshot(),
-    send=lambda chat_id, msgid, payload: webxdc.push_to_msgid(
-        state.bot, state.accid, msgid, payload,
-    ),
+    send=_publisher_send,
     interval_s=PUBLISH_INTERVAL_S,
 )
 
