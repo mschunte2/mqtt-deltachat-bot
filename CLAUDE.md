@@ -439,7 +439,7 @@ level of `payload` — no wrapping `snapshot:` key:
 ```
 
 Pushed on (a) state edges, (b) periodic timer
-(`PUBLISH_INTERVAL_S`, default 300 s), (c) refresh button,
+(`PUBLISH_INTERVAL_S`, default 10800 s = 3 h), (c) refresh button,
 (d) `/apps` onboarding. The app caches the latest snapshot in
 `localStorage` and renders all chart windows from it — no on-demand
 fetches. `output` in `power_history` is `1|0|null`; `null` means the

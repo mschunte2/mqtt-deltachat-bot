@@ -103,7 +103,7 @@ RULES_PATH = STATE_DIR / "rules.json"
 BASELINES_PATH = STATE_DIR / "baselines.json"
 
 CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", BOT_NAME)
-PUBLISH_INTERVAL_S = int(os.environ.get("PUBLISH_INTERVAL_S", "300"))
+PUBLISH_INTERVAL_S = int(os.environ.get("PUBLISH_INTERVAL_S", "10800"))
 
 
 # --- Late-bound bot reference --------------------------------------------
