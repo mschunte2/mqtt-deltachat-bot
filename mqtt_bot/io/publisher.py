@@ -146,6 +146,10 @@ class Publisher:
         (chat, msgid)."""
         pushed = 0
         skipped = 0
+        # /apps mints a new msgid every run, so _last_hash accumulated an
+        # entry per install for the process lifetime. Small, but it never
+        # shrank; drop keys for msgids no longer in the registry.
+        live: set[tuple[int, int]] = set()
         for chat_id, by_class in self._msgids().items():
             for class_name, msgid in by_class.items():
                 if only_class is not None and class_name != only_class:
@@ -162,6 +166,12 @@ class Publisher:
                 if self._send(chat_id, msgid, payload):
                     self._last_hash[key] = h
                     pushed += 1
+            live.update((chat_id, m) for m in by_class.values())
+        if only_class is None:
+            # Only safe to prune on a full fan-out; a class-scoped one
+            # doesn't see the other classes' live msgids.
+            for stale in set(self._last_hash) - live:
+                self._last_hash.pop(stale, None)
         if device_name or skipped:
             log.debug("broadcast(trigger=%s class=%s force=%s) → %d push(es), %d skipped",
                       device_name, only_class, force, pushed, skipped)

@@ -548,17 +548,6 @@ def help_text(chat_id: int) -> str:
     return f"{prefix}\n\n{base}" if prefix else base
 
 
-#: Every webxdc action the bot will act on. `refresh` and `telemetry`
-#: are in here rather than short-circuiting above the check, so no
-#: action reaches real work without passing the whitelist.
-_KNOWN_ACTIONS = frozenset({
-    "on", "off", "toggle", "status",
-    "auto-off", "auto-on",
-    "cancel-auto-off", "cancel-auto-on", "cancel-schedule",
-    "reset-counter", "refresh", "telemetry",
-})
-
-
 def handle_webxdc_request(chat_id: int, msgid: int,
                           request: dict) -> None:
     cls_for_msg = webxdc.class_for_msgid(chat_id, msgid)
@@ -802,6 +791,7 @@ MAX_APP_AGE_SECONDS = commands_mod.MAX_APP_AGE_SECONDS
 MAX_CLOCK_SKEW_SECONDS = commands_mod.MAX_CLOCK_SKEW_SECONDS
 EXPORT_MAX_WINDOW_S = commands_mod.EXPORT_MAX_WINDOW_S
 EXPORT_MAX_ROWS = commands_mod.EXPORT_MAX_ROWS
+_KNOWN_ACTIONS = commands_mod.KNOWN_APP_ACTIONS
 
 
 def _is_allowed(chatid: int) -> bool:

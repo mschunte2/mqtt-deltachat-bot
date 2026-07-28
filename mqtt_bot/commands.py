@@ -48,6 +48,20 @@ EXPORT_MAX_WINDOW_S = 31 * 86400
 EXPORT_MAX_ROWS = 100_000
 
 
+#: Every webxdc action the bot will act on. `refresh` and `telemetry`
+#: are members rather than short-circuiting above the check in
+#: handle_webxdc_request, so no action reaches real work without passing
+#: the whitelist. Lives here, not in bot.py, so a lock-step test can
+#: compare it against what the shipped app actually emits — bot.py is
+#: import-hostile and cannot be asserted against.
+KNOWN_APP_ACTIONS = frozenset({
+    "on", "off", "toggle", "status",
+    "auto-off", "auto-on",
+    "cancel-auto-off", "cancel-auto-on", "cancel-schedule",
+    "reset-counter", "refresh", "telemetry",
+})
+
+
 def check_freshness(ts, now: int, max_age: int,
                     skew: int = MAX_CLOCK_SKEW_SECONDS) -> tuple[bool, str]:
     """Is a request bearing timestamp `ts` fresh enough to act on?

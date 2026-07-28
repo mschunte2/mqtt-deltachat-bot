@@ -51,8 +51,8 @@ import logging
 import sqlite3
 import threading
 import time
-from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger("mqtt_bot.history")
 
@@ -370,8 +370,6 @@ class History:
     def query_power(self, device: str, since_ts: int, until_ts: int,
                     max_points: int = 200,
                     ) -> tuple[int, list[tuple[int, float | None, float | None, float, int | None]]]:
-        if self._closed:
-            return (60, [])
         """Return (bucket_seconds, [(ts, min_w, max_w, avg_w, output), ...]).
 
         `min_w` / `max_w` are the trough / peak apower observed in the
@@ -380,7 +378,13 @@ class History:
         mean. `output` is MAX over the bucket's minutes: 1 if on for
         any minute, 0 if every minute off, NULL if no minutes had a
         known output.
+
+        (The early-return guard used to sit ABOVE this string, which
+        made it a no-op expression rather than a docstring — __doc__
+        was None.)
         """
+        if self._closed:
+            return (60, [])
         if until_ts <= since_ts:
             return (60, [])
         window = until_ts - since_ts
