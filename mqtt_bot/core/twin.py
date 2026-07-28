@@ -57,7 +57,10 @@ class TwinDeps:
     has zero static imports of bot/mqtt/publisher/webxdc — those
     dependencies are wired up in bot.py at construction time.
     """
-    mqtt_publish:    Callable[[str, str], None]                 # (topic, payload)
+    # (topic, payload) -> True/False. None also counts as success, so a
+    # backend or test fake that predates the return value keeps working
+    # rather than reporting every switch as failed — see _publish_ok.
+    mqtt_publish:    Callable[[str, str], "bool | None"]
     post_to_chats:   Callable[["Device", str], None]            # text → device.allowed_chats
     broadcast:       Callable[[str], None]                      # device_name → publisher
     save_rules:      Callable[[], None]                         # rules.json atomic save
@@ -162,13 +165,22 @@ class PlugTwin:
         elif new_out is False and prev_out is True:
             self._reset_rule_windows_for("on", now)
 
-        # State-based rule evaluation (idle / consumed). Dormant rules
-        # (target state already met) are reset to their starting condition
-        # so they don't accumulate while the plug sits in target.
-        rule_fired = self._tick_state_rules(current_fields, now)
-
-        # History writes — outside the lock; History has its own lock.
+        # History FIRST, then rule evaluation. The consumed and avg
+        # evaluators read this same history back, so writing afterwards
+        # meant every evaluation ran against data that was missing the
+        # sample which had just triggered it: avg's coverage gate
+        # systematically undercounted by one bucket, and consumed's
+        # window lagged one sample — a ~10% error at the default 60s
+        # cadence against a 10-minute window.
+        #
+        # Outside the lock; History has its own.
         self._write_history(suffix, payload, current_fields, now)
+
+        # State-based rule evaluation (idle / consumed / avg). Dormant
+        # rules (target state already met) are reset to their starting
+        # condition so they don't accumulate while the plug sits in
+        # target.
+        rule_fired = self._tick_state_rules(current_fields, now)
 
         # Broadcast on any state edge OR rule fire. Don't broadcast for
         # plain power-metric noise (apower wiggling without crossing
@@ -194,7 +206,13 @@ class PlugTwin:
         topic = f"{self.cfg.topic_prefix}/{cmd.suffix}"
         payload = templating.render(cmd.payload,
                                     {"client_id": self.deps.client_id})
-        self.deps.mqtt_publish(topic, payload)
+        if not _publish_ok(self.deps.mqtt_publish, topic, payload):
+            log.error("dispatch %s/%s → %s FAILED to publish",
+                      self.name, action, topic)
+            if source_msgid is not None:
+                self.deps.react(source_msgid, "❌")
+            return False, (f"could not reach the broker — {self.name} was NOT "
+                           f"switched {action}. Check the MQTT connection.")
         log.info("dispatch %s/%s → %s", self.name, action, topic)
 
         if source_msgid is not None:
@@ -333,6 +351,9 @@ class PlugTwin:
                 # app before it acts (avoids the rehydrate-insta-fire
                 # footgun).
                 if job.in_grace(now):
+                    _skip(self.name, job,
+                          "post-restart grace: %ds of %ds elapsed",
+                          now - job._loaded_at, rules_mod.GRACE_PERIOD_S)
                     survivors.append(job)
                     continue
                 # Time-based rule has reached its deadline.
@@ -350,16 +371,10 @@ class PlugTwin:
                     ctx["hh"] = f"{h:02d}"
                     ctx["mm"] = f"{m:02d}"
 
-                if job.once:
-                    pass  # drop, do not re-arm
-                elif job.time_of_day:
-                    h, m = job.time_of_day
-                    job.deadline_ts = rules_mod.next_tod_deadline(h, m, now)
+                # Shared with rules.load_into, so a rule that survives a
+                # fire also survives a restart (and vice versa).
+                if job.rearm(now):
                     survivors.append(job)
-                elif job.timer_seconds:
-                    job.deadline_ts = now + job.timer_seconds
-                    survivors.append(job)
-                # else: drop defensively
 
                 if not dormant:
                     fires.append((job, mode, ctx))
@@ -382,8 +397,35 @@ class PlugTwin:
         with self._lock:
             return list(self.rules)
 
-    def to_dict(self) -> dict[str, Any]:
-        """The per-device payload included in the outbound snapshot."""
+    def fields_snapshot(self) -> dict[str, Any]:
+        """Locked copy of the current state fields.
+
+        Readers used to do a bare `dict(twin.fields)`, which can raise
+        "dictionary changed size during iteration" while the MQTT thread
+        is inside `fields.update()`. formatters was doing exactly that
+        one line above a correctly-locked jobs_snapshot() call, which is
+        what makes it look accidental rather than deliberate.
+        """
+        with self._lock:
+            return dict(self.fields)
+
+    def to_dict(self, include_history: bool = True) -> dict[str, Any]:
+        """The per-device payload included in the outbound snapshot.
+
+        `include_history=False` omits `power_history` and
+        `daily_energy_wh` — ~2500 chart points plus 365 daily pairs per
+        device, which is the bulk of a ~139 KB snapshot and the reason
+        dc.db reached 464 MB on the live host. Those series barely
+        change between two state edges seconds apart, and every push
+        leaves a permanently-retained carrier message. Edge broadcasts
+        therefore send live state only; the periodic heartbeat, the
+        refresh button and /apps send the full payload.
+
+        The app merges a partial payload into its cached snapshot. Older
+        app builds simply render "(no data yet)" on the chart until the
+        next full push — they already guard both keys — so no installed
+        instance breaks while it waits for /apps.
+        """
         now_ts = int(time.time())
 
         def _actual_window(job, full_window_s: int) -> int:
@@ -482,7 +524,7 @@ class PlugTwin:
         }
         if self.deps.history is not None:
             from .snapshot import (_daily_energy_wh, _energy_summary,
-                                   _power_history)
+                                   _power_history)  # noqa: F401
             # Effective lifetime = raw_at_or_before(now) + cumulative
             # offset SUM. Falls back to the in-memory raw field if we
             # don't yet have a samples_raw row (e.g. just before the
@@ -497,14 +539,15 @@ class PlugTwin:
                 baseline_wh=self.baseline_wh,
                 reset_at_ts=self.reset_at_ts,
             )
-            payload["daily_energy_wh"] = _daily_energy_wh(
-                self.deps.history, self.name,
-            )
-            payload["power_history"] = _power_history(
-                self.deps.history, self.name,
-                live_apower=fields.get("apower"),
-                live_output=fields.get("output"),
-            )
+            if include_history:
+                payload["daily_energy_wh"] = _daily_energy_wh(
+                    self.deps.history, self.name,
+                )
+                payload["power_history"] = _power_history(
+                    self.deps.history, self.name,
+                    live_apower=fields.get("apower"),
+                    live_output=fields.get("output"),
+                )
         return payload
 
     # --- internals ------------------------------------------------------
@@ -634,6 +677,8 @@ class PlugTwin:
                 # State-aware dormancy: reset transient counters and skip
                 # while the device is already in the rule's target state.
                 if rules_mod._job_dormant(job, output):
+                    _skip(self.name, job,
+                          "dormant — device output is already %r", output)
                     job._below_since = None
                     job._consumed_started_at = now
                     job._avg_started_at = now
@@ -643,6 +688,9 @@ class PlugTwin:
                 # don't fire on the first tick after restart even if
                 # history already satisfies the condition.
                 if job.in_grace(now):
+                    _skip(self.name, job,
+                          "post-restart grace: %ds of %ds elapsed",
+                          now - job._loaded_at, rules_mod.GRACE_PERIOD_S)
                     survivors.append(job)
                     continue
                 fired = False
@@ -746,14 +794,20 @@ class PlugTwin:
         if self.deps.history is None:
             return False
         if now - job._avg_started_at < job.avg_window_s:
+            _skip(self.name, job, "avg warm-up: %ds of %ds observed",
+                  now - job._avg_started_at, job.avg_window_s)
             return False
         since = now - job.avg_window_s
         rows = self.deps.history.query_power_raw(self.name, since, now)
         vals = [r[1] for r in rows if r[1] is not None]
         if not vals:
+            _skip(self.name, job, "avg: no power_minute rows in the window")
             return False
         expected = max(1, job.avg_window_s // 60)
         if len(vals) < expected * 0.9:
+            _skip(self.name, job,
+                  "avg coverage: only %d of ~%d expected minutes have data "
+                  "(device offline for part of the window)", len(vals), expected)
             return False  # too many offline minutes
         max_min_avg = max(vals)
         if max_min_avg < job.avg_threshold_w:
@@ -788,12 +842,17 @@ class PlugTwin:
         if self.deps.history is None:
             return False
         if now - job._consumed_started_at < job.consumed_window_s:
+            _skip(self.name, job, "consumed warm-up: %ds of %ds observed",
+                  now - job._consumed_started_at, job.consumed_window_s)
             return False
         since = now - job.consumed_window_s
         wh, earliest = self.deps.history.energy_consumed_in(
             self.name, since, now,
         )
         if earliest is None or earliest > since:
+            _skip(self.name, job,
+                  "consumed coverage: history starts at %s, window needs %d",
+                  earliest, since)
             return False  # insufficient history coverage
         if wh < job.consumed_threshold_wh:
             fires.append((job, "consumed", {
@@ -817,10 +876,29 @@ class PlugTwin:
             log.error("rule fired for unknown action %s on %s",
                       job.target_action, self.name)
             return
+        with self._lock:
+            if job._cancelled:
+                # Cancelled after this tick selected it. Telling the user
+                # "cancelled" and then switching the plug anyway is the
+                # worst of both answers.
+                _skip(self.name, job, "cancelled before it could fire")
+                return
         topic = f"{self.cfg.topic_prefix}/{cmd.suffix}"
         payload = templating.render(cmd.payload,
                                     {"client_id": self.deps.client_id})
-        self.deps.mqtt_publish(topic, payload)
+        if not _publish_ok(self.deps.mqtt_publish, topic, payload):
+            # Say what actually happened. Posting the normal trigger
+            # message here would tell the user their appliance had been
+            # switched off when it is still running — the worst outcome
+            # for a safety rule.
+            log.error("rule fire %s/%s mode=%s → %s FAILED to publish",
+                      self.name, job.target_action, mode, topic)
+            self.deps.post_to_chats(
+                self.cfg,
+                f"⚠️ {self.name}: could not reach the broker — the "
+                f"'{job.target_action}' rule did NOT take effect. "
+                f"The rule stays armed and will retry.")
+            return
         log.info("rule fire %s/%s mode=%s → %s",
                  self.name, job.target_action, mode, topic)
         section = self._auto_section_for(job.target_action)
@@ -848,6 +926,11 @@ class PlugTwin:
                     survivors.append(r); continue
                 if rule_id is not None and r.rule_id != rule_id:
                     survivors.append(r); continue
+                # Mark, don't just unlist: a tick may already hold this
+                # job in its `fires` list, past the point where it would
+                # re-read self.rules. _fire_rule re-checks the flag
+                # immediately before publishing.
+                r._cancelled = True
                 cancelled.append(r)
             self.rules = survivors
         return cancelled
@@ -895,6 +978,42 @@ class PlugTwin:
 
 
 # --- pure helpers (module-level) -----------------------------------------
+
+def _skip(device: str, job, reason: str, *args) -> None:
+    """Log why a rule did NOT fire.
+
+    Every negative decision point used to be a bare `continue` or
+    `return False`, so "my rule didn't fire" was unanswerable from the
+    journal at any level — including debug. Only the positive path
+    logged. Dormancy is the most common real cause and the user had no
+    way to learn it; the avg-coverage gate is the hardest to guess,
+    since a rule silently refuses to fire because the plug was offline
+    for more than 10% of the window.
+
+    DEBUG because a busy device evaluates rules on every status update;
+    the point is that `LOG_LEVEL=debug` now *answers the question*
+    rather than being equally silent.
+    """
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("rule skip %s/%s [%s]: " + reason,
+                  device, job.target_action, job.rule_id, *args)
+
+
+def _publish_ok(publish, topic: str, payload: str) -> bool:
+    """Publish and normalise the result to a bool.
+
+    `TwinDeps.mqtt_publish` used to be typed `-> None`, and a publisher
+    that still returns None is reporting "no error", not "failed". Only
+    an explicit False (or a raised exception) counts as a failure, so
+    older backends and test fakes don't suddenly mark every switch as
+    unsuccessful.
+    """
+    try:
+        return publish(topic, payload) is not False
+    except Exception:
+        log.exception("mqtt publish to %s raised", topic)
+        return False
+
 
 def _coerce_value_key(v: Any) -> str:
     if isinstance(v, bool):

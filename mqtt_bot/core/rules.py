@@ -19,9 +19,9 @@ rules (timer / tod).
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..io import atomic
+from ..io.atomic import STATE_FILE_MODE
 from ..util import durations
 
 log = logging.getLogger("mqtt_bot.rules")
@@ -43,6 +45,26 @@ log = logging.getLogger("mqtt_bot.rules")
 # react. Runtime-scheduled rules (`/dev off if idle` from chat or
 # the app) leave `_loaded_at = 0` and are NOT subject to it.
 GRACE_PERIOD_S = 60
+
+# Longest observation window an idle/consumed/avg rule may use. These
+# windows are re-queried against SQLite on every snapshot build (see
+# ScheduledJob.from_policy), and a snapshot is built on every state
+# edge, so an unbounded window is a repeated full-table scan on the
+# MQTT callback thread rather than a one-off cost. A week is far longer
+# than any "has this appliance gone idle" question needs.
+MAX_RULE_WINDOW_S = 7 * 86400
+
+
+def _clamp_window(seconds: int | None, kind: str, device: str) -> int | None:
+    """Bound one observation window, logging when it bites."""
+    if seconds is None:
+        return None
+    seconds = int(seconds)
+    if seconds > MAX_RULE_WINDOW_S:
+        log.warning("%s: %s window %ds exceeds the %dd maximum; clamping",
+                    device, kind, seconds, MAX_RULE_WINDOW_S // 86400)
+        return MAX_RULE_WINDOW_S
+    return seconds
 
 
 # --- Defaults & data shapes ----------------------------------------------
@@ -153,6 +175,15 @@ class ScheduledJob:
     # Transient — NOT persisted via to_dict / from_dict.
     _loaded_at: int = 0
 
+    # Set by PlugTwin._remove_rules under the twin lock when this rule
+    # is cancelled. Both tick paths select the rules to fire under the
+    # lock, release it, and only then publish — so a cancel arriving in
+    # that window used to unlist the job while the already-built `fires`
+    # list still switched the plug. The state-rule path holds that
+    # window open across several SQL round-trips. Checked immediately
+    # before the side effect. Transient — NOT persisted.
+    _cancelled: bool = False
+
     @classmethod
     def from_policy(
         cls,
@@ -171,6 +202,20 @@ class ScheduledJob:
             h, m = policy.time_of_day
             deadline_ts = next_tod_deadline(h, m, now)
             time_mode = "tod"
+
+        # Every path that turns a policy into a rule funnels through
+        # here, so this is the one place to bound observation windows.
+        # They aren't just a rule-evaluation cost: `to_dict` re-runs the
+        # idle window's samples_raw query on EVERY snapshot build, and a
+        # snapshot is built on every state edge. A rule written as
+        # "off if idle 5W in 365d" would put a year-long scan on the
+        # MQTT callback thread several times a minute.
+        idle_duration_s = _clamp_window(policy.idle_duration_s, "idle",
+                                        device_name)
+        consumed_window_s = _clamp_window(policy.consumed_window_s, "consumed",
+                                          device_name)
+        avg_window_s = _clamp_window(policy.avg_window_s, "avg", device_name)
+
         return cls(
             device_name=device_name,
             chat_id_origin=chat_id_origin,
@@ -184,14 +229,14 @@ class ScheduledJob:
             once=policy.once,
             idle_field=policy.idle_field,
             idle_threshold=policy.idle_threshold,
-            idle_duration_s=policy.idle_duration_s,
+            idle_duration_s=idle_duration_s,
             consumed_field=policy.consumed_field,
             consumed_threshold_wh=policy.consumed_threshold_wh,
-            consumed_window_s=policy.consumed_window_s,
+            consumed_window_s=consumed_window_s,
             _consumed_started_at=now if policy.consumed_field else 0,
             avg_field=policy.avg_field,
             avg_threshold_w=policy.avg_threshold_w,
-            avg_window_s=policy.avg_window_s,
+            avg_window_s=avg_window_s,
             _avg_started_at=now if policy.avg_field else 0,
             _observation_started_at=(
                 now if (policy.idle_field or policy.consumed_field
@@ -201,6 +246,43 @@ class ScheduledJob:
 
     def has_time(self) -> bool:
         return self.deadline_ts is not None
+
+    def is_recurring(self) -> bool:
+        """Whether this rule re-arms after firing.
+
+        Since v0.1.5 recurrence is `once`, full stop. `recurring_tod`
+        survives only as the flag that decides whether the user asked
+        for "daily" explicitly — it does NOT decide behaviour, because
+        a TOD rule with once=False re-arms to the next occurrence
+        either way. Three call sites used to answer this question
+        differently (tick_time on `once`, load_into on `recurring_tod`,
+        the formatter on `recurring_tod`), which is how restart came to
+        silently drop rules the running bot kept firing.
+        """
+        return not self.once
+
+    def rearm(self, now: int) -> bool:
+        """Move `deadline_ts` to this rule's next occurrence.
+
+        Returns True if the rule should be kept, False if it is spent
+        and the caller should drop it. The single source of truth for
+        re-arming, shared by `twin.tick_time` (a rule that just fired)
+        and `rules.load_into` (a deadline that elapsed during
+        downtime), so the two can never diverge again.
+        """
+        if not self.is_recurring():
+            return False
+        if self.time_of_day:
+            h, m = self.time_of_day
+            self.deadline_ts = next_tod_deadline(h, m, now)
+            return True
+        if self.timer_seconds:
+            self.deadline_ts = now + self.timer_seconds
+            return True
+        # A time-based rule with neither a TOD nor a stored duration
+        # can't be re-armed (pre-v0.1.5 rules.json entries lack
+        # timer_seconds). Drop it rather than leave it stuck in the past.
+        return False
 
     def in_grace(self, now: int, grace_s: int = GRACE_PERIOD_S) -> bool:
         """True for rules just loaded from rules.json that haven't
@@ -353,13 +435,33 @@ def _sec_to_min(seconds: int | None) -> float | None:
 
 def next_tod_deadline(h: int, m: int, now: int) -> int:
     """Unix seconds for the next occurrence of HH:MM in local time.
-    Uses mktime with isdst=-1 for DST safety."""
+
+    Day arithmetic is done on the CALENDAR, not by adding 86400.
+    `now + 86400` lands on the same calendar date whenever the local day
+    is 25 hours long and `now` is in its first hour — so on the autumn
+    fall-back day this used to return a timestamp in the *past*. A rule
+    that then re-armed to that timestamp fired again immediately, giving
+    a 2 Hz fire/re-arm loop for up to half an hour: thousands of
+    rules.json rewrites, and for a `toggle` rule (never dormant) the
+    plug switched and the chat was spammed at the same rate.
+
+    mktime with isdst=-1 is still what resolves the wall-clock time to
+    an instant, which is why the spring-forward gap (a 02:30 that does
+    not exist) lands harmlessly on 03:30 rather than raising.
+    """
     lt = time.localtime(now)
     target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, m, 0, 0, 0, -1))
     if target <= now:
-        tom = time.localtime(now + 86400)
-        target = time.mktime((tom.tm_year, tom.tm_mon, tom.tm_mday, h, m, 0, 0, 0, -1))
+        tom = _next_calendar_day(lt)
+        target = time.mktime((*tom, h, m, 0, 0, 0, -1))
     return int(target)
+
+
+def _next_calendar_day(lt: time.struct_time) -> tuple[int, int, int]:
+    """(year, month, day) of the day after `lt`, by calendar rather than
+    by elapsed seconds — DST changes the length of a day, not its date."""
+    return tuple((datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday)
+                  + datetime.timedelta(days=1)).timetuple()[:3])
 
 
 # --- Parser --------------------------------------------------------------
@@ -499,16 +601,21 @@ def _value_unit_split(s: str) -> tuple[float, str]:
 
 def save_all(registry, path: Path | str) -> None:
     """Write every twin's rules to a single rules.json. Atomic.
-    `registry` is a TwinRegistry."""
+    `registry` is a TwinRegistry.
+
+    Reachable from three threads (DC handler via schedule/cancel, the
+    rules sweeper via tick_time, and the MQTT callback via state rules
+    firing on a status update), so the write goes through `atomic` —
+    which serialises per path. A torn rules.json reads back as a
+    JSONDecodeError, which `load_into` turns into "no rules at all".
+    """
     p = Path(path)
     jobs: list[dict] = []
     for twin in registry.all():
         jobs.extend(j.to_dict() for j in twin.jobs_snapshot())
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"jobs": jobs}, indent=2))
-        os.replace(tmp, p)
+        atomic.write_text(p, json.dumps({"jobs": jobs}, indent=2),
+                          mode=STATE_FILE_MODE)
     except Exception:
         log.exception("persist rules to %s failed", p)
 
@@ -543,13 +650,25 @@ def load_into(registry, path: Path | str) -> int:
             dropped_unknown[job.device_name] = dropped_unknown.get(
                 job.device_name, 0) + 1
             continue
+        # An out-of-range deadline is a poison pill: it used to be
+        # persisted before the sweeper ever saw it, so the resulting
+        # outage survived every restart and only hand-editing this file
+        # recovered. durations.parse now rejects these at the source;
+        # this drops any that a previous version already wrote.
+        if job.deadline_ts and job.deadline_ts > now + durations.MAX_SECONDS:
+            log.warning("dropping %s rule for %s with out-of-range deadline "
+                        "%d (more than %dd out)",
+                        job.target_action, job.device_name, job.deadline_ts,
+                        durations.MAX_SECONDS // 86400)
+            dropped_malformed += 1
+            continue
         if job.deadline_ts and job.deadline_ts < now:
-            if job.recurring_tod and job.time_of_day:
-                h, m = job.time_of_day
-                job.deadline_ts = next_tod_deadline(h, m, now)
+            # Same verdict tick_time would reach for a rule that fired:
+            # recurring rules re-arm (TOD to the next occurrence, timer
+            # to now + its duration), one-shots are spent.
+            if job.rearm(now):
                 rearmed = True
             else:
-                # one-shot timer/tod expired during downtime — drop
                 dropped_expired += 1
                 continue
         # Stamp loaded-at so PlugTwin's tick honours the grace period
@@ -579,6 +698,13 @@ def load_into(registry, path: Path | str) -> int:
 
 # --- Sweeper thread ------------------------------------------------------
 
+#: Longest the sweeper will sleep in one go. Rules further out than this
+#: simply get re-evaluated on the next wake — ticking is cheap (a
+#: comparison per rule), and a bounded wait means no deadline value can
+#: exceed what threading.Event.wait accepts.
+MAX_SWEEP_WAIT_S = 3600
+
+
 class RulesSweeper:
     """Single daemon thread that wakes at the earliest deadline across
     every twin and calls twin.tick_time(now) on every twin. Tick is
@@ -601,31 +727,64 @@ class RulesSweeper:
         self._stop.set()
         self._wake.set()
 
+    def is_alive(self) -> bool:
+        """Whether the sweeper thread is still running — surfaced by
+        /diag. This thread dying is the single most consequential silent
+        failure in the bot: every timer and time-of-day rule stops
+        firing, and /rules keeps counting down against nothing."""
+        return self._thread is not None and self._thread.is_alive()
+
     def wake(self) -> None:
         """Called when a new rule is added/cancelled, so we re-evaluate
         the earliest deadline immediately."""
         self._wake.set()
 
+    def _next_wait(self) -> float | None:
+        """Seconds to sleep before the next tick, or None to block until
+        woken. Never returns a value `Event.wait` would reject: a single
+        rule with an out-of-range deadline used to raise OverflowError
+        here and take the whole thread down with it, silently stopping
+        every timed rule on every device until a restart. A twin whose
+        next_deadline() raises is skipped rather than allowed to mask
+        the deadlines of its neighbours."""
+        now = int(time.time())
+        deadlines = []
+        for t in self._registry.all():
+            try:
+                d = t.next_deadline()
+            except Exception:
+                log.exception("next_deadline raised for %s; ignoring its rules "
+                              "for this pass", getattr(t, "name", "?"))
+                continue
+            if d is not None:
+                deadlines.append(d)
+        if not deadlines:
+            return None
+        return min(max(0.5, min(deadlines) - now), MAX_SWEEP_WAIT_S)
+
     def _loop(self) -> None:
+        # The whole body is guarded. This thread is the only thing that
+        # fires timer and time-of-day rules, start() refuses to restart
+        # it once it has run, and nothing monitors its liveness — so an
+        # escaping exception is a permanent, silent outage.
         while not self._stop.is_set():
-            now = int(time.time())
-            deadlines = [d for d in (t.next_deadline()
-                                     for t in self._registry.all())
-                         if d is not None]
-            if deadlines:
-                wait_for = max(0.5, min(deadlines) - now)
-            else:
-                wait_for = None  # block until wake
-            if wait_for is None:
-                self._wake.wait()
-            else:
-                self._wake.wait(timeout=wait_for)
-            self._wake.clear()
-            if self._stop.is_set():
-                return
-            now = int(time.time())
-            for t in self._registry.all():
-                try:
-                    t.tick_time(now)
-                except Exception:
-                    log.exception("tick_time raised for %s", t.name)
+            try:
+                wait_for = self._next_wait()
+                if wait_for is None:
+                    self._wake.wait()
+                else:
+                    self._wake.wait(timeout=wait_for)
+                self._wake.clear()
+                if self._stop.is_set():
+                    return
+                now = int(time.time())
+                for t in self._registry.all():
+                    try:
+                        t.tick_time(now)
+                    except Exception:
+                        log.exception("tick_time raised for %s", t.name)
+            except Exception:
+                log.exception("rules sweeper iteration failed; continuing")
+                # Don't spin if the failure is immediate and persistent.
+                self._stop.wait(1.0)
+        log.info("rules sweeper stopped")

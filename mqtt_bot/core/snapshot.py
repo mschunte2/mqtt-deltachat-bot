@@ -14,6 +14,7 @@ dependencies.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
 from typing import Any
@@ -30,9 +31,16 @@ _HISTORY_DAY_WINDOW = 365 * _DAY         # last 365 d at 1-day buckets
 
 
 def build_for_chat(chat_id: int, class_name: str,
-                   registry, allowed_chats: set[int]) -> dict[str, Any] | None:
+                   registry, allowed_chats: set[int],
+                   include_history: bool = True) -> dict[str, Any] | None:
     """Build the per-(chat, class) payload. None if the chat sees no
-    devices in this class — caller skips the push."""
+    devices in this class — caller skips the push.
+
+    `include_history=False` produces the compact edge payload: live
+    state, rules and energy counters, without the ~2500 chart points
+    and 365 daily-energy pairs per device. `kind` tells the app which
+    it received, so it can merge rather than replace.
+    """
     visible = [t for t in registry.all()
                if t.cls.name == class_name
                and t.can_chat_see(chat_id, allowed_chats)]
@@ -41,7 +49,9 @@ def build_for_chat(chat_id: int, class_name: str,
     return {
         "class": class_name,
         "server_ts": int(time.time()),
-        "devices": {t.name: t.to_dict() for t in visible},
+        "kind": "full" if include_history else "state",
+        "devices": {t.name: t.to_dict(include_history=include_history)
+                    for t in visible},
     }
 
 
@@ -187,9 +197,19 @@ def _local_midnight(now_ts: int) -> int:
 
 
 def _local_week_start(now_ts: int) -> int:
-    midnight = _local_midnight(now_ts)
-    lt = time.localtime(midnight)
-    return midnight - lt.tm_wday * _DAY
+    """Local midnight on the Monday of this week.
+
+    Stepping back by `tm_wday * 86400` lands on 23:00 or 01:00 rather
+    than midnight whenever a DST change falls inside the week, shifting
+    the whole "this week" energy figure by an hour. Go back by calendar
+    days and re-resolve the wall-clock midnight instead — the same fix
+    as rules.next_tod_deadline.
+    """
+    lt = time.localtime(_local_midnight(now_ts))
+    monday = (datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday)
+              - datetime.timedelta(days=lt.tm_wday))
+    return int(time.mktime((monday.year, monday.month, monday.day,
+                            0, 0, 0, 0, 0, -1)))
 
 
 def _local_month_start(now_ts: int) -> int:

@@ -5,7 +5,11 @@ Accepted forms (case-insensitive, whitespace-tolerant):
 
 Returns integer seconds. Raises ValueError on anything else, including
 an empty string. Zero is rejected — a zero-duration auto-off makes no
-sense and is almost always a typo.
+sense and is almost always a typo. So is anything above MAX_SECONDS:
+the result feeds `ScheduledJob.deadline_ts`, and the rules sweeper
+waits on `deadline - now`, which raises OverflowError above
+`threading.TIMEOUT_MAX`. A year is far more than any plug timer needs
+and leaves seven orders of magnitude of headroom under that limit.
 """
 
 import re
@@ -21,6 +25,9 @@ _FULL_RE = re.compile(r"^(?:\s*\d+\s*" + _UNIT + r"\s*)+$", re.IGNORECASE)
 
 _MULT = {"d": 86400, "h": 3600, "m": 60, "s": 1}
 
+#: Upper bound on any parsed duration (365 days).
+MAX_SECONDS = 365 * 86400
+
 
 def parse(text: str) -> int:
     if not text or not _FULL_RE.match(text):
@@ -32,6 +39,9 @@ def parse(text: str) -> int:
         total += int(n) * _MULT[unit[0].lower()]
     if total <= 0:
         raise ValueError(f"duration must be positive: {text!r}")
+    if total > MAX_SECONDS:
+        raise ValueError(
+            f"duration too long (max {MAX_SECONDS // 86400}d): {text!r}")
     return total
 
 

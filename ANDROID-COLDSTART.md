@@ -38,6 +38,12 @@ Two possibilities remain:
 
 ## Comparative evidence (BAD-APPS folder)
 
+> The `BAD-APPS/` folder is **local-only and gitignored**: those are
+> other people's published webxdc apps, kept on the dev machine as
+> comparison subjects. They are not ours to redistribute from a public
+> repo, and nothing in the bot needs them. Re-download them from their
+> respective chats if you want to repeat these measurements.
+
 We compared the source of three xdcs that all run inside the same
 Delta Chat for Android client:
 

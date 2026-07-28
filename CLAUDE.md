@@ -225,7 +225,8 @@ Use it everywhere — never duplicate the check inline.
 
 ## PlugTwin (per-device digital twin)
 
-`PlugTwin` lives in `plug.py`. One instance per `Device`. Owns:
+`PlugTwin` lives in `mqtt_bot/core/twin.py`. One instance per
+`Device`. Owns:
 
 - `fields: dict[str, Any]` — current state (online, output, apower, …)
 - `last_update_ts: int`
@@ -320,9 +321,27 @@ counter starts fresh.
   `samples_raw` doesn't extend back to the window start
   (`earliest_ts > since`), don't fire (we'd be comparing a
   partial-window delta against a full-window threshold).
+- **avg:** fires when `MAX(avg_apower_w)` across the 1-minute buckets
+  in `[now - avg_window_s, now]` is below `avg_threshold_w` — i.e.
+  *every* one-minute average stayed under the threshold. Distinct
+  from `idle`, which requires every raw sample below threshold: `avg`
+  suits cycling loads (espresso machine, fridge) where short bursts
+  above the threshold are expected and the average is what matters.
+  Evaluated inline by `twin.on_mqtt`, reading `power_minute`. Two
+  gates: (a) `_avg_started_at` window-warmup, as for consumed;
+  (b) coverage — at least 90% of the expected minute buckets must
+  have rows, since `power_minute` only has a row for a minute that
+  received a sample, so a long offline gap would otherwise let a
+  partial-window MAX satisfy the threshold.
+
+All observation windows (`idle`, `consumed`, `avg`) are clamped to
+`rules.MAX_RULE_WINDOW_S` (7 days) in `ScheduledJob.from_policy` —
+the single funnel from policy to rule. They are re-queried on every
+snapshot build, which happens on every state edge, so an unbounded
+window is a repeated long scan on the MQTT callback thread.
 
 Time-based policies are mutually exclusive within one rule (timer
-XOR tod). Idle and consumed can each appear at most once. Policies
+XOR tod). Idle, consumed and avg can each appear at most once. Policies
 combine OR-wise — whichever fires first wins.
 
 ### `RulesSweeper`
@@ -426,25 +445,52 @@ level of `payload` — no wrapping `snapshot:` key:
        "fields": {"online": true, "output": false, "apower": 0.0, ...},
        "last_update_ts": 1714000000,
        "energy": { "kwh_last_hour": ..., "current_total_wh": ... },
-       "daily_energy_wh": [[ts, wh] ... 30],
+       "daily_energy_wh": [[ts, wh] ... 365],
        "scheduled_jobs": [{"target_action": "off", "deadline_ts": ...}],
        "params": { "power_threshold_watts": 1500, ... },
        "power_history": {
-         "minute": [[ts, w, 1|0|null] ... 1440],
-         "hour":   [[ts, w, 1|0|null] ...  744]
+         "minute": [[ts, min_w, max_w, avg_w, 1|0|null] ... 1440],
+         "hour":   [[ts, min_w, max_w, avg_w, 1|0|null] ...  750],
+         "day":    [[ts, min_w, max_w, avg_w, 1|0|null] ...  365]
        }
      }
    }
 }}
 ```
 
-Pushed on (a) state edges, (b) periodic timer
-(`PUBLISH_INTERVAL_S`, default 10800 s = 3 h), (c) refresh button,
-(d) `/apps` onboarding. The app caches the latest snapshot in
+Each `power_history` entry is `[ts, min_w, max_w, avg_w, output]` —
+see *Snapshot energy + history blocks* below for how the app renders
+them. (This block previously documented a 3-element
+`[ts, w, output]` shape, contradicting that section; the 5-element
+form is the real one.) `output` is `1|0|null`; `null` means the plug
+had no `power_minute` row for that bucket → app paints grey (offline).
+
+Pushed on (a) state edges — coalesced, compact, (b) periodic timer
+(`PUBLISH_INTERVAL_S`, default 10800 s = 3 h) — full, (c) refresh
+button — full, (d) `/apps` onboarding — full. The app caches the latest snapshot in
 `localStorage` and renders all chart windows from it — no on-demand
-fetches. `output` in `power_history` is `1|0|null`; `null` means the
-plug had no `power_minute` row for that bucket → app paints grey
-(offline).
+fetches.
+
+**Two payload kinds.** `kind` tells the app what it received:
+
+- `"full"` — everything above. Sent on the periodic heartbeat, the
+  refresh button and `/apps`.
+- `"state"` — live `fields`, `scheduled_jobs`, `energy` and `params`
+  only; no `power_history`, no `daily_energy_wh`. Sent on state edges.
+
+A full payload measured ~139 KB per device (1440 + 750 + 365 chart
+buckets plus 365 daily-energy pairs), and every push leaves a
+permanently-retained carrier message in `dc.db`. Edge broadcasts used
+to be unthrottled full pushes, which is what took `dc.db` to 464 MB —
+see *Maintenance: reclaiming dc.db space*.
+
+Edges are now **coalesced** by `Publisher.COALESCE_S` (2 s) and
+performed on the publisher daemon, not inline on the MQTT callback
+thread. The app merges a `"state"` payload over its cached snapshot so
+the charts survive between heartbeats; a payload with no `kind` is
+treated as full (that is what an older bot sends), and an older *app*
+build renders "(no data yet)" on the chart until the next full push
+rather than breaking.
 
 ### `/apps` onboarding
 
@@ -497,7 +543,7 @@ the real package installed.
 Run with `python3 -m unittest discover tests`. Coverage: durations parser,
 templating regex (incl. JSON brace passthrough), state extraction
 (bool_text + json_path edges), permissions (global + per-device +
-fallback), scheduler.parse_policy (every form + restricted kinds),
+fallback), rules.parse_policy (every form + restricted kinds),
 scheduler.next_tod_deadline, scheduler.tick
 (idle fire + reset), config loader (every error path), engine
 (unknown device, permission denied, unknown action, publish, template
@@ -590,13 +636,21 @@ falls back to the 1.x API if `CallbackAPIVersion` isn't importable.
 `dc.db` (the Delta Chat core DB at `~/.config/<BOT_NAME>/accounts/*/dc.db`)
 grows from retained webxdc status-update carriers. Two knobs bound it:
 `PUBLISH_INTERVAL_S` (fewer idle heartbeats) and
-`DC_DELETE_DEVICE_AFTER_DAYS` (prune old messages). The DB runs with
-`PRAGMA auto_vacuum = INCREMENTAL`, so once retention prunes messages,
-Delta Chat's housekeeping returns the freed pages to the filesystem on
-its own — **no `VACUUM` needed**. Watch it drop with `du -h dc.db` over a
-few days after enabling retention. If it stalls, reclaim in-place during
-a brief stop (a full `VACUUM` is unnecessary and needs 2× the free
-space):
+`DC_DELETE_DEVICE_AFTER_DAYS` (prune old messages).
+
+**Retention alone does not bound this — measured, 2026-07-28.** On the
+live host `delete_device_after` was correctly set to 14 days and `dc.db`
+had still reached **464 MB**. The breakdown: `msgs.param` 324 MB over
+32 653 rows, `msgs_status_updates` 53 MB over just 382 rows (~139 KB per
+snapshot push), blobdir only 908 KB. 30 125 of those `msgs` rows sit in
+`chat_id=3` — the trash chat — with `timestamp=0`, which a
+timestamp-based prune never matches.
+
+So the growth driver is **push volume × payload size**, not retention.
+The real lever is reducing how often and how much we push; retention and
+`PRAGMA auto_vacuum = INCREMENTAL` only reclaim what they can actually
+match. If space needs reclaiming in-place, do it during a brief stop (a
+full `VACUUM` is unnecessary and needs 2× the free space):
 
 ```
 sudo systemctl stop deltabot-mqtt-bot.service
@@ -606,19 +660,29 @@ sudo systemctl start deltabot-mqtt-bot.service
 
 ## Known limitations / accepted trade-offs
 
-- **No scheduler persistence.** Bot restart drops pending auto-off /
-  auto-on jobs. The user can re-issue them. Adding persistence would
-  bring replay-on-restart edge cases.
 - **No live config reload.** `devices.json` edits require a
   `systemctl restart`. Adding watch-and-reload would mean reasoning
-  about state cache/scheduler invalidation for removed devices —
-  not worth the v1 complexity.
-- **Engine state cache has no explicit lock.** Relies on GIL; access
-  pattern is one writer (MQTT thread) and one reader (scheduler
-  thread reading snapshots). Safe in practice. If we ever see weird
-  state races, wrap `_states` access in a `threading.Lock`.
+  about twin/rule invalidation for removed devices — not worth the
+  complexity.
 - **No rate-limiting on chat output.** A flapping plug produces one
-  on/off message per state push. Acceptable for v1.
+  on/off message per state push. The `online` edge is debounced
+  (`ONLINE_FLAP_DEBOUNCE_S`) but other edges are not.
+- **Commands are fire-and-forget beyond the broker.** Publishes go out
+  at QoS 1 and a failed publish is reported to the user (❌ reaction,
+  explicit chat message), but the bot cannot know the *plug* acted —
+  only that the broker accepted the message. The twin still waits for
+  the device's own MQTT echo before believing any state change.
+- **The bot trusts any client that can authenticate to the broker.**
+  With no topic ACLs, a rogue LAN device holding the shared credential
+  can publish a forged `status/switch:0` and drive twin state, chat
+  events and rule evaluation. See SECURITY.md.
+
+(Removed from this list: "No scheduler persistence" — rules have
+persisted to `rules.json` since 2026-05-07, as the *Persistence*
+section above describes. "Engine state cache has no explicit lock" —
+`engine.py` was deleted in the v0.2 digital-twin refactor and CI
+asserts it cannot come back; per-twin state is guarded by
+`PlugTwin._lock`.)
 
 ## webxdc app gotchas (caught the hard way)
 
@@ -730,7 +794,29 @@ Each device payload includes:
 
 - `/<device> export 7d` — bot dumps power_minute + samples_raw for the
   window to a CSV and sends as a chat attachment. Window accepts
-  `s/m/h/d` (the d unit was added for this).
+  `s/m/h/d` (the d unit was added for this). Capped at
+  `commands.EXPORT_MAX_WINDOW_S` (31 days) and
+  `commands.EXPORT_MAX_ROWS` (100k rows per table); the reply says so
+  when it truncates. The handler `fetchall()`s into RAM and the target
+  Pi has ~275 MB available against a 300k-row `samples_raw`, so an
+  uncapped window was an OOM. Row shaping lives in
+  `mqtt_bot/csv_export.py` so the column layout is testable.
+- `/diag` (alias `/version`) — subsystem health: MQTT thread liveness
+  and broker connection, age of the last inbound message, sweeper and
+  publisher liveness, per-device data age and rule counts, the app
+  msgids registered in this chat, the authorised chat list, and the
+  running build (`mqtt_bot/version.py`, a `git describe`). Each dead
+  subsystem reports its *consequence* ("DEAD — timed rules will not
+  fire"), because the subsystem name alone tells the user nothing.
+  This is the answer to "the bot stopped reacting" that previously
+  required SSH.
+
+`/list` and `/<device> status` lines carry `⚠️ stale, last seen N ago`
+once data is older than `formatters.STALE_AFTER_S` (180 s). Without it
+a six-hour-old reading rendered identically to a four-second-old one,
+so a dead MQTT thread was invisible from chat — `online` can't help,
+since it only flips via the plug's LWT, which needs the very
+connection under suspicion.
 
 ## Provenance and history
 
@@ -740,6 +826,53 @@ released versions; treat them as part of the prose. Going forward,
 provenance entries reference work by date and (where helpful) the
 short SHA — no invented version labels. Tags are reserved for
 stable major releases the user creates by hand.
+
+Since 2026-07-28 the detailed log lives in
+`change-history/CHANGELOG.md`, with plans archived under
+`change-history/plans/`. Entries below remain for older work.
+
+- 2026-07-28 **quality, correctness and debuggability sweep**
+  (commits `8a9021e..70d9e18`). Preventive, mirroring the sweep the
+  sibling `portfolio-bot` had just been through; findings came from
+  auditing the live `pi@gatekeeper` deployment plus a full read.
+  175 → 305 tests. Full write-up in
+  `change-history/CHANGELOG.md`.
+
+  *The headline finding:* the documented webxdc replay protection did
+  not exist. `bot.py` only applied the freshness window when `ts`
+  happened to be numeric and executed the request otherwise, so a
+  missing, null, string or boolean `ts` switched a mains relay with no
+  age bound and no log line — while both SECURITY.md and CLAUDE.md
+  stated the opposite. Two independent audits found it separately. The
+  check now lives in `commands.check_freshness`, where it is testable;
+  `bot.py` having no test file is the structural reason the gap could
+  persist while both documents described correct behaviour.
+
+  *Tier 1 (data loss).* Three JSON state writers shared one fixed
+  `.tmp` path with no lock or fsync, and `save_all` is reachable from
+  three threads — a collision published a spliced `rules.json` that the
+  loader read as "no rules". `WebxdcIO` had no lock at all after
+  `cd6645f` broke its documented single-thread invariant. One oversized
+  timer killed the sweeper permanently, and the poison rule was
+  persisted so the outage survived restarts. Restart silently dropped
+  recurring timer and non-`daily` TOD rules because three code paths
+  each defined "recurring" differently. The CSV export and rule
+  observation windows were unbounded against a 416 MB host.
+
+  *Tier 2.* TOD deadlines used `+86400`, which lands on the same
+  calendar date on the 25-hour fall-back day → a past deadline and a
+  2 Hz fire/re-arm storm. A failed MQTT publish was acked 🆗 while the
+  appliance stayed on. Crashes exited 0. CSV columns were off by one.
+  MQTT thread death and `History.close` races were silent.
+
+  *Observability.* `/diag`, a git-derived server version, staleness
+  markers on device lines, and a logged reason for every rule that
+  declines to fire — previously unanswerable at any log level.
+
+  *Tier 3.* systemd unit gained a full hardening block (it had none,
+  and ran as the operator's sudo-capable login user);
+  `systemd-analyze verify` caught that `StartLimit*` under `[Service]`
+  is silently ignored, so the crash-loop limit had never worked.
 
 - 2026-05-09 **chart fidelity + rule fidelity + repo cleanup**
   (commits `3938c14..fd414a2`, post-`v0.2.1`).
@@ -930,7 +1063,7 @@ The app is a single page; sections from top to bottom:
    refresh button
 2. State card — current ON/OFF + apower + aenergy
 3. On / Off / Toggle buttons
-4. Power chart (1h / 6h / 12h / 24h / 31d) with daily-energy bars
+4. Power chart (1h / 12h / 24h / 7d / 31d / 365d) with daily-energy bars
    below. Three colors: green = on, red = off, grey = offline. The
    smallest window is 1 h (live 5 min was dropped in v0.2; the
    header timestamp is the real-time indicator instead).

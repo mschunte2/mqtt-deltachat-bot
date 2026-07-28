@@ -24,10 +24,22 @@ from pathlib import Path
 # attaches a handler to its own logger, so without basicConfig our
 # log calls would be silently dropped.
 _LOG_LEVEL = (os.environ.get("LOG_LEVEL") or "info").upper()
+# Explicit map rather than getattr(logging, name): getattr resolves ANY
+# module attribute, so LOG_LEVEL=NOTSET silently meant level 0 ("log
+# absolutely everything") and LOG_LEVEL=raiseExceptions meant level True
+# (== 1). A plain typo also fell back to INFO with no warning, so a user
+# who thought they had enabled debug got no hint otherwise.
+_LEVELS = {"CRITICAL": logging.CRITICAL, "ERROR": logging.ERROR,
+           "WARNING": logging.WARNING, "WARN": logging.WARNING,
+           "INFO": logging.INFO, "DEBUG": logging.DEBUG}
 logging.basicConfig(
-    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    level=_LEVELS.get(_LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
+if _LOG_LEVEL not in _LEVELS:
+    logging.getLogger("mqtt_bot").warning(
+        "LOG_LEVEL=%r is not a known level (%s); defaulting to info",
+        _LOG_LEVEL, ", ".join(sorted(_LEVELS)))
 
 
 class _SwallowBrokenPipe(logging.Filter):
@@ -83,9 +95,12 @@ from appdirs import user_config_dir  # noqa: E402
 from deltachat2 import EventType, MsgData, events  # noqa: E402
 from deltabot_cli import BotCli  # noqa: E402
 
+from mqtt_bot import app_policy  # noqa: E402
 from mqtt_bot import commands as commands_mod  # noqa: E402
+from mqtt_bot import csv_export  # noqa: E402
 from mqtt_bot import formatters  # noqa: E402
 from mqtt_bot import rehydrate as rehydrate_mod  # noqa: E402
+from mqtt_bot import version as version_mod  # noqa: E402
 from mqtt_bot.core import rules as rules_mod  # noqa: E402
 from mqtt_bot.core import snapshot as snap_mod  # noqa: E402
 from mqtt_bot.core.twin import PlugTwin, TwinDeps  # noqa: E402
@@ -105,8 +120,27 @@ RULES_PATH = STATE_DIR / "rules.json"
 BASELINES_PATH = STATE_DIR / "baselines.json"
 
 CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", BOT_NAME)
-PUBLISH_INTERVAL_S = int(os.environ.get("PUBLISH_INTERVAL_S", "10800"))
-DC_DELETE_DEVICE_AFTER_DAYS = int(os.environ.get("DC_DELETE_DEVICE_AFTER_DAYS", "14"))
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env var without taking the process down.
+
+    A bare int() here raised an unhandled ValueError before the
+    deltabot logger existed, which fed the crash loop the unit's
+    restart limit could not stop. RETENTION_DAYS was the only one
+    written defensively; this is that pattern, shared."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+
+
+PUBLISH_INTERVAL_S = _env_int("PUBLISH_INTERVAL_S", 10800)
+DC_DELETE_DEVICE_AFTER_DAYS = _env_int("DC_DELETE_DEVICE_AFTER_DAYS", 14)
 
 
 # --- Late-bound bot reference --------------------------------------------
@@ -128,7 +162,9 @@ def _post_to_visible_chats(device, text: str) -> None:
     if state.bot is None:
         log.warning("no bot ref yet; would post to %s: %s", device.name, text)
         return
-    chats = device.allowed_chats or tuple(sorted(ALLOWED_CHATS))
+    # Via the shared predicate, not a second inline copy of the
+    # fallback rule — see permissions.chats_for_device.
+    chats = permissions.chats_for_device(device, ALLOWED_CHATS)
     for chat_id in chats:
         try:
             state.bot.rpc.send_msg(state.accid, chat_id, MsgData(text=text))
@@ -147,8 +183,10 @@ def _react(msgid: int, emoji: str) -> None:
         log.exception("send_reaction failed")
 
 
-def _mqtt_publish(topic: str, payload: str) -> None:
-    mqtt.publish(topic, payload)
+def _mqtt_publish(topic: str, payload: str) -> bool:
+    # Must return the result: the twin uses it to decide whether to
+    # react 🆗 and tell the chat the plug switched.
+    return mqtt.publish(topic, payload)
 
 
 def _save_rules() -> None:
@@ -170,17 +208,22 @@ def _load_baselines() -> int:
 
 
 def _publisher_broadcast(device_name: str | None = None) -> None:
-    # Twins call this on every state edge. We resolve the class so the
-    # publisher only pushes to apps of that class — a Tasmota toggle
-    # doesn't churn unrelated Shelly app instances. Force=True so we
-    # don't suppress edges with hash-equal payloads (e.g. a quick
-    # toggle that lands back where it started before the plug echoes).
+    """Twins call this on every state edge.
+
+    It only QUEUES the push. Building inline here ran ~750 SQL queries
+    per device and two ~139 KB JSON serialisations on paho's network
+    callback thread, which could stall the MQTT loop past its keepalive.
+    The publisher daemon coalesces a burst into one compact push.
+
+    We still resolve the class so the fan-out stays scoped — a Tasmota
+    toggle shouldn't churn unrelated Shelly app instances.
+    """
     only_class = None
     if device_name:
         twin = registry.get(device_name)
         if twin is not None:
             only_class = twin.cls.name
-    publisher.broadcast(device_name, only_class=only_class, force=True)
+    publisher.request_broadcast(device_name, only_class=only_class)
 
 
 # --- Construct everything ------------------------------------------------
@@ -188,9 +231,7 @@ def _publisher_broadcast(device_name: str | None = None) -> None:
 webxdc = WebxdcIO(state_dir=STATE_DIR, devices_dir=DEVICES_DIR)
 history = History(
     db_path=STATE_DIR / "history.sqlite",
-    retention_days=int(
-        (os.environ.get("RETENTION_DAYS") or "0").strip() or "0"
-    ),
+    retention_days=_env_int("RETENTION_DAYS", 0),
 )
 
 # Build one twin per device. TwinDeps wires up the side effects.
@@ -229,6 +270,16 @@ def _reseed_stale_chat(chat_id: int, msgid: int) -> None:
     try:
         visible = registry.visible_classes_for(chat_id, ALLOWED_CHATS)
         if not visible:
+            # This used to be a bare `return` with the log line below
+            # it, so "the container is gone AND I can't re-seed"
+            # produced only a repeating push-failed WARNING with no
+            # hint that a heal had been attempted and abandoned. With
+            # DC_DELETE_DEVICE_AFTER_DAYS=14 containers age out on a
+            # schedule, so this path is hit in normal operation.
+            log.warning("msgid=%d gone in chat=%d but no devices are "
+                        "visible there any more; cannot re-seed. Check "
+                        "allowed_chats, or remove the stale app.",
+                        msgid, chat_id)
             return
         log.info("msgid=%d gone in chat=%d; re-seeding apps", msgid, chat_id)
         sent, _ = webxdc.send_apps(state.bot, state.accid, chat_id, visible)
@@ -249,9 +300,10 @@ def _publisher_send(chat_id: int, msgid: int, payload: dict) -> bool:
 
 
 publisher = Publisher(
-    build=lambda chat_id, class_name: snap_mod.build_for_chat(
-        chat_id, class_name, registry, ALLOWED_CHATS,
-    ),
+    build=lambda chat_id, class_name, include_history=True:
+        snap_mod.build_for_chat(chat_id, class_name, registry,
+                                ALLOWED_CHATS,
+                                include_history=include_history),
     msgids=lambda: webxdc.map_snapshot(),
     send=_publisher_send,
     interval_s=PUBLISH_INTERVAL_S,
@@ -269,21 +321,71 @@ mqtt = MqttClient(
 )
 
 
+_crashed = False
+
+
+def _record_crash(exc_type, exc, tb) -> None:
+    """Remember that we are dying from an unhandled exception, so
+    _on_shutdown can pick a truthful exit code. Runs before atexit, and
+    still delegates to the previous hook so the traceback is printed
+    exactly as before."""
+    global _crashed
+    _crashed = True
+    _prev_excepthook(exc_type, exc, tb)
+
+
+_prev_excepthook = sys.excepthook
+sys.excepthook = _record_crash
+
+
 def _on_shutdown(*_a) -> None:
+    """Flush what we own, then leave immediately.
+
+    Registered as both the SIGTERM handler and an atexit hook. atexit
+    also runs during normal interpreter finalisation, which INCLUDES
+    the path taken after an unhandled exception escapes __main__ — so
+    exiting 0 unconditionally reported every crash to systemd as
+    `code=exited, status=0/SUCCESS`, left `journalctl -p err` empty,
+    and made a clean stop indistinguishable from a hard failure. It
+    would also have silently disabled Restart=on-failure.
+
+    Note the flag rather than sys.exc_info(): by the time atexit hooks
+    run the interpreter has already printed and cleared the exception,
+    so exc_info() is empty on the crash path too. _record_crash below
+    catches it earlier, in sys.excepthook.
+    """
     try:
         publisher.stop()
+    except Exception:
+        pass
+    try:
+        sweeper.stop()
+    except Exception:
+        pass
+    try:
+        mqtt.stop()
     except Exception:
         pass
     try:
         history.close()
     except Exception:
         log.exception("history close failed")
+
+    code = 1 if _crashed else 0
+    if _crashed:
+        log.error("shutting down after an unhandled exception; exiting %d",
+                  code)
+    else:
+        log.info("shutdown complete")
+
     # os._exit instead of sys.exit: deltabot-cli's main thread is blocked
     # in a transport loop that doesn't propagate SystemExit cleanly, so
     # sys.exit was leaving the process alive until systemd's SIGKILL
     # (~90s after SIGTERM). os._exit terminates immediately — safe here
-    # because we've already flushed everything we own.
-    os._exit(0)
+    # because we've already flushed everything we own. It does mean no
+    # other atexit hook runs, so flush logging first.
+    logging.shutdown()
+    os._exit(code)
 
 
 import atexit  # noqa: E402
@@ -355,6 +457,23 @@ def list_devices(chat_id: int) -> str:
     return "\n".join(lines)
 
 
+def diag_text(chat_id: int) -> str:
+    """`/diag` — subsystem health, per-device freshness, app
+    registrations and the running build. Rendering lives in
+    formatters.format_diag; this only gathers the live values."""
+    return formatters.format_diag(
+        version=version_mod.version(),
+        mqtt_alive=mqtt.is_alive(),
+        mqtt_connected=mqtt.is_connected(),
+        mqtt_last_message_age_s=mqtt.last_message_age_s(),
+        sweeper_alive=sweeper.is_alive(),
+        publisher_alive=publisher.is_alive(),
+        twins=registry.visible_to(chat_id, ALLOWED_CHATS),
+        registered_msgids=dict(webxdc.map_snapshot().get(chat_id, {})),
+        allowed_chats=ALLOWED_CHATS,
+    )
+
+
 def list_rules(chat_id: int, device_name: str | None = None) -> str:
     if device_name is not None:
         twin = registry.get(device_name)
@@ -409,6 +528,7 @@ def help_text(chat_id: int) -> str:
         "  /<device> export 7d                — CSV of power + energy history\n"
         "  /<device> rules                    — list this device's rules\n"
         "  /rules               — list rules for every visible device\n"
+        "  /diag                — health: mqtt, threads, data age, build\n"
         "  /refresh             — push fresh state to every open webxdc app in this chat\n"
         "  /<device> refresh    — push fresh state for that device's class only\n"
         "  /list                — list devices visible to this chat\n"
@@ -417,6 +537,13 @@ def help_text(chat_id: int) -> str:
         "  /help                — this message\n"
         f"Devices in this chat: {names}\n"
     )
+    # HELP_MESSAGE is operator-supplied free text and may name the
+    # household, the room, or the appliances. /help is permission-free
+    # (needed for setup), so unauthorised chats get the generic command
+    # reference only. The device list is already filtered above by
+    # registry.visible_to, which returns empty for a stranger.
+    if not permissions.is_allowed(chat_id, ALLOWED_CHATS):
+        return base
     prefix = (os.environ.get("HELP_MESSAGE") or "").strip()
     return f"{prefix}\n\n{base}" if prefix else base
 
@@ -428,35 +555,33 @@ def handle_webxdc_request(chat_id: int, msgid: int,
         log.warning("webxdc update from unregistered msgid=%d in chat=%d "
                     "(run /apps to register)", msgid, chat_id)
         return
-    device_name = str(request.get("device", "")).strip().lower()
-    action = str(request.get("action", "")).strip().lower()
+    device_name = _sanitize(request.get("device", ""), fallback="").lower()
+    action = _sanitize(request.get("action", ""), fallback="").lower()
 
-    # Refresh button: device may be unset; respond with a unicast push
-    # for the (chat, class) of the requesting msgid.
+    # Whitelist FIRST. `refresh` and `telemetry` used to be handled
+    # above this check, so they were reachable with only the global chat
+    # gate — and both do real work (a full snapshot build + push, or a
+    # SQLite insert plus a 15-field INFO line), with no throttle.
+    if action not in _KNOWN_ACTIONS:
+        # INFO, not DEBUG: an unknown action from a *registered* app
+        # means the deployed .xdc and the bot have diverged. At DEBUG it
+        # was invisible in the default deployment, so "the app's buttons
+        # stopped working after the upgrade" produced an empty journal.
+        log.info("ignoring webxdc action %r (chat=%d msgid=%d)",
+                 action, chat_id, msgid)
+        return
+
+    # These two carry no device: the class comes from the msgid.
     if action == "refresh":
         publisher.push_unicast(chat_id, msgid, cls_for_msg)
         return
-
-    # Telemetry: device may be unset; record + return. Class resolves
-    # from msgid (same as refresh). Never let a bad payload escape into
-    # the rest of the handler.
     if action == "telemetry":
         _record_telemetry(chat_id, msgid, cls_for_msg, request)
         return
 
-    if not device_name or not action:
-        return
-
-    # Whitelist of actions we know about. Anything else (including the
-    # pre-v0.2 history/events/set_param) silently drops — old app
-    # instances in the chat will keep retrying until /apps replaces them.
-    _KNOWN = ("on", "off", "toggle", "status",
-              "auto-off", "auto-on",
-              "cancel-auto-off", "cancel-auto-on", "cancel-schedule",
-              "reset-counter")
-    if action not in _KNOWN:
-        log.debug("ignoring webxdc action %r (chat=%d msgid=%d)",
-                  action, chat_id, msgid)
+    if not device_name:
+        log.info("webxdc action %r without a device (chat=%d msgid=%d)",
+                 action, chat_id, msgid)
         return
 
     if action == "reset-counter":
@@ -536,54 +661,12 @@ def _schedule_from_app(chat_id: int, device_name: str, action: str,
 def _policy_from_app(raw: dict, section) -> rules_mod.ScheduledPolicy:
     """Build a ScheduledPolicy from a webxdc app payload subobject.
 
-    The app speaks **minutes** at this boundary; we convert to seconds
-    once here and feed the engine its native unit downstream.
+    Validation and coercion live in mqtt_bot.app_policy so this
+    untrusted-input boundary is testable — it used to raise TypeError
+    on type-confused payloads (callers catch only ValueError) and
+    accepted negative durations.
     """
-    defaults = _defaults_from_section(section)
-    policy = rules_mod.ScheduledPolicy()
-    timer_m = raw.get("timer_minutes")
-    if isinstance(timer_m, (int, float)) and timer_m > 0:
-        policy.timer_seconds = int(round(float(timer_m) * 60))
-    tod = raw.get("time_of_day")
-    if isinstance(tod, list) and len(tod) == 2:
-        h, m = int(tod[0]), int(tod[1])
-        if 0 <= h <= 23 and 0 <= m <= 59:
-            policy.time_of_day = (h, m)
-            policy.recurring_tod = bool(raw.get("recurring_tod", False))
-    idle = raw.get("idle")
-    if isinstance(idle, dict):
-        policy.idle_field = str(idle.get("field", defaults.idle_field))
-        policy.idle_threshold = float(idle.get("threshold", defaults.idle_threshold))
-        idle_m = idle.get("duration_minutes")
-        if isinstance(idle_m, (int, float)):
-            policy.idle_duration_s = int(round(float(idle_m) * 60))
-        else:
-            policy.idle_duration_s = defaults.idle_duration_s
-    consumed = raw.get("consumed")
-    if isinstance(consumed, dict):
-        policy.consumed_field = str(consumed.get("field", defaults.consumed_field))
-        policy.consumed_threshold_wh = float(consumed.get(
-            "threshold_wh", defaults.consumed_threshold_wh))
-        cons_m = consumed.get("window_minutes")
-        if isinstance(cons_m, (int, float)):
-            policy.consumed_window_s = int(round(float(cons_m) * 60))
-        else:
-            policy.consumed_window_s = defaults.consumed_window_s
-    avg = raw.get("avg")
-    if isinstance(avg, dict):
-        policy.avg_field = str(avg.get("field", defaults.avg_field))
-        policy.avg_threshold_w = float(avg.get(
-            "threshold_w", defaults.avg_threshold_w))
-        avg_m = avg.get("window_minutes")
-        if isinstance(avg_m, (int, float)):
-            policy.avg_window_s = int(round(float(avg_m) * 60))
-        else:
-            policy.avg_window_s = defaults.avg_window_s
-    if raw.get("once") is True:
-        policy.once = True
-    if policy.is_empty():
-        raise ValueError("no policies supplied")
-    return policy
+    return app_policy.build(raw, _defaults_from_section(section))
 
 
 def _defaults_from_section(section) -> rules_mod.PolicyDefaults:
@@ -706,6 +789,9 @@ _parse_text_command = commands_mod.parse_text_command
 MAX_AGE_SECONDS = commands_mod.MAX_AGE_SECONDS
 MAX_APP_AGE_SECONDS = commands_mod.MAX_APP_AGE_SECONDS
 MAX_CLOCK_SKEW_SECONDS = commands_mod.MAX_CLOCK_SKEW_SECONDS
+EXPORT_MAX_WINDOW_S = commands_mod.EXPORT_MAX_WINDOW_S
+EXPORT_MAX_ROWS = commands_mod.EXPORT_MAX_ROWS
+_KNOWN_ACTIONS = commands_mod.KNOWN_APP_ACTIONS
 
 
 def _is_allowed(chatid: int) -> bool:
@@ -743,12 +829,20 @@ def _on_webxdc_update(bot, accid, event):
                            chatid)
         return
 
-    ts = req.get("ts")
-    if isinstance(ts, (int, float)):
-        age = int(time.time()) - int(ts)
-        if age > MAX_APP_AGE_SECONDS or age < -MAX_CLOCK_SKEW_SECONDS:
-            bot.logger.info("webxdc cmd age=%ds dropped (chat=%d)", age, chatid)
-            return
+    # Freshness is mandatory here, not best-effort. This used to run the
+    # window check only when `ts` happened to be numeric and fall through
+    # to handle_webxdc_request otherwise, so a request with no `ts` (an
+    # old .xdc build, or an update redelivered after a long offline
+    # period) switched the relay with no age bound and no log line.
+    ok, why = commands_mod.check_freshness(
+        req.get("ts"), int(time.time()), MAX_APP_AGE_SECONDS)
+    if not ok:
+        bot.logger.warning(
+            "webxdc request REJECTED (chat=%d msgid=%d device=%s action=%s): "
+            "%s — run /apps if this app instance is out of date",
+            chatid, msgid, _sanitize(req.get("device")),
+            _sanitize(req.get("action")), why)
+        return
 
     handle_webxdc_request(chatid, msgid, req)
 
@@ -786,16 +880,23 @@ def _on_new_message(bot, accid, event):
         bot.rpc.send_msg(accid, chatid, MsgData(text="permission denied"))
         return
 
-    age = int(time.time()) - int(msg.timestamp)
-    if age > MAX_AGE_SECONDS or age < -MAX_CLOCK_SKEW_SECONDS:
-        bot.logger.info("text command age=%ds dropped in chat %d", age, chatid)
+    head, verb, rest = parsed
+
+    # Same gate as the webxdc path, wider window: a typed command should
+    # survive one broker reconnect, an app tap should not. Rejections are
+    # WARNING and name the device+verb — a stale tap and a replay attempt
+    # look identical otherwise.
+    ok, why = commands_mod.check_freshness(
+        msg.timestamp, int(time.time()), MAX_AGE_SECONDS)
+    if not ok:
+        bot.logger.warning(
+            "text command REJECTED in chat %d (%s %s): %s",
+            chatid, _sanitize(head or "/"), _sanitize(verb), why)
         try:
             bot.rpc.send_reaction(accid, msg.id, ["❌"])
         except Exception:
             pass
         return
-
-    head, verb, rest = parsed
 
     if head == "":
         if verb == "list":
@@ -809,6 +910,9 @@ def _on_new_message(bot, accid, event):
             return
         if verb == "rules":
             bot.rpc.send_msg(accid, chatid, MsgData(text=list_rules(chatid)))
+            return
+        if verb in ("diag", "version"):
+            bot.rpc.send_msg(accid, chatid, MsgData(text=diag_text(chatid)))
             return
         if verb == "refresh":
             n = _refresh_chat(chatid)
@@ -985,9 +1089,10 @@ def _handle_apps(bot, accid, chatid):
 
 
 def _handle_export(bot, accid, chatid, device_name, rest):
-    """Dump power_minute + energy_hour for a device to a CSV attachment."""
+    """Dump power_minute + samples_raw for a device to a CSV attachment.
+    Row shaping lives in mqtt_bot.csv_export so the column layout is
+    testable."""
     import csv
-    import datetime as _dt
     import tempfile
 
     twin = registry.get(device_name)
@@ -1004,10 +1109,19 @@ def _handle_export(bot, accid, chatid, device_name, rest):
     except ValueError as ex:
         bot.rpc.send_msg(accid, chatid, MsgData(text=f"bad duration: {ex}"))
         return
+    if window_seconds > EXPORT_MAX_WINDOW_S:
+        bot.rpc.send_msg(accid, chatid, MsgData(
+            text=f"export window too long ({window_str}); "
+                 f"max is {EXPORT_MAX_WINDOW_S // 86400}d"))
+        return
     until_ts = int(time.time())
     since_ts = until_ts - window_seconds
-    power_rows = history.query_power_raw(device_name, since_ts, until_ts)
-    samples_rows = history.query_samples_raw(device_name, since_ts, until_ts)
+    power_rows = history.query_power_raw(device_name, since_ts, until_ts,
+                                         limit=EXPORT_MAX_ROWS)
+    samples_rows = history.query_samples_raw(device_name, since_ts, until_ts,
+                                             limit=EXPORT_MAX_ROWS)
+    total_samples = history.count_samples_raw(device_name, since_ts, until_ts)
+    truncated = total_samples > len(samples_rows)
 
     if not (power_rows or samples_rows):
         bot.rpc.send_msg(accid, chatid,
@@ -1019,36 +1133,19 @@ def _handle_export(bot, accid, chatid, device_name, rest):
     try:
         with os.fdopen(fd, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow([
-                "unix_ts", "iso_time", "device", "kind",
-                "avg_apower_w", "output", "sample_count",
-                "apower_w", "voltage_v", "current_a", "freq_hz",
-                "aenergy_total_wh", "temperature_c",
-            ])
-            for ts, apower, output, count in power_rows:
-                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
-                            device_name, "power_minute",
-                            f"{apower:.3f}",
-                            "" if output is None else output,
-                            count, "", "", "", "", "", "", ""])
+            w.writerow(csv_export.HEADER)
+            for row in power_rows:
+                w.writerow(csv_export.power_minute_row(device_name, row))
             for row in samples_rows:
-                ts, ap, v, c, f_hz, ae, out, tc = row
-                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
-                            device_name, "samples_raw",
-                            "", "", "",
-                            "" if ap is None else f"{ap:.3f}",
-                            "" if v is None else f"{v:.2f}",
-                            "" if c is None else f"{c:.4f}",
-                            "" if f_hz is None else f"{f_hz:.2f}",
-                            "" if ae is None else f"{ae:.3f}",
-                            "" if out is None else out,
-                            "" if tc is None else f"{tc:.1f}"])
+                w.writerow(csv_export.samples_raw_row(device_name, row))
+        note = (f" · TRUNCATED to the newest {EXPORT_MAX_ROWS} of "
+                f"{total_samples} status updates" if truncated else "")
         bot.rpc.send_msg(
             accid, chatid,
             MsgData(file=path,
                     text=f"{device_name} export · {window_str} · "
                          f"{len(samples_rows)} status updates · "
-                         f"{len(power_rows)} per-min"),
+                         f"{len(power_rows)} per-min{note}"),
         )
     finally:
         try:

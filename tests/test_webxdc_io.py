@@ -13,6 +13,7 @@ lingering duplicate — never a dangling pointer.
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -179,6 +180,87 @@ class TestPushSelfHeal(unittest.TestCase):
         ok, fired = self._push(None)
         self.assertTrue(ok)
         self.assertEqual(fired, [])
+
+
+class TestRegistryConcurrency(unittest.TestCase):
+    """`send_apps` was documented as confined to the Delta Chat handler
+    thread (publisher.py's module docstring). The stale-msgid re-seed
+    added in cd6645f broke that: broadcast -> push_to_msgid -> on_missing
+    -> _reseed_stale_chat -> send_apps now mutates the registry from the
+    Publisher daemon and the MQTT callback thread, concurrently with
+    Publisher.broadcast's own map_snapshot(). With retention ageing app
+    containers out on a schedule, multi-chat re-seeds are routine.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.state_dir = root / "state"
+        self.state_dir.mkdir()
+        self.devices_dir = root / "devices"
+        self.devices_dir.mkdir()
+        _make_class(self.devices_dir, "shelly_plug")
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_snapshot_survives_concurrent_send_apps(self):
+        io = WebxdcIO(self.state_dir, self.devices_dir)
+        bot = _FakeBot(_FakeRpc())
+        errors: list[Exception] = []
+        stop = threading.Event()
+
+        def seeder(base):
+            try:
+                for i in range(80):
+                    io.send_apps(bot, accid=1, chat_id=base + i,
+                                 classes_visible={"shelly_plug"})
+            except Exception as ex:
+                errors.append(ex)
+
+        def snapshotter():
+            while not stop.is_set():
+                try:
+                    for chat, apps in io.map_snapshot().items():
+                        assert isinstance(chat, int) and isinstance(apps, dict)
+                except Exception as ex:
+                    errors.append(ex)
+                    return
+
+        readers = [threading.Thread(target=snapshotter) for _ in range(3)]
+        for t in readers:
+            t.start()
+        writers = [threading.Thread(target=seeder, args=(b,))
+                   for b in (1000, 5000, 9000)]
+        for t in writers:
+            t.start()
+        for t in writers:
+            t.join()
+        stop.set()
+        for t in readers:
+            t.join()
+
+        self.assertEqual([repr(e) for e in errors], [])
+        self.assertEqual(len(io.map_snapshot()), 240)
+
+    def test_registry_file_matches_memory_after_concurrent_seeds(self):
+        io = WebxdcIO(self.state_dir, self.devices_dir)
+        bot = _FakeBot(_FakeRpc())
+
+        def seeder(base):
+            for i in range(40):
+                io.send_apps(bot, accid=1, chat_id=base + i,
+                             classes_visible={"shelly_plug"})
+
+        threads = [threading.Thread(target=seeder, args=(b,))
+                   for b in (100, 500, 900)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        on_disk = json.loads((self.state_dir / "app_msgids.json").read_text())
+        in_memory = io.map_snapshot()
+        self.assertEqual(len(in_memory), 120)
+        self.assertEqual({int(k) for k in on_disk}, set(in_memory))
 
 
 if __name__ == "__main__":

@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
+
+from . import atomic
 
 log = logging.getLogger("mqtt_bot.baselines")
 
@@ -32,10 +33,8 @@ def save(registry, path: Path | str) -> None:
         for t in registry.all()
     }
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        os.replace(tmp, p)
+        atomic.write_text(p, json.dumps(data, indent=2),
+                          mode=atomic.STATE_FILE_MODE)
     except Exception:
         log.exception("persist baselines to %s failed", p)
 

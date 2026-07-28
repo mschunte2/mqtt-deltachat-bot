@@ -45,13 +45,14 @@ in users' SQLite files are dead data the bot never reads.)
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import sqlite3
 import threading
 import time
-from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger("mqtt_bot.history")
 
@@ -141,7 +142,9 @@ class History:
         # Single retention knob — applies to samples_raw + power_minute.
         # aenergy_offset_events is forever (tiny + load-bearing).
         self.retention_days = max(0, int(retention_days))
-        self._lock = threading.Lock()
+        # Reentrant so close() can hold the lock across the final flush,
+        # which itself takes the lock per device via _flush_minute.
+        self._lock = threading.RLock()
         # Per-device current-minute accumulator for power_minute:
         # {device: (minute_start_ts, [apower, ...], latest_output_or_None)}
         self._minute: dict[str, tuple[int, list[float], int | None]] = {}
@@ -150,6 +153,16 @@ class History:
 
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(db_path), check_same_thread=False)
+        # A per-minute power series is a high-resolution occupancy
+        # signal for the household. sqlite3.connect creates the file
+        # with the ambient umask (0664 on the live host), so restrict it
+        # explicitly. Best-effort: the -wal/-shm siblings are recreated
+        # by SQLite and picked up on the next open.
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(db_path) + suffix).chmod(0o600)
+            except OSError:
+                pass
         self._db.execute("PRAGMA journal_mode=WAL")
         with self._lock:
             self._db.executescript(_SCHEMA)
@@ -357,8 +370,6 @@ class History:
     def query_power(self, device: str, since_ts: int, until_ts: int,
                     max_points: int = 200,
                     ) -> tuple[int, list[tuple[int, float | None, float | None, float, int | None]]]:
-        if self._closed:
-            return (60, [])
         """Return (bucket_seconds, [(ts, min_w, max_w, avg_w, output), ...]).
 
         `min_w` / `max_w` are the trough / peak apower observed in the
@@ -367,7 +378,13 @@ class History:
         mean. `output` is MAX over the bucket's minutes: 1 if on for
         any minute, 0 if every minute off, NULL if no minutes had a
         known output.
+
+        (The early-return guard used to sit ABOVE this string, which
+        made it a no-op expression rather than a docstring — __doc__
+        was None.)
         """
+        if self._closed:
+            return (60, [])
         if until_ts <= since_ts:
             return (60, [])
         window = until_ts - since_ts
@@ -395,17 +412,31 @@ class History:
             for t, mn, mx, avg, o in rows if avg is not None
         ])
 
-    def query_power_raw(self, device: str, since_ts: int, until_ts: int
+    def query_power_raw(self, device: str, since_ts: int, until_ts: int,
+                        limit: int | None = None
                         ) -> list[tuple[int, float, int | None, int]]:
-        """Un-bucketed minute rows for the window. Used for CSV export."""
+        """Un-bucketed minute rows for the window. Used for CSV export.
+        `limit` keeps the newest rows; see query_samples_raw."""
         if self._closed:
             return []
         with self._lock:
-            cur = self._db.execute(
-                "SELECT ts, avg_apower_w, output, sample_count FROM power_minute "
-                "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
-                (device, int(since_ts), int(until_ts)),
-            )
+            if limit is None:
+                cur = self._db.execute(
+                    "SELECT ts, avg_apower_w, output, sample_count "
+                    "FROM power_minute "
+                    "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
+                    (device, int(since_ts), int(until_ts)),
+                )
+            else:
+                cur = self._db.execute(
+                    "SELECT ts, avg_apower_w, output, sample_count FROM ("
+                    "  SELECT ts, avg_apower_w, output, sample_count "
+                    "  FROM power_minute "
+                    "  WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts DESC "
+                    "  LIMIT ?"
+                    ") ORDER BY ts ASC",
+                    (device, int(since_ts), int(until_ts), int(limit)),
+                )
             rows = cur.fetchall()
         return [(int(t), float(w), int(o) if o is not None else None, int(c))
                 for t, w, o, c in rows]
@@ -520,12 +551,16 @@ class History:
         """
         if self._closed or days <= 0:
             return []
-        oldest_start = midnight_ts - (days - 1) * 86400
+        # Day boundaries by CALENDAR, not by adding 86400. A DST change
+        # makes one local day 23 or 25 hours long, so fixed-second steps
+        # drift to 23:00/01:00 for every day after the transition and the
+        # daily-energy bars stop lining up with local midnight.
+        starts = _local_midnights_back_from(midnight_ts, days)
         out: list[tuple[int, float]] = []
-        prev_wh = self.aenergy_at(device, oldest_start)
-        for d in range(days):
-            day_start = oldest_start + d * 86400
-            day_end = day_start + 86400
+        prev_wh = self.aenergy_at(device, starts[0])
+        for i, day_start in enumerate(starts):
+            day_end = (starts[i + 1] if i + 1 < len(starts)
+                       else day_start + 86400)
             end_wh = self.aenergy_at(device, day_end)
             if prev_wh is None or end_wh is None:
                 out.append((day_start, 0.0))
@@ -535,20 +570,56 @@ class History:
                 prev_wh = end_wh
         return out
 
-    def query_samples_raw(self, device: str, since_ts: int, until_ts: int
-                           ) -> list[tuple]:
-        """Lossless dump of every status update in the window."""
+    def query_samples_raw(self, device: str, since_ts: int, until_ts: int,
+                          limit: int | None = None) -> list[tuple]:
+        """Lossless dump of every status update in the window.
+
+        `limit` caps how many rows are materialised. The result is
+        always ascending, but a limited query returns the *newest*
+        `limit` rows — a truncated export should show the recent tail,
+        which is what "the last N days" means to the caller. The cap
+        matters: this fetchall()s into RAM, and the deployment host has
+        ~275 MB available against a samples_raw table already past
+        300k rows.
+        """
         if self._closed:
             return []
         with self._lock:
+            if limit is None:
+                cur = self._db.execute(
+                    "SELECT ts, apower_w, voltage_v, current_a, freq_hz, "
+                    "       aenergy_total_wh, output, temperature_c "
+                    "FROM samples_raw "
+                    "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
+                    (device, int(since_ts), int(until_ts)),
+                )
+                return cur.fetchall()
             cur = self._db.execute(
                 "SELECT ts, apower_w, voltage_v, current_a, freq_hz, "
-                "       aenergy_total_wh, output, temperature_c "
-                "FROM samples_raw "
-                "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
-                (device, int(since_ts), int(until_ts)),
+                "       aenergy_total_wh, output, temperature_c FROM ("
+                "  SELECT ts, apower_w, voltage_v, current_a, freq_hz, "
+                "         aenergy_total_wh, output, temperature_c "
+                "  FROM samples_raw "
+                "  WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts DESC "
+                "  LIMIT ?"
+                ") ORDER BY ts ASC",
+                (device, int(since_ts), int(until_ts), int(limit)),
             )
             return cur.fetchall()
+
+    def count_samples_raw(self, device: str, since_ts: int,
+                          until_ts: int) -> int:
+        """How many rows `query_samples_raw` would return unlimited.
+        Lets the export tell the user it truncated."""
+        if self._closed:
+            return 0
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT COUNT(*) FROM samples_raw "
+                "WHERE device=? AND ts >= ? AND ts < ?",
+                (device, int(since_ts), int(until_ts)),
+            )
+            return int(cur.fetchone()[0])
 
     # --- internals -------------------------------------------------------
 
@@ -616,7 +687,10 @@ class History:
         cutoff = now - self.retention_days * 86400
         counts: dict[str, int] = {}
         with self._lock:
-            for table in ("samples_raw", "power_minute"):
+            # app_telemetry used to be exempt: one row per app boot,
+            # forever, in the very database the bot is trying to keep
+            # small. It is diagnostic data, not a source of truth.
+            for table in ("samples_raw", "power_minute", "app_telemetry"):
                 counts[table] = self._db.execute(
                     f"DELETE FROM {table} WHERE ts < ?", (cutoff,)
                 ).rowcount
@@ -626,18 +700,83 @@ class History:
             log.info("history prune: %s",
                      ", ".join(f"{n} {t}" for t, n in counts.items() if n))
 
-    def close(self) -> None:
-        # Idempotent: SIGTERM handler runs close(), then sys.exit fires atexit
-        # which would otherwise re-enter and ProgrammingError on the now-closed
-        # connection.
+    def close(self, lock_timeout: float = 5.0) -> None:
+        """Flush the in-flight minute and close the connection.
+
+        Idempotent: the SIGTERM handler runs close(), then atexit fires
+        and would otherwise re-enter and ProgrammingError on the closed
+        connection.
+
+        Two ordering details matter, both of which used to be wrong:
+
+        1. `_closed` is set BEFORE the connection is closed, not after.
+           Every read/write does an unsynchronised `if self._closed:
+           return` and then takes the lock, so with the old order the
+           MQTT thread could pass the check, block on the lock we hold,
+           acquire it after `_db.close()`, and raise
+           `ProgrammingError: Cannot operate on a closed database`.
+           Setting the flag first closes that window: anything that
+           passes the check has already been admitted, and anything
+           arriving later short-circuits.
+
+        2. The lock is acquired with a timeout. SIGTERM runs its
+           handler on the MAIN thread, interrupting whatever it was
+           doing — including a multi-second `query_samples_raw` inside
+           `_handle_export`, which holds this same non-reentrant lock.
+           Blocking forever there meant `os._exit` was never reached
+           and the process hung until systemd's SIGKILL ~90s later,
+           which is the exact hang os._exit was added to prevent. If we
+           can't get the lock we log and skip the close: leaking a
+           connection on the way out of the process is harmless, hanging
+           is not.
+        """
         if self._closed:
             return
+        # Set first: stops new work being admitted while we shut down.
+        self._closed = True
+        if not self._lock.acquire(timeout=lock_timeout):
+            log.error("history lock still held after %.1fs (a long query is "
+                      "in flight); skipping flush+close so shutdown can "
+                      "proceed rather than hanging until SIGKILL",
+                      lock_timeout)
+            return
         try:
+            # flush_pending_minutes has no _closed guard, so setting the
+            # flag above doesn't skip the final flush.
             self.flush_pending_minutes()
+        except Exception:
+            log.exception("flushing the in-flight minute failed during close")
         finally:
-            with self._lock:
+            try:
                 self._db.close()
-            self._closed = True
+            except Exception:
+                log.exception("closing the history database failed")
+            self._lock.release()
+
+
+def _local_midnights_back_from(boundary_ts: int, days: int) -> list[int]:
+    """`days` consecutive daily boundaries ending at `boundary_ts`.
+
+    Walks the calendar and re-resolves each boundary through
+    mktime(isdst=-1). Fixed 86400-second steps drift to 23:00 or 01:00
+    for every day after a DST transition, so the daily-energy bars stop
+    lining up with local midnight for the rest of the series.
+
+    The caller's own boundary is preserved exactly — earlier ones keep
+    its local time-of-day rather than being snapped to midnight. In
+    practice callers pass `snapshot._local_midnight(...)`, so that IS
+    midnight; not assuming it keeps the function honest for any other
+    boundary and avoids silently moving the range the caller asked for.
+    """
+    lt = time.localtime(boundary_ts)
+    last = datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday)
+    out: list[int] = []
+    for back in range(days - 1, -1, -1):
+        d = last - datetime.timedelta(days=back)
+        out.append(int(time.mktime((d.year, d.month, d.day,
+                                    lt.tm_hour, lt.tm_min, lt.tm_sec,
+                                    0, 0, -1))))
+    return out
 
 
 def _coerce_float(v: Any) -> float | None:

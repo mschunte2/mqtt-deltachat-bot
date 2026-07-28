@@ -178,7 +178,9 @@ class TestIntegrationRoutingChain(unittest.TestCase):
             14: {"tasmota_plug": 2002},
         }
         self.publisher = Publisher(
-            build=lambda chat, cls: build_for_chat(chat, cls, self.registry, set()),
+            build=lambda chat, cls, include_history=True: build_for_chat(
+                chat, cls, self.registry, set(),
+                include_history=include_history),
             msgids=lambda: msgid_map,
             send=lambda c, m, p: (self.sent.append((c, m, p)), True)[1],
             interval_s=300,
@@ -225,7 +227,7 @@ class TestIntegrationRoutingChain(unittest.TestCase):
         self.assertGreater(len(self.sent), 0)
         for chat_id, msgid, payload in self.sent:
             self.assertEqual(set(payload.keys()),
-                             {"class", "server_ts", "devices"})
+                             {"class", "server_ts", "kind", "devices"})
             self.assertIn("lamp", payload["devices"])
             dev = payload["devices"]["lamp"]
             self.assertIn("fields", dev)

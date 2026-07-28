@@ -1,9 +1,27 @@
 [Unit]
-# Placeholders (@UPPERCASE@) are substituted by install-systemd-unit.sh
-# at install time; do not hand-edit the rendered unit under
-# /etc/systemd/system/ -- re-run the installer instead.
+# Placeholders in AT-UPPERCASE-AT form are substituted by
+# install-systemd-unit.sh at install time; do not hand-edit the
+# rendered unit under /etc/systemd/system/ -- re-run the installer.
 Description=mqtt-bot - @DESCRIPTION@
 After=network.target
+# The bot connects to the broker on startup. paho retries, so this is
+# only to avoid a guaranteed connect-failure WARNING on every boot when
+# the broker runs on the same host.
+Wants=mosquitto.service
+After=mosquitto.service
+
+# NOTE: StartLimit* belong in [Unit], not [Service] — systemd silently
+# ignores them under [Service] ("Unknown key name ... ignoring"), which
+# systemd-analyze verify catches and a running unit does not.
+#
+# The defaults are StartLimitBurst=5 within StartLimitIntervalSec=10s.
+# Five restarts at RestartSec=5 span 25s, so the default limit can NEVER
+# trip: a config error (a stray character in ALLOWED_CHATS, a missing
+# devices.json) restarts every ~5s indefinitely, the unit never enters
+# `failed`, and `systemctl is-failed` stays clean. Widen the window so a
+# genuine crash loop actually stops and becomes visible.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -11,8 +29,59 @@ User=@USER@
 Group=@USER@
 WorkingDirectory=@WORKING_DIR@
 ExecStart=@WORKING_DIR@/start-mqtt-bot.sh
+
 Restart=always
 RestartSec=5
+
+# Logs go to the journal (systemd >= v240 default). SyslogIdentifier
+# makes entries readable in a mixed `journalctl -f` — without it they
+# are tagged `start-mqtt-bot.sh`.
+SyslogIdentifier=@UNIT_BASENAME@
+
+# --- Hardening ------------------------------------------------------
+# This process parses untrusted network input on two sides (MQTT
+# payloads from the LAN, Delta Chat messages from the internet) via
+# paho, deltachat-rpc-server and the JSON parsers. Left unconfined and
+# running as the operator's own login account, any RCE in that
+# dependency tree would hand over SSH keys, the Delta Chat profile
+# backup, and a sudo-capable shell config.
+#
+# ProtectHome is deliberately NOT enabled: the bot's state directory is
+# ~/.config/<BOT_NAME>. ReadWritePaths below narrows that instead.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RemoveIPC=yes
+# IPv4/IPv6 for MQTT + IMAP/SMTP; UNIX for the rpc-server pipe.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# ProtectSystem=strict makes the whole filesystem read-only, so name the
+# two trees that must stay writable: the per-bot state directory
+# (dc.db, history.sqlite, rules.json, app_msgids.json, baselines.json)
+# and the checkout (the built .xdc artifacts).
+ReadWritePaths=@STATE_DIR@
+ReadWritePaths=@WORKING_DIR@
+
+# The Pi has 416 MB of RAM. A runaway query should take the unit down
+# and be restarted, not invite the OOM killer to pick a victim.
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target

@@ -394,3 +394,121 @@ class TestHistory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExportQueryBounds(unittest.TestCase):
+    """The CSV export fetchall()s whole tables into RAM. The live host
+    has 416 MB total / ~275 MB available and already holds 306k
+    samples_raw rows, so an unbounded window is an OOM, not a
+    hypothetical: `/kaffeete export 365d` would have materialised
+    roughly 1.5M tuples at once.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.h = history_mod.History(self.tmp / "h.sqlite", retention_days=0)
+        self.addCleanup(self.h.close)
+        for i in range(50):
+            self.h.record_status("k", 1000 + i, {"apower": float(i),
+                                                 "output": True})
+
+    def test_samples_raw_respects_limit(self):
+        rows = self.h.query_samples_raw("k", 0, 99999, limit=10)
+        self.assertEqual(len(rows), 10)
+
+    def test_samples_raw_limit_keeps_the_newest_rows(self):
+        """A truncated export should show the most recent data, not the
+        oldest — the user asking for 'the last N days' wants the tail."""
+        rows = self.h.query_samples_raw("k", 0, 99999, limit=5)
+        self.assertEqual([r[0] for r in rows], [1045, 1046, 1047, 1048, 1049])
+
+    def test_samples_raw_unlimited_by_default(self):
+        self.assertEqual(len(self.h.query_samples_raw("k", 0, 99999)), 50)
+
+    def test_power_raw_respects_limit(self):
+        for i in range(10):
+            self.h.write_sample("p", 60 * i, float(i), output=True)
+        self.h.flush_pending_minutes()
+        rows = self.h.query_power_raw("p", 0, 99999, limit=3)
+        self.assertLessEqual(len(rows), 3)
+
+    def test_rows_stay_in_ascending_order_when_limited(self):
+        rows = self.h.query_samples_raw("k", 0, 99999, limit=7)
+        self.assertEqual([r[0] for r in rows], sorted(r[0] for r in rows))
+
+
+class TestCloseOrdering(unittest.TestCase):
+    """`_closed` used to be set AFTER `_db.close()`. Every read/write
+    does an unsynchronised `if self._closed: return` and then takes the
+    lock, so the MQTT thread could pass the check, block on the lock
+    close() held, acquire it after the connection was gone, and raise
+    ProgrammingError. The docstring and CLAUDE.md both claimed this was
+    handled."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.h = history_mod.History(self.tmp / "h.sqlite", retention_days=0)
+
+    def test_writer_racing_close_never_hits_a_closed_database(self):
+        import threading
+        errors = []
+        stop = threading.Event()
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                i += 1
+                try:
+                    self.h.write_sample("k", 1000 + i, float(i), output=True)
+                    self.h.record_status("k", 1000 + i, {"apower": 1.0})
+                except Exception as ex:      # ProgrammingError et al
+                    errors.append(ex)
+                    return
+
+        threads = [threading.Thread(target=writer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        time.sleep(0.05)
+        self.h.close()
+        stop.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual([repr(e) for e in errors], [])
+
+    def test_close_is_idempotent(self):
+        self.h.close()
+        self.h.close()
+
+    def test_close_does_not_hang_when_the_lock_is_held(self):
+        """SIGTERM runs its handler on the main thread, which may be
+        interrupted mid-query while holding this lock. Blocking forever
+        meant os._exit was never reached and systemd SIGKILLed us ~90s
+        later — the exact hang os._exit was added to prevent."""
+        import threading
+        holder_in = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with self.h._lock:
+                holder_in.set()
+                release.wait(timeout=10)
+
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        self.assertTrue(holder_in.wait(timeout=5))
+
+        started = time.monotonic()
+        self.h.close(lock_timeout=0.3)
+        elapsed = time.monotonic() - started
+
+        release.set()
+        t.join(timeout=5)
+        self.assertLess(elapsed, 3.0,
+                        "close() blocked on a held lock instead of giving up")
+
+    def test_reads_after_close_return_empty_not_raise(self):
+        self.h.write_sample("k", 1000, 5.0, output=True)
+        self.h.close()
+        self.assertEqual(self.h.query_samples_raw("k", 0, 99999), [])
+        self.assertEqual(self.h.query_power_raw("k", 0, 99999), [])

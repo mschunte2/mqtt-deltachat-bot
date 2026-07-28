@@ -51,9 +51,16 @@ warning on startup if `ALLOWED_CHATS` is empty.
 Each device entry may list specific chat IDs. If omitted, the device
 falls back to the global `ALLOWED_CHATS`.
 
-Both checks happen in `permissions.chat_can_see` — the single
-function called from every routing site (text dispatch, webxdc
-request, snapshot assembly, chat broadcast). There is no bypass path.
+Both checks happen in `permissions.chat_can_see`, called from text
+dispatch, webxdc request handling, snapshot assembly, `/apps`, `/all`,
+`/refresh` and CSV export.
+
+**One known second copy:** `bot.py:_post_to_visible_chats` — the path
+for threshold alerts, offline notices and rule-fire messages — derives
+its recipients inline as `device.allowed_chats or ALLOWED_CHATS`
+instead of calling the predicate. The two agree today; they will not
+the moment anyone adds a deny-list, a per-device `enabled` flag, or a
+mute. Consolidating it is queued.
 
 ### `/id` and `/help`
 
@@ -74,8 +81,16 @@ Three windows, all enforced in `bot.py`:
 | Future-dated skew | `MAX_CLOCK_SKEW_SECONDS` | 30 s | Tolerates NTP drift / sender clock ahead |
 
 Messages outside these windows get a `❌` reaction (text path) or a
-silent drop (webxdc path) plus a log line. The `ts` field on app
-requests is required.
+drop (webxdc path), with a WARNING naming the device and action —
+a stale tap and a replay attempt are otherwise indistinguishable.
+
+The `ts` field on app requests **is required and enforced**: a missing,
+null, string or boolean `ts` is rejected outright by
+`commands.check_freshness`. Until 2026-07-28 the webxdc path only
+applied the window when `ts` happened to be numeric and fell through
+to execute the request otherwise, so any request without a usable `ts`
+switched a relay with no freshness bound and no log line. That gap
+contradicted this document; it is closed and covered by tests.
 
 ## Webxdc msgid registry
 
@@ -105,7 +120,7 @@ No telemetry, no auto-update checks, no third-party services.
 | Path | Contents | Sensitivity |
 |---|---|---|
 | `.env/env` | Bot identity + MQTT creds + ALLOWED_CHATS | Secrets — gitignored |
-| `.env/<dump>.tar` | Delta Chat profile (encrypted) | Secrets — gitignored |
+| `.env/<dump>.tar` | Delta Chat profile backup | Secrets — gitignored. NOTE: a Delta Chat backup tar is only encrypted if you set a backup passphrase; nothing here verifies that. Treat as plaintext credentials unless you know otherwise. |
 | `devices.json` | Device names, MQTT topic prefixes, threshold params | Configuration |
 | `~/.config/<BOT_NAME>/rules.json` | Pending auto-off / auto-on rules | Configuration |
 | `~/.config/<BOT_NAME>/history.sqlite` | Per-minute power + per-hour energy | User-level metering data |
@@ -121,9 +136,19 @@ your chat.
 
 - **No rate limiting on chat output.** A flapping plug produces one
   on/off message per state change. Acceptable for v0.2.
-- **No mutual TLS to the MQTT broker.** Recommend running Mosquitto
-  on the same host (default in `setup-mosquitto.sh`) so the broker
-  link doesn't traverse the LAN.
+- **No TLS to the MQTT broker, and no topic ACLs.**
+  `setup-mosquitto.sh` writes `listener 1883 0.0.0.0` with
+  `allow_anonymous false` and a password file — so the listener DOES
+  face the LAN (an earlier version of this document claimed the
+  opposite), credentials cross it in cleartext on every plug
+  reconnect, and the single account is shared between the bot and the
+  plugs. With no `acl_file`, any client holding that credential can
+  publish straight to a command topic, bypassing `ALLOWED_CHATS`
+  entirely, and can publish a forged `status/switch:0` that drives
+  twin state, chat events, `samples_raw`, and rule evaluation.
+  Binding the listener to `127.0.0.1` only works if the plugs reach
+  the broker some other way; the real fixes are per-role credentials
+  plus topic ACLs, and TLS if the LAN is not trusted.
 - **Bot restart drops unflushed state in flight.** History buffers
   are flushed on SIGTERM; webxdc updates being sent at exit may be
   lost (deltachat2 will retry on next start).

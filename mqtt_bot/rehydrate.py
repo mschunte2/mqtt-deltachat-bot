@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import time
 
-log = logging.getLogger("mqtt_bot")
+log = logging.getLogger("mqtt_bot.rehydrate")
 
 
 def rehydrate_rules_from_history(registry, history) -> None:
