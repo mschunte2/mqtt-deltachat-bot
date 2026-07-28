@@ -45,6 +45,7 @@ in users' SQLite files are dead data the bot never reads.)
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import sqlite3
@@ -546,12 +547,16 @@ class History:
         """
         if self._closed or days <= 0:
             return []
-        oldest_start = midnight_ts - (days - 1) * 86400
+        # Day boundaries by CALENDAR, not by adding 86400. A DST change
+        # makes one local day 23 or 25 hours long, so fixed-second steps
+        # drift to 23:00/01:00 for every day after the transition and the
+        # daily-energy bars stop lining up with local midnight.
+        starts = _local_midnights_back_from(midnight_ts, days)
         out: list[tuple[int, float]] = []
-        prev_wh = self.aenergy_at(device, oldest_start)
-        for d in range(days):
-            day_start = oldest_start + d * 86400
-            day_end = day_start + 86400
+        prev_wh = self.aenergy_at(device, starts[0])
+        for i, day_start in enumerate(starts):
+            day_end = (starts[i + 1] if i + 1 < len(starts)
+                       else day_start + 86400)
             end_wh = self.aenergy_at(device, day_end)
             if prev_wh is None or end_wh is None:
                 out.append((day_start, 0.0))
@@ -743,6 +748,31 @@ class History:
             except Exception:
                 log.exception("closing the history database failed")
             self._lock.release()
+
+
+def _local_midnights_back_from(boundary_ts: int, days: int) -> list[int]:
+    """`days` consecutive daily boundaries ending at `boundary_ts`.
+
+    Walks the calendar and re-resolves each boundary through
+    mktime(isdst=-1). Fixed 86400-second steps drift to 23:00 or 01:00
+    for every day after a DST transition, so the daily-energy bars stop
+    lining up with local midnight for the rest of the series.
+
+    The caller's own boundary is preserved exactly — earlier ones keep
+    its local time-of-day rather than being snapped to midnight. In
+    practice callers pass `snapshot._local_midnight(...)`, so that IS
+    midnight; not assuming it keeps the function honest for any other
+    boundary and avoids silently moving the range the caller asked for.
+    """
+    lt = time.localtime(boundary_ts)
+    last = datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday)
+    out: list[int] = []
+    for back in range(days - 1, -1, -1):
+        d = last - datetime.timedelta(days=back)
+        out.append(int(time.mktime((d.year, d.month, d.day,
+                                    lt.tm_hour, lt.tm_min, lt.tm_sec,
+                                    0, 0, -1))))
+    return out
 
 
 def _coerce_float(v: Any) -> float | None:

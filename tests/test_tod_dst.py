@@ -143,5 +143,77 @@ class TestOrdinaryDays(unittest.TestCase):
             self.assertGreater(sched.next_tod_deadline(0, 15, now), now)
 
 
+
+class TestEnergyBucketBoundaries(unittest.TestCase):
+    """Daily and weekly boundaries used fixed 86400-second steps. A DST
+    change makes one local day 23 or 25 hours long, so every boundary
+    after the transition drifted to 23:00 or 01:00 and the daily-energy
+    bars stopped lining up with local midnight."""
+
+    def test_daily_boundaries_stay_at_local_midnight_across_dst(self):
+        from mqtt_bot.io.history import _local_midnights_back_from
+
+        with _tz("Europe/Berlin"):
+            # Ends the day after the autumn transition, reaching back
+            # across it.
+            end = _at(2026, 10, 27, 0, 0)
+            starts = _local_midnights_back_from(end, 5)
+            self.assertEqual(len(starts), 5)
+            for ts in starts:
+                lt = time.localtime(ts)
+                self.assertEqual((lt.tm_hour, lt.tm_min), (0, 0),
+                                 f"{time.strftime('%F %T %Z', lt)} is not "
+                                 f"local midnight")
+
+    def test_one_day_really_is_25_hours_on_the_fall_back_day(self):
+        from mqtt_bot.io.history import _local_midnights_back_from
+
+        with _tz("Europe/Berlin"):
+            starts = _local_midnights_back_from(_at(2026, 10, 27, 0, 0), 5)
+            gaps = [b - a for a, b in zip(starts, starts[1:])]
+            self.assertIn(25 * 3600, gaps,
+                          "the fall-back day should be 25 hours long")
+
+    def test_daily_boundaries_across_spring_forward(self):
+        from mqtt_bot.io.history import _local_midnights_back_from
+
+        with _tz("Europe/Berlin"):
+            starts = _local_midnights_back_from(_at(2026, 3, 31, 0, 0), 5)
+            gaps = [b - a for a, b in zip(starts, starts[1:])]
+            self.assertIn(23 * 3600, gaps,
+                          "the spring-forward day should be 23 hours long")
+            for ts in starts:
+                lt = time.localtime(ts)
+                self.assertEqual((lt.tm_hour, lt.tm_min), (0, 0))
+
+    def test_boundaries_are_ascending_and_end_on_the_caller_value(self):
+        from mqtt_bot.io.history import _local_midnights_back_from
+
+        with _tz("Europe/Berlin"):
+            end = _at(2026, 10, 27, 0, 0)
+            starts = _local_midnights_back_from(end, 30)
+            self.assertEqual(starts, sorted(starts))
+            self.assertEqual(starts[-1], end)
+
+    def test_week_start_is_monday_midnight_across_dst(self):
+        from mqtt_bot.core.snapshot import _local_week_start
+
+        with _tz("Europe/Berlin"):
+            # Wednesday after the autumn change; Monday is on the other
+            # side of it.
+            got = _local_week_start(_at(2026, 10, 28, 15, 0))
+            lt = time.localtime(got)
+            self.assertEqual(lt.tm_wday, 0, "should be a Monday")
+            self.assertEqual((lt.tm_hour, lt.tm_min), (0, 0),
+                             "should be local midnight, not 23:00/01:00")
+
+    def test_week_start_ordinary_week(self):
+        from mqtt_bot.core.snapshot import _local_week_start
+
+        with _tz("Europe/Berlin"):
+            got = _local_week_start(_at(2026, 6, 17, 12, 0))   # a Wednesday
+            self.assertEqual(got, _at(2026, 6, 15, 0, 0))      # that Monday
+
+
 if __name__ == "__main__":
     unittest.main()

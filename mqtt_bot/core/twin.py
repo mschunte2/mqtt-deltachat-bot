@@ -165,13 +165,22 @@ class PlugTwin:
         elif new_out is False and prev_out is True:
             self._reset_rule_windows_for("on", now)
 
-        # State-based rule evaluation (idle / consumed). Dormant rules
-        # (target state already met) are reset to their starting condition
-        # so they don't accumulate while the plug sits in target.
-        rule_fired = self._tick_state_rules(current_fields, now)
-
-        # History writes — outside the lock; History has its own lock.
+        # History FIRST, then rule evaluation. The consumed and avg
+        # evaluators read this same history back, so writing afterwards
+        # meant every evaluation ran against data that was missing the
+        # sample which had just triggered it: avg's coverage gate
+        # systematically undercounted by one bucket, and consumed's
+        # window lagged one sample — a ~10% error at the default 60s
+        # cadence against a 10-minute window.
+        #
+        # Outside the lock; History has its own.
         self._write_history(suffix, payload, current_fields, now)
+
+        # State-based rule evaluation (idle / consumed / avg). Dormant
+        # rules (target state already met) are reset to their starting
+        # condition so they don't accumulate while the plug sits in
+        # target.
+        rule_fired = self._tick_state_rules(current_fields, now)
 
         # Broadcast on any state edge OR rule fire. Don't broadcast for
         # plain power-metric noise (apower wiggling without crossing
