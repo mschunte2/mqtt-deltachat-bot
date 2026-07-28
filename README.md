@@ -57,7 +57,7 @@ mqtt-bot/
 ├── init-from-backup.sh            # one-shot: import a Delta Chat profile tar from .env/
 ├── install-systemd-unit.sh        # render+enable+start the systemd unit
 ├── systemd-unit/deltabot.service.template
-└── tests/                         # stdlib unittest, 130 tests
+└── tests/                         # stdlib unittest, 305 tests
 ```
 
 ## Chat commands
@@ -68,6 +68,7 @@ mqtt-bot/
 /<device> on until idle           # on now + auto-off when apower<5W for 60s (defaults)
 /<device> on until idle 10W 120s  # on now + auto-off (custom thresholds)
 /<device> on until used <5Wh in 10m
+/<device> off if avg <20W in 15m  # mean power (cycling loads; see avg policy)
 /<device> on for 1h or until idle
 /<device> auto-off in 30m         # schedule auto-off, no immediate toggle
 /<device> auto-off at 18h         # next 18:00 local
@@ -75,11 +76,12 @@ mqtt-bot/
 /<device> auto-on at 7h           # next 07:00 local
 /<device> auto-on at 7h daily     # recurring
 /<device> cancel-auto-off | cancel-auto-on | cancel-schedule
-/<device> export 7d               # CSV (samples_raw + power_minute)
+/<device> export 7d               # CSV (samples_raw + power_minute), max 31d
 /<device> rules                   # list this device's pending auto-off / auto-on rules
 
 /all on | off | toggle            # act on every device visible to this chat
 /rules          list pending rules across every visible device
+/diag           bot health: mqtt, threads, data age, running build
 /list           list devices visible to this chat
 /apps           (re)deliver webxdc control apps
 /id             show this chat's id (permission-free, needed for setup)
@@ -98,7 +100,7 @@ The bot persists per-device time series under
 `~/.config/<BOT_NAME>/history.sqlite`. This drives:
 
 - **Webxdc app charts** — line chart over the selected window
-  (1h / 6h / 12h / 24h / 31d). Three colors: green = on,
+  (1h / 12h / 24h / 7d / 31d / 365d). Three colors: green = on,
   red = off, **grey = offline** (no `power_minute` row for that
   bucket — gap-filled by the snapshot builder).
 - **30-day daily-energy bars** below the line chart.
@@ -309,7 +311,7 @@ No Python edits needed.
 ## Testing
 
 ```bash
-python3 -m unittest discover tests # 130 unit tests (~5 s)
+python3 -m unittest discover tests # 305 unit tests (~14 s)
 ```
 
 Coverage: `durations`, `templating`, `state` extraction, `permissions`,
@@ -340,4 +342,5 @@ Detailed change log lives in `CLAUDE.md` under "Provenance and history."
 Modeled on [`gatekeeper-bot`](../gatekeeper-bot) (Delta Chat ↔ BLE smart
 lock). The bot framework, webxdc plumbing, `app_msgids.json` pattern,
 and systemd template are derived from it; the digital-twin core
-(`plug.py` + `twins.py` + `snapshot.py` + `publisher.py`) is new.
+(`core/twin.py` + `core/twins.py` + `core/snapshot.py` +
+`io/publisher.py`) is new.
