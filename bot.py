@@ -208,17 +208,22 @@ def _load_baselines() -> int:
 
 
 def _publisher_broadcast(device_name: str | None = None) -> None:
-    # Twins call this on every state edge. We resolve the class so the
-    # publisher only pushes to apps of that class — a Tasmota toggle
-    # doesn't churn unrelated Shelly app instances. Force=True so we
-    # don't suppress edges with hash-equal payloads (e.g. a quick
-    # toggle that lands back where it started before the plug echoes).
+    """Twins call this on every state edge.
+
+    It only QUEUES the push. Building inline here ran ~750 SQL queries
+    per device and two ~139 KB JSON serialisations on paho's network
+    callback thread, which could stall the MQTT loop past its keepalive.
+    The publisher daemon coalesces a burst into one compact push.
+
+    We still resolve the class so the fan-out stays scoped — a Tasmota
+    toggle shouldn't churn unrelated Shelly app instances.
+    """
     only_class = None
     if device_name:
         twin = registry.get(device_name)
         if twin is not None:
             only_class = twin.cls.name
-    publisher.broadcast(device_name, only_class=only_class, force=True)
+    publisher.request_broadcast(device_name, only_class=only_class)
 
 
 # --- Construct everything ------------------------------------------------
@@ -295,9 +300,10 @@ def _publisher_send(chat_id: int, msgid: int, payload: dict) -> bool:
 
 
 publisher = Publisher(
-    build=lambda chat_id, class_name: snap_mod.build_for_chat(
-        chat_id, class_name, registry, ALLOWED_CHATS,
-    ),
+    build=lambda chat_id, class_name, include_history=True:
+        snap_mod.build_for_chat(chat_id, class_name, registry,
+                                ALLOWED_CHATS,
+                                include_history=include_history),
     msgids=lambda: webxdc.map_snapshot(),
     send=_publisher_send,
     interval_s=PUBLISH_INTERVAL_S,

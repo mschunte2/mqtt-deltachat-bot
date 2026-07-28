@@ -21,7 +21,7 @@ const SERIAL_KEY = 'lastSerial';
 
 // Bump on substantive main.js / index.html changes; emitted in telemetry
 // so server-side stats can be grouped by build.
-const APP_BUILD_TS = 1784468620; // 2026-07-19 — fix stateEnergy crash on empty-cache boot
+const APP_BUILD_TS = 1785240000; // 2026-07-28 — merge compact "state" pushes
 
 // Telemetry collected during boot, sent once ~2s after script load.
 // nav_to_*_ms are performance.now() snapshots, relative to navigation
@@ -677,7 +677,35 @@ window.webxdc.setUpdateListener((update) => {
   // indirection for no reason.)
   if (!p || !p.devices) return;
   state.serverTs = p.server_ts || Math.floor(Date.now() / 1000);
-  state.devices = p.devices;
+  // Two payload kinds since 2026-07-28:
+  //   "full"  — everything, including power_history + daily_energy_wh.
+  //             Sent on the heartbeat, the refresh button and /apps.
+  //   "state" — live fields, rules and energy counters only. Sent on
+  //             state edges, which are frequent; shipping ~2500 chart
+  //             points and 365 daily pairs per device on each of those
+  //             is what drove dc.db to 464 MB.
+  // A "state" payload MERGES over the cached snapshot so the charts
+  // survive; anything else replaces wholesale. Payloads with no `kind`
+  // are treated as full — that's what an older bot sends.
+  if (p.kind === 'state') {
+    const merged = Object.assign({}, state.devices);
+    for (const [name, dev] of Object.entries(p.devices)) {
+      const prev = merged[name] || {};
+      merged[name] = Object.assign({}, prev, dev);
+      // Carry the heavy series forward explicitly: Object.assign would
+      // otherwise leave them only if absent from `dev`, which is true
+      // today but silently breaks if the bot ever sends a partial one.
+      if (!dev.power_history && prev.power_history) {
+        merged[name].power_history = prev.power_history;
+      }
+      if (!dev.daily_energy_wh && prev.daily_energy_wh) {
+        merged[name].daily_energy_wh = prev.daily_energy_wh;
+      }
+    }
+    state.devices = merged;
+  } else {
+    state.devices = p.devices;
+  }
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       server_ts: state.serverTs, devices: state.devices,

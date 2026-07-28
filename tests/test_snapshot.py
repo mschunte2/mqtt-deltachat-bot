@@ -99,7 +99,9 @@ class TestSnapshotContract(unittest.TestCase):
         self.assertIsNotNone(snap)
         # Snapshot is at the top level of payload — NO `snapshot:` wrapper.
         # The app reads `payload.devices`, `payload.server_ts`, etc.
-        self.assertEqual(set(snap.keys()), {"class", "server_ts", "devices"})
+        self.assertEqual(set(snap.keys()),
+                         {"class", "server_ts", "kind", "devices"})
+        self.assertEqual(snap["kind"], "full")
         self.assertEqual(snap["class"], "tplug")
         self.assertIsInstance(snap["server_ts"], int)
 
@@ -181,7 +183,8 @@ class TestSnapshotContract(unittest.TestCase):
         # Single `payload` wrapper, snapshot keys at the top level
         # under it (NO extra `snapshot:` nesting).
         self.assertEqual(set(body.keys()), {"payload"})
-        self.assertEqual(set(body["payload"].keys()), {"class", "server_ts", "devices"})
+        self.assertEqual(set(body["payload"].keys()),
+                         {"class", "server_ts", "kind", "devices"})
         self.assertIn("kitchen", body["payload"]["devices"])
 
 

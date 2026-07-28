@@ -31,9 +31,16 @@ _HISTORY_DAY_WINDOW = 365 * _DAY         # last 365 d at 1-day buckets
 
 
 def build_for_chat(chat_id: int, class_name: str,
-                   registry, allowed_chats: set[int]) -> dict[str, Any] | None:
+                   registry, allowed_chats: set[int],
+                   include_history: bool = True) -> dict[str, Any] | None:
     """Build the per-(chat, class) payload. None if the chat sees no
-    devices in this class — caller skips the push."""
+    devices in this class — caller skips the push.
+
+    `include_history=False` produces the compact edge payload: live
+    state, rules and energy counters, without the ~2500 chart points
+    and 365 daily-energy pairs per device. `kind` tells the app which
+    it received, so it can merge rather than replace.
+    """
     visible = [t for t in registry.all()
                if t.cls.name == class_name
                and t.can_chat_see(chat_id, allowed_chats)]
@@ -42,7 +49,9 @@ def build_for_chat(chat_id: int, class_name: str,
     return {
         "class": class_name,
         "server_ts": int(time.time()),
-        "devices": {t.name: t.to_dict() for t in visible},
+        "kind": "full" if include_history else "state",
+        "devices": {t.name: t.to_dict(include_history=include_history)
+                    for t in visible},
     }
 
 

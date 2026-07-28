@@ -409,8 +409,23 @@ class PlugTwin:
         with self._lock:
             return dict(self.fields)
 
-    def to_dict(self) -> dict[str, Any]:
-        """The per-device payload included in the outbound snapshot."""
+    def to_dict(self, include_history: bool = True) -> dict[str, Any]:
+        """The per-device payload included in the outbound snapshot.
+
+        `include_history=False` omits `power_history` and
+        `daily_energy_wh` — ~2500 chart points plus 365 daily pairs per
+        device, which is the bulk of a ~139 KB snapshot and the reason
+        dc.db reached 464 MB on the live host. Those series barely
+        change between two state edges seconds apart, and every push
+        leaves a permanently-retained carrier message. Edge broadcasts
+        therefore send live state only; the periodic heartbeat, the
+        refresh button and /apps send the full payload.
+
+        The app merges a partial payload into its cached snapshot. Older
+        app builds simply render "(no data yet)" on the chart until the
+        next full push — they already guard both keys — so no installed
+        instance breaks while it waits for /apps.
+        """
         now_ts = int(time.time())
 
         def _actual_window(job, full_window_s: int) -> int:
@@ -509,7 +524,7 @@ class PlugTwin:
         }
         if self.deps.history is not None:
             from .snapshot import (_daily_energy_wh, _energy_summary,
-                                   _power_history)
+                                   _power_history)  # noqa: F401
             # Effective lifetime = raw_at_or_before(now) + cumulative
             # offset SUM. Falls back to the in-memory raw field if we
             # don't yet have a samples_raw row (e.g. just before the
@@ -524,14 +539,15 @@ class PlugTwin:
                 baseline_wh=self.baseline_wh,
                 reset_at_ts=self.reset_at_ts,
             )
-            payload["daily_energy_wh"] = _daily_energy_wh(
-                self.deps.history, self.name,
-            )
-            payload["power_history"] = _power_history(
-                self.deps.history, self.name,
-                live_apower=fields.get("apower"),
-                live_output=fields.get("output"),
-            )
+            if include_history:
+                payload["daily_energy_wh"] = _daily_energy_wh(
+                    self.deps.history, self.name,
+                )
+                payload["power_history"] = _power_history(
+                    self.deps.history, self.name,
+                    live_apower=fields.get("apower"),
+                    live_output=fields.get("output"),
+                )
         return payload
 
     # --- internals ------------------------------------------------------
