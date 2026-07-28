@@ -716,6 +716,13 @@ class RulesSweeper:
         self._stop.set()
         self._wake.set()
 
+    def is_alive(self) -> bool:
+        """Whether the sweeper thread is still running — surfaced by
+        /diag. This thread dying is the single most consequential silent
+        failure in the bot: every timer and time-of-day rule stops
+        firing, and /rules keeps counting down against nothing."""
+        return self._thread is not None and self._thread.is_alive()
+
     def wake(self) -> None:
         """Called when a new rule is added/cancelled, so we re-evaluate
         the earliest deadline immediately."""

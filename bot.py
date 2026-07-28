@@ -87,6 +87,7 @@ from mqtt_bot import commands as commands_mod  # noqa: E402
 from mqtt_bot import csv_export  # noqa: E402
 from mqtt_bot import formatters  # noqa: E402
 from mqtt_bot import rehydrate as rehydrate_mod  # noqa: E402
+from mqtt_bot import version as version_mod  # noqa: E402
 from mqtt_bot.core import rules as rules_mod  # noqa: E402
 from mqtt_bot.core import snapshot as snap_mod  # noqa: E402
 from mqtt_bot.core.twin import PlugTwin, TwinDeps  # noqa: E402
@@ -408,6 +409,23 @@ def list_devices(chat_id: int) -> str:
     return "\n".join(lines)
 
 
+def diag_text(chat_id: int) -> str:
+    """`/diag` — subsystem health, per-device freshness, app
+    registrations and the running build. Rendering lives in
+    formatters.format_diag; this only gathers the live values."""
+    return formatters.format_diag(
+        version=version_mod.version(),
+        mqtt_alive=mqtt.is_alive(),
+        mqtt_connected=mqtt.is_connected(),
+        mqtt_last_message_age_s=mqtt.last_message_age_s(),
+        sweeper_alive=sweeper.is_alive(),
+        publisher_alive=publisher.is_alive(),
+        twins=registry.visible_to(chat_id, ALLOWED_CHATS),
+        registered_msgids=dict(webxdc.map_snapshot().get(chat_id, {})),
+        allowed_chats=ALLOWED_CHATS,
+    )
+
+
 def list_rules(chat_id: int, device_name: str | None = None) -> str:
     if device_name is not None:
         twin = registry.get(device_name)
@@ -462,6 +480,7 @@ def help_text(chat_id: int) -> str:
         "  /<device> export 7d                — CSV of power + energy history\n"
         "  /<device> rules                    — list this device's rules\n"
         "  /rules               — list rules for every visible device\n"
+        "  /diag                — health: mqtt, threads, data age, build\n"
         "  /refresh             — push fresh state to every open webxdc app in this chat\n"
         "  /<device> refresh    — push fresh state for that device's class only\n"
         "  /list                — list devices visible to this chat\n"
@@ -879,6 +898,9 @@ def _on_new_message(bot, accid, event):
             return
         if verb == "rules":
             bot.rpc.send_msg(accid, chatid, MsgData(text=list_rules(chatid)))
+            return
+        if verb in ("diag", "version"):
+            bot.rpc.send_msg(accid, chatid, MsgData(text=diag_text(chatid)))
             return
         if verb == "refresh":
             n = _refresh_chat(chatid)

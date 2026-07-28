@@ -385,6 +385,18 @@ class PlugTwin:
         with self._lock:
             return list(self.rules)
 
+    def fields_snapshot(self) -> dict[str, Any]:
+        """Locked copy of the current state fields.
+
+        Readers used to do a bare `dict(twin.fields)`, which can raise
+        "dictionary changed size during iteration" while the MQTT thread
+        is inside `fields.update()`. formatters was doing exactly that
+        one line above a correctly-locked jobs_snapshot() call, which is
+        what makes it look accidental rather than deliberate.
+        """
+        with self._lock:
+            return dict(self.fields)
+
     def to_dict(self) -> dict[str, Any]:
         """The per-device payload included in the outbound snapshot."""
         now_ts = int(time.time())

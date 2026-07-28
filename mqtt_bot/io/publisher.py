@@ -76,6 +76,12 @@ class Publisher:
     def stop(self) -> None:
         self._stop.set()
 
+    def is_alive(self) -> bool:
+        """Whether the heartbeat thread is still running — surfaced by
+        /diag, since a dead publisher means apps silently stop updating
+        while everything else looks fine."""
+        return self._thread is not None and self._thread.is_alive()
+
     # --- triggers --------------------------------------------------------
 
     def broadcast(self, device_name: str | None = None,

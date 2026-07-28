@@ -20,7 +20,8 @@ from __future__ import annotations
 import re
 
 # Verbs that don't need a device prefix: `/help`, `/list`, etc.
-GLOBAL_VERBS = {"id", "list", "apps", "help", "rules", "refresh"}
+GLOBAL_VERBS = {"id", "list", "apps", "help", "rules", "refresh",
+                "diag", "version"}
 # Per-device verbs that fire an immediate dispatch.
 DIRECT_VERBS = {"on", "off", "toggle", "status"}
 # Per-device verbs that cancel a previously-scheduled rule.
