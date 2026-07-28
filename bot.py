@@ -272,21 +272,67 @@ mqtt = MqttClient(
 )
 
 
+_crashed = False
+
+
+def _record_crash(exc_type, exc, tb) -> None:
+    """Remember that we are dying from an unhandled exception, so
+    _on_shutdown can pick a truthful exit code. Runs before atexit, and
+    still delegates to the previous hook so the traceback is printed
+    exactly as before."""
+    global _crashed
+    _crashed = True
+    _prev_excepthook(exc_type, exc, tb)
+
+
+_prev_excepthook = sys.excepthook
+sys.excepthook = _record_crash
+
+
 def _on_shutdown(*_a) -> None:
+    """Flush what we own, then leave immediately.
+
+    Registered as both the SIGTERM handler and an atexit hook. atexit
+    also runs during normal interpreter finalisation, which INCLUDES
+    the path taken after an unhandled exception escapes __main__ — so
+    exiting 0 unconditionally reported every crash to systemd as
+    `code=exited, status=0/SUCCESS`, left `journalctl -p err` empty,
+    and made a clean stop indistinguishable from a hard failure. It
+    would also have silently disabled Restart=on-failure.
+
+    Note the flag rather than sys.exc_info(): by the time atexit hooks
+    run the interpreter has already printed and cleared the exception,
+    so exc_info() is empty on the crash path too. _record_crash below
+    catches it earlier, in sys.excepthook.
+    """
     try:
         publisher.stop()
+    except Exception:
+        pass
+    try:
+        sweeper.stop()
     except Exception:
         pass
     try:
         history.close()
     except Exception:
         log.exception("history close failed")
+
+    code = 1 if _crashed else 0
+    if _crashed:
+        log.error("shutting down after an unhandled exception; exiting %d",
+                  code)
+    else:
+        log.info("shutdown complete")
+
     # os._exit instead of sys.exit: deltabot-cli's main thread is blocked
     # in a transport loop that doesn't propagate SystemExit cleanly, so
     # sys.exit was leaving the process alive until systemd's SIGKILL
     # (~90s after SIGTERM). os._exit terminates immediately — safe here
-    # because we've already flushed everything we own.
-    os._exit(0)
+    # because we've already flushed everything we own. It does mean no
+    # other atexit hook runs, so flush logging first.
+    logging.shutdown()
+    os._exit(code)
 
 
 import atexit  # noqa: E402
