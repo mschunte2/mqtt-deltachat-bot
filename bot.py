@@ -794,12 +794,20 @@ def _on_webxdc_update(bot, accid, event):
                            chatid)
         return
 
-    ts = req.get("ts")
-    if isinstance(ts, (int, float)):
-        age = int(time.time()) - int(ts)
-        if age > MAX_APP_AGE_SECONDS or age < -MAX_CLOCK_SKEW_SECONDS:
-            bot.logger.info("webxdc cmd age=%ds dropped (chat=%d)", age, chatid)
-            return
+    # Freshness is mandatory here, not best-effort. This used to run the
+    # window check only when `ts` happened to be numeric and fall through
+    # to handle_webxdc_request otherwise, so a request with no `ts` (an
+    # old .xdc build, or an update redelivered after a long offline
+    # period) switched the relay with no age bound and no log line.
+    ok, why = commands_mod.check_freshness(
+        req.get("ts"), int(time.time()), MAX_APP_AGE_SECONDS)
+    if not ok:
+        bot.logger.warning(
+            "webxdc request REJECTED (chat=%d msgid=%d device=%s action=%s): "
+            "%s — run /apps if this app instance is out of date",
+            chatid, msgid, _sanitize(req.get("device")),
+            _sanitize(req.get("action")), why)
+        return
 
     handle_webxdc_request(chatid, msgid, req)
 
@@ -837,16 +845,23 @@ def _on_new_message(bot, accid, event):
         bot.rpc.send_msg(accid, chatid, MsgData(text="permission denied"))
         return
 
-    age = int(time.time()) - int(msg.timestamp)
-    if age > MAX_AGE_SECONDS or age < -MAX_CLOCK_SKEW_SECONDS:
-        bot.logger.info("text command age=%ds dropped in chat %d", age, chatid)
+    head, verb, rest = parsed
+
+    # Same gate as the webxdc path, wider window: a typed command should
+    # survive one broker reconnect, an app tap should not. Rejections are
+    # WARNING and name the device+verb — a stale tap and a replay attempt
+    # look identical otherwise.
+    ok, why = commands_mod.check_freshness(
+        msg.timestamp, int(time.time()), MAX_AGE_SECONDS)
+    if not ok:
+        bot.logger.warning(
+            "text command REJECTED in chat %d (%s %s): %s",
+            chatid, _sanitize(head or "/"), _sanitize(verb), why)
         try:
             bot.rpc.send_reaction(accid, msg.id, ["❌"])
         except Exception:
             pass
         return
-
-    head, verb, rest = parsed
 
     if head == "":
         if verb == "list":

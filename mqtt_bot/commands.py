@@ -47,6 +47,42 @@ EXPORT_MAX_WINDOW_S = 31 * 86400
 EXPORT_MAX_ROWS = 100_000
 
 
+def check_freshness(ts, now: int, max_age: int,
+                    skew: int = MAX_CLOCK_SKEW_SECONDS) -> tuple[bool, str]:
+    """Is a request bearing timestamp `ts` fresh enough to act on?
+
+    Returns (ok, reason); `reason` is empty when ok.
+
+    A missing or non-numeric `ts` is a REJECTION, not a skip. The
+    webxdc path used to read
+
+        ts = req.get("ts")
+        if isinstance(ts, (int, float)):
+            ...check age...
+        handle_webxdc_request(...)      # ran regardless
+
+    so a request with no `ts` at all — or with `ts` as a JSON string,
+    null, or bool — bypassed replay protection entirely, with no log
+    line, and switched a mains relay. Both SECURITY.md and CLAUDE.md
+    documented the opposite ("the `ts` field is required ... apps
+    without a `ts` field are rejected"), which is the worst kind of
+    gap: the operator believes the control exists.
+
+    bool is excluded explicitly because `isinstance(True, int)` is
+    True in Python, so `{"ts": true}` would otherwise read as ts=1 —
+    an age of ~56 years, which the window would reject, but for the
+    wrong reason and only by luck.
+    """
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return False, f"missing or non-numeric ts ({type(ts).__name__})"
+    age = int(now) - int(ts)
+    if age > max_age:
+        return False, f"stale by {age - max_age}s (age={age}s)"
+    if age < -skew:
+        return False, f"future-dated by {-age}s beyond the {skew}s skew"
+    return True, ""
+
+
 def sanitize(value, fallback: str = "?", max_len: int = 64) -> str:
     """Strip control characters, trim whitespace, cap length. Used
     when echoing user-supplied strings (device names, actions) into
