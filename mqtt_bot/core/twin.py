@@ -876,6 +876,13 @@ class PlugTwin:
             log.error("rule fired for unknown action %s on %s",
                       job.target_action, self.name)
             return
+        with self._lock:
+            if job._cancelled:
+                # Cancelled after this tick selected it. Telling the user
+                # "cancelled" and then switching the plug anyway is the
+                # worst of both answers.
+                _skip(self.name, job, "cancelled before it could fire")
+                return
         topic = f"{self.cfg.topic_prefix}/{cmd.suffix}"
         payload = templating.render(cmd.payload,
                                     {"client_id": self.deps.client_id})
@@ -919,6 +926,11 @@ class PlugTwin:
                     survivors.append(r); continue
                 if rule_id is not None and r.rule_id != rule_id:
                     survivors.append(r); continue
+                # Mark, don't just unlist: a tick may already hold this
+                # job in its `fires` list, past the point where it would
+                # re-read self.rules. _fire_rule re-checks the flag
+                # immediately before publishing.
+                r._cancelled = True
                 cancelled.append(r)
             self.rules = survivors
         return cancelled

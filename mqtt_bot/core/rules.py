@@ -175,6 +175,15 @@ class ScheduledJob:
     # Transient — NOT persisted via to_dict / from_dict.
     _loaded_at: int = 0
 
+    # Set by PlugTwin._remove_rules under the twin lock when this rule
+    # is cancelled. Both tick paths select the rules to fire under the
+    # lock, release it, and only then publish — so a cancel arriving in
+    # that window used to unlist the job while the already-built `fires`
+    # list still switched the plug. The state-rule path holds that
+    # window open across several SQL round-trips. Checked immediately
+    # before the side effect. Transient — NOT persisted.
+    _cancelled: bool = False
+
     @classmethod
     def from_policy(
         cls,
