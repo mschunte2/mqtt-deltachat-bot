@@ -84,6 +84,7 @@ from deltachat2 import EventType, MsgData, events  # noqa: E402
 from deltabot_cli import BotCli  # noqa: E402
 
 from mqtt_bot import commands as commands_mod  # noqa: E402
+from mqtt_bot import csv_export  # noqa: E402
 from mqtt_bot import formatters  # noqa: E402
 from mqtt_bot import rehydrate as rehydrate_mod  # noqa: E402
 from mqtt_bot.core import rules as rules_mod  # noqa: E402
@@ -987,9 +988,10 @@ def _handle_apps(bot, accid, chatid):
 
 
 def _handle_export(bot, accid, chatid, device_name, rest):
-    """Dump power_minute + energy_hour for a device to a CSV attachment."""
+    """Dump power_minute + samples_raw for a device to a CSV attachment.
+    Row shaping lives in mqtt_bot.csv_export so the column layout is
+    testable."""
     import csv
-    import datetime as _dt
     import tempfile
 
     twin = registry.get(device_name)
@@ -1030,30 +1032,11 @@ def _handle_export(bot, accid, chatid, device_name, rest):
     try:
         with os.fdopen(fd, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow([
-                "unix_ts", "iso_time", "device", "kind",
-                "avg_apower_w", "output", "sample_count",
-                "apower_w", "voltage_v", "current_a", "freq_hz",
-                "aenergy_total_wh", "temperature_c",
-            ])
-            for ts, apower, output, count in power_rows:
-                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
-                            device_name, "power_minute",
-                            f"{apower:.3f}",
-                            "" if output is None else output,
-                            count, "", "", "", "", "", "", ""])
+            w.writerow(csv_export.HEADER)
+            for row in power_rows:
+                w.writerow(csv_export.power_minute_row(device_name, row))
             for row in samples_rows:
-                ts, ap, v, c, f_hz, ae, out, tc = row
-                w.writerow([ts, _dt.datetime.fromtimestamp(ts).isoformat(),
-                            device_name, "samples_raw",
-                            "", "", "",
-                            "" if ap is None else f"{ap:.3f}",
-                            "" if v is None else f"{v:.2f}",
-                            "" if c is None else f"{c:.4f}",
-                            "" if f_hz is None else f"{f_hz:.2f}",
-                            "" if ae is None else f"{ae:.3f}",
-                            "" if out is None else out,
-                            "" if tc is None else f"{tc:.1f}"])
+                w.writerow(csv_export.samples_raw_row(device_name, row))
         note = (f" · TRUNCATED to the newest {EXPORT_MAX_ROWS} of "
                 f"{total_samples} status updates" if truncated else "")
         bot.rpc.send_msg(
