@@ -7,6 +7,11 @@ __pycache__/
 # Built webxdc artifacts; rebuild with ./build-xdc.sh
 devices/*/*.xdc
 
+# Third-party .xdc files kept locally as comparative evidence for the
+# ANDROID-COLDSTART.md investigation. Not ours to redistribute — this
+# repo is public — and not needed to build or run the bot.
+BAD-APPS/
+
 # Editor / OS junk
 .vscode/
 .idea/

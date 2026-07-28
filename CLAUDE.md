@@ -832,7 +832,7 @@ Since 2026-07-28 the detailed log lives in
 `change-history/plans/`. Entries below remain for older work.
 
 - 2026-07-28 **quality, correctness and debuggability sweep**
-  (commits `8a9021e..97c4250`). Preventive, mirroring the sweep the
+  (commits `8a9021e..70d9e18`). Preventive, mirroring the sweep the
   sibling `portfolio-bot` had just been through; findings came from
   auditing the live `pi@gatekeeper` deployment plus a full read.
   175 → 305 tests. Full write-up in

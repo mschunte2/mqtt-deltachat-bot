@@ -47,38 +47,38 @@ Tests: 175 → 305.
 - TOD deadlines advanced by `+86400`, which lands on the same calendar
   date on the 25-hour fall-back day — producing a past deadline and a
   2 Hz fire/re-arm storm for up to half an hour. Now calendar-based,
-  with TZ-pinned tests. (`34372af`)
+  with TZ-pinned tests. (`a2ddf66`)
 - A failed MQTT publish was acked 🆗 and chat was told the plug
   switched. Commands now go out at QoS 1 and failures are reported.
-  (`687b4fa`)
-- Crashes exited 0, so systemd logged `status=0/SUCCESS`. (`96679b5`)
+  (`ac0ba60`)
+- Crashes exited 0, so systemd logged `status=0/SUCCESS`. (`5eb55d9`)
 - CSV export wrote 14 columns under a 13-column header; relay state was
-  labelled `temperature_c`. (`cdd9a60`)
+  labelled `temperature_c`. (`a88d3dd`)
 - MQTT loop-thread death was silent and unrecoverable; `History.close`
-  raced writers and could hang SIGTERM until SIGKILL. (`8bee740`)
+  raced writers and could hang SIGTERM until SIGKILL. (`f1db5d6`)
 - `/diag`, a server version, and staleness markers on device lines —
   a six-hour-old reading used to render identically to a fresh one.
-  (`d9e3091`)
+  (`b0a0025`)
 - Every rule-skip reason is now logged; "my rule didn't fire" was
-  unanswerable at any log level. (`1af29f3`)
+  unanswerable at any log level. (`c198066`)
 
 ### Tier 3 — security
 
 - **Missing or non-numeric `ts` bypassed webxdc replay protection
   entirely** — no age bound, no log line, relay switched. Both
   SECURITY.md and CLAUDE.md documented the opposite. Found
-  independently by two audits. (`4c717fd`)
+  independently by two audits. (`9398db9`)
 - systemd unit had zero hardening and ran as the operator's
   sudo-capable login user; the crash-loop rate limit could never trip;
   `BOT_NAME` was interpolated unvalidated into a root-owned unit path.
-  (`97c4250`)
+  (`70d9e18`)
 
 ### Tier 5 — documentation
 
 Corrected two false security claims, the false dc.db-reclaim claim, a
 `power_history` shape documented two contradictory ways, an undocumented
 rule policy (`avg`), and several stale module names and counts.
-(`b62b3c7`)
+(`08e99d0`)
 
 ### Audited and clean
 
@@ -89,28 +89,28 @@ No credential logging. `send_apps` persists before deleting. No
 
 ### Second pass (same day) — remaining tiers
 
-- **Snapshot fan-out reworked** (`d3a161f`). Edge broadcasts are
+- **Snapshot fan-out reworked** (`480e53e`). Edge broadcasts are
   coalesced (2 s) and performed on the publisher daemon rather than
   inline on paho's callback thread, and carry a compact `"state"`
   payload instead of ~139 KB of chart series. The heartbeat, refresh
   and `/apps` still send `"full"`. This is the fix for the `dc.db`
   growth above. **Requires `/apps` after deploy.**
-- **Input validation at both untrusted boundaries** (`27adc45`). App
+- **Input validation at both untrusted boundaries** (`4741477`). App
   policy payloads raised TypeError past callers that caught only
   ValueError, and accepted negative durations that collapsed a
   30-minute safety window to one sample. `devices.json` params were
   unvalidated, so a quoted number silently stopped history recording
   and all rule evaluation.
-- **Security batch** (`484c42f`). Broker topic ACLs and a separate
+- **Security batch** (`90660e5`). Broker topic ACLs and a separate
   device credential — previously any authenticated client could switch
   relays directly and forge status that drives rule evaluation.
   `refresh`/`telemetry` moved behind the action whitelist. One
   permission predicate. `/help` no longer leaks `HELP_MESSAGE` to
   strangers. State files 0600. `MQTT_PASS` off argv.
-- **History ordering and calendar arithmetic** (`4435ac0`). History is
+- **History ordering and calendar arithmetic** (`5f5e769`). History is
   written before the rules that read it; daily and weekly boundaries
   walk the calendar instead of adding 86400.
-- **Lock-step guards and cleanups** (`84b1e58`). The app's action
+- **Lock-step guards and cleanups** (`767b429`). The app's action
   vocabulary is now asserted against the bot's whitelist, plus guards
   on the CSV widths, the duration ceilings, and the sweeper wait vs
   `threading.TIMEOUT_MAX`.
