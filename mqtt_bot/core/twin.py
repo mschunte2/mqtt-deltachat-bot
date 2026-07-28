@@ -57,7 +57,10 @@ class TwinDeps:
     has zero static imports of bot/mqtt/publisher/webxdc — those
     dependencies are wired up in bot.py at construction time.
     """
-    mqtt_publish:    Callable[[str, str], None]                 # (topic, payload)
+    # (topic, payload) -> True/False. None also counts as success, so a
+    # backend or test fake that predates the return value keeps working
+    # rather than reporting every switch as failed — see _publish_ok.
+    mqtt_publish:    Callable[[str, str], "bool | None"]
     post_to_chats:   Callable[["Device", str], None]            # text → device.allowed_chats
     broadcast:       Callable[[str], None]                      # device_name → publisher
     save_rules:      Callable[[], None]                         # rules.json atomic save
@@ -194,7 +197,13 @@ class PlugTwin:
         topic = f"{self.cfg.topic_prefix}/{cmd.suffix}"
         payload = templating.render(cmd.payload,
                                     {"client_id": self.deps.client_id})
-        self.deps.mqtt_publish(topic, payload)
+        if not _publish_ok(self.deps.mqtt_publish, topic, payload):
+            log.error("dispatch %s/%s → %s FAILED to publish",
+                      self.name, action, topic)
+            if source_msgid is not None:
+                self.deps.react(source_msgid, "❌")
+            return False, (f"could not reach the broker — {self.name} was NOT "
+                           f"switched {action}. Check the MQTT connection.")
         log.info("dispatch %s/%s → %s", self.name, action, topic)
 
         if source_msgid is not None:
@@ -814,7 +823,19 @@ class PlugTwin:
         topic = f"{self.cfg.topic_prefix}/{cmd.suffix}"
         payload = templating.render(cmd.payload,
                                     {"client_id": self.deps.client_id})
-        self.deps.mqtt_publish(topic, payload)
+        if not _publish_ok(self.deps.mqtt_publish, topic, payload):
+            # Say what actually happened. Posting the normal trigger
+            # message here would tell the user their appliance had been
+            # switched off when it is still running — the worst outcome
+            # for a safety rule.
+            log.error("rule fire %s/%s mode=%s → %s FAILED to publish",
+                      self.name, job.target_action, mode, topic)
+            self.deps.post_to_chats(
+                self.cfg,
+                f"⚠️ {self.name}: could not reach the broker — the "
+                f"'{job.target_action}' rule did NOT take effect. "
+                f"The rule stays armed and will retry.")
+            return
         log.info("rule fire %s/%s mode=%s → %s",
                  self.name, job.target_action, mode, topic)
         section = self._auto_section_for(job.target_action)
@@ -889,6 +910,22 @@ class PlugTwin:
 
 
 # --- pure helpers (module-level) -----------------------------------------
+
+def _publish_ok(publish, topic: str, payload: str) -> bool:
+    """Publish and normalise the result to a bool.
+
+    `TwinDeps.mqtt_publish` used to be typed `-> None`, and a publisher
+    that still returns None is reporting "no error", not "failed". Only
+    an explicit False (or a raised exception) counts as a failure, so
+    older backends and test fakes don't suddenly mark every switch as
+    unsuccessful.
+    """
+    try:
+        return publish(topic, payload) is not False
+    except Exception:
+        log.exception("mqtt publish to %s raised", topic)
+        return False
+
 
 def _coerce_value_key(v: Any) -> str:
     if isinstance(v, bool):

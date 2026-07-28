@@ -68,10 +68,31 @@ class MqttClient:
 
     # --- publish (thread-safe) -------------------------------------------
 
-    def publish(self, topic: str, payload: str, qos: int = 0, retain: bool = False) -> None:
-        info = self._client.publish(topic, payload, qos=qos, retain=retain)
+    def publish(self, topic: str, payload: str, qos: int = 1,
+                retain: bool = False) -> bool:
+        """Publish one command. Returns whether paho accepted it.
+
+        The result matters: callers switch mains relays and then tell
+        the user what happened. Discarding a non-success rc (typically
+        MQTT_ERR_NO_CONN while paho reconnects) meant the bot reacted
+        🆗 and posted "switching off" for commands that never left the
+        process.
+
+        qos defaults to 1 so a command survives a reconnect rather than
+        being dropped on the floor — these are one-shot actuations, not
+        a telemetry stream, and a duplicate on/off is harmless because
+        the twin only trusts the device's own echo.
+        """
+        try:
+            info = self._client.publish(topic, payload, qos=qos, retain=retain)
+        except Exception:
+            log.exception("publish to %s raised", topic)
+            return False
         if info.rc != mqtt.MQTT_ERR_SUCCESS:
-            log.warning("publish to %s rc=%s", topic, info.rc)
+            log.error("publish to %s FAILED rc=%s — the device did not get "
+                      "this command", topic, info.rc)
+            return False
+        return True
 
     # --- callbacks --------------------------------------------------------
 

@@ -148,8 +148,10 @@ def _react(msgid: int, emoji: str) -> None:
         log.exception("send_reaction failed")
 
 
-def _mqtt_publish(topic: str, payload: str) -> None:
-    mqtt.publish(topic, payload)
+def _mqtt_publish(topic: str, payload: str) -> bool:
+    # Must return the result: the twin uses it to decide whether to
+    # react 🆗 and tell the chat the plug switched.
+    return mqtt.publish(topic, payload)
 
 
 def _save_rules() -> None:
