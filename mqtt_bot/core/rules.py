@@ -547,6 +547,18 @@ def load_into(registry, path: Path | str) -> int:
             dropped_unknown[job.device_name] = dropped_unknown.get(
                 job.device_name, 0) + 1
             continue
+        # An out-of-range deadline is a poison pill: it used to be
+        # persisted before the sweeper ever saw it, so the resulting
+        # outage survived every restart and only hand-editing this file
+        # recovered. durations.parse now rejects these at the source;
+        # this drops any that a previous version already wrote.
+        if job.deadline_ts and job.deadline_ts > now + durations.MAX_SECONDS:
+            log.warning("dropping %s rule for %s with out-of-range deadline "
+                        "%d (more than %dd out)",
+                        job.target_action, job.device_name, job.deadline_ts,
+                        durations.MAX_SECONDS // 86400)
+            dropped_malformed += 1
+            continue
         if job.deadline_ts and job.deadline_ts < now:
             if job.recurring_tod and job.time_of_day:
                 h, m = job.time_of_day
@@ -583,6 +595,13 @@ def load_into(registry, path: Path | str) -> int:
 
 # --- Sweeper thread ------------------------------------------------------
 
+#: Longest the sweeper will sleep in one go. Rules further out than this
+#: simply get re-evaluated on the next wake — ticking is cheap (a
+#: comparison per rule), and a bounded wait means no deadline value can
+#: exceed what threading.Event.wait accepts.
+MAX_SWEEP_WAIT_S = 3600
+
+
 class RulesSweeper:
     """Single daemon thread that wakes at the earliest deadline across
     every twin and calls twin.tick_time(now) on every twin. Tick is
@@ -610,26 +629,52 @@ class RulesSweeper:
         the earliest deadline immediately."""
         self._wake.set()
 
+    def _next_wait(self) -> float | None:
+        """Seconds to sleep before the next tick, or None to block until
+        woken. Never returns a value `Event.wait` would reject: a single
+        rule with an out-of-range deadline used to raise OverflowError
+        here and take the whole thread down with it, silently stopping
+        every timed rule on every device until a restart. A twin whose
+        next_deadline() raises is skipped rather than allowed to mask
+        the deadlines of its neighbours."""
+        now = int(time.time())
+        deadlines = []
+        for t in self._registry.all():
+            try:
+                d = t.next_deadline()
+            except Exception:
+                log.exception("next_deadline raised for %s; ignoring its rules "
+                              "for this pass", getattr(t, "name", "?"))
+                continue
+            if d is not None:
+                deadlines.append(d)
+        if not deadlines:
+            return None
+        return min(max(0.5, min(deadlines) - now), MAX_SWEEP_WAIT_S)
+
     def _loop(self) -> None:
+        # The whole body is guarded. This thread is the only thing that
+        # fires timer and time-of-day rules, start() refuses to restart
+        # it once it has run, and nothing monitors its liveness — so an
+        # escaping exception is a permanent, silent outage.
         while not self._stop.is_set():
-            now = int(time.time())
-            deadlines = [d for d in (t.next_deadline()
-                                     for t in self._registry.all())
-                         if d is not None]
-            if deadlines:
-                wait_for = max(0.5, min(deadlines) - now)
-            else:
-                wait_for = None  # block until wake
-            if wait_for is None:
-                self._wake.wait()
-            else:
-                self._wake.wait(timeout=wait_for)
-            self._wake.clear()
-            if self._stop.is_set():
-                return
-            now = int(time.time())
-            for t in self._registry.all():
-                try:
-                    t.tick_time(now)
-                except Exception:
-                    log.exception("tick_time raised for %s", t.name)
+            try:
+                wait_for = self._next_wait()
+                if wait_for is None:
+                    self._wake.wait()
+                else:
+                    self._wake.wait(timeout=wait_for)
+                self._wake.clear()
+                if self._stop.is_set():
+                    return
+                now = int(time.time())
+                for t in self._registry.all():
+                    try:
+                        t.tick_time(now)
+                    except Exception:
+                        log.exception("tick_time raised for %s", t.name)
+            except Exception:
+                log.exception("rules sweeper iteration failed; continuing")
+                # Don't spin if the failure is immediate and persistent.
+                self._stop.wait(1.0)
+        log.info("rules sweeper stopped")
