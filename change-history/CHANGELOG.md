@@ -115,9 +115,26 @@ No credential logging. `send_apps` persists before deleting. No
   on the CSV widths, the duration ceilings, and the sweeper wait vs
   `threading.TIMEOUT_MAX`.
 
-Tests: 175 → 371.
+- **Cancelled rules can no longer fire** (`d3630c0`). Both tick paths
+  selected under the lock and fired outside it, so a cancel in that
+  window unlisted the job while the already-built list still switched
+  the plug.
+- **BAD-APPS/ gitignored.** Two third-party .xdc binaries had been
+  swept into an unrelated commit by `git add -A`; removed from this
+  branch's history and ignored.
+
+Tests: 175 → 377.
 
 ### Still queued
+
+Three lock-scope items from the plan's T2.10 remain, all lower severity
+than the cancel race that was fixed: the threshold latch is mutated
+outside the lock (benign with a single MQTT writer, but it violates the
+invariant the module documents), `baseline_wh`/`reset_at_ts` are read
+outside it (a snapshot during a counter reset can pair a new baseline
+with an old timestamp), and `WebxdcIO._map` is never pruned of chats
+the bot has left. The plan also asked for a comment marking the CSV
+export path as safe-by-ordering rather than by validation; not added.
 
 `test_bot.py`. bot.py remains import-hostile, so its routing glue has no
 direct coverage. The security-critical decisions it used to make inline
