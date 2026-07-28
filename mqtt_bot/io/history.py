@@ -141,7 +141,9 @@ class History:
         # Single retention knob — applies to samples_raw + power_minute.
         # aenergy_offset_events is forever (tiny + load-bearing).
         self.retention_days = max(0, int(retention_days))
-        self._lock = threading.Lock()
+        # Reentrant so close() can hold the lock across the final flush,
+        # which itself takes the lock per device via _flush_minute.
+        self._lock = threading.RLock()
         # Per-device current-minute accumulator for power_minute:
         # {device: (minute_start_ts, [apower, ...], latest_output_or_None)}
         self._minute: dict[str, tuple[int, list[float], int | None]] = {}
@@ -676,18 +678,58 @@ class History:
             log.info("history prune: %s",
                      ", ".join(f"{n} {t}" for t, n in counts.items() if n))
 
-    def close(self) -> None:
-        # Idempotent: SIGTERM handler runs close(), then sys.exit fires atexit
-        # which would otherwise re-enter and ProgrammingError on the now-closed
-        # connection.
+    def close(self, lock_timeout: float = 5.0) -> None:
+        """Flush the in-flight minute and close the connection.
+
+        Idempotent: the SIGTERM handler runs close(), then atexit fires
+        and would otherwise re-enter and ProgrammingError on the closed
+        connection.
+
+        Two ordering details matter, both of which used to be wrong:
+
+        1. `_closed` is set BEFORE the connection is closed, not after.
+           Every read/write does an unsynchronised `if self._closed:
+           return` and then takes the lock, so with the old order the
+           MQTT thread could pass the check, block on the lock we hold,
+           acquire it after `_db.close()`, and raise
+           `ProgrammingError: Cannot operate on a closed database`.
+           Setting the flag first closes that window: anything that
+           passes the check has already been admitted, and anything
+           arriving later short-circuits.
+
+        2. The lock is acquired with a timeout. SIGTERM runs its
+           handler on the MAIN thread, interrupting whatever it was
+           doing — including a multi-second `query_samples_raw` inside
+           `_handle_export`, which holds this same non-reentrant lock.
+           Blocking forever there meant `os._exit` was never reached
+           and the process hung until systemd's SIGKILL ~90s later,
+           which is the exact hang os._exit was added to prevent. If we
+           can't get the lock we log and skip the close: leaking a
+           connection on the way out of the process is harmless, hanging
+           is not.
+        """
         if self._closed:
             return
+        # Set first: stops new work being admitted while we shut down.
+        self._closed = True
+        if not self._lock.acquire(timeout=lock_timeout):
+            log.error("history lock still held after %.1fs (a long query is "
+                      "in flight); skipping flush+close so shutdown can "
+                      "proceed rather than hanging until SIGKILL",
+                      lock_timeout)
+            return
         try:
+            # flush_pending_minutes has no _closed guard, so setting the
+            # flag above doesn't skip the final flush.
             self.flush_pending_minutes()
+        except Exception:
+            log.exception("flushing the in-flight minute failed during close")
         finally:
-            with self._lock:
+            try:
                 self._db.close()
-            self._closed = True
+            except Exception:
+                log.exception("closing the history database failed")
+            self._lock.release()
 
 
 def _coerce_float(v: Any) -> float | None:

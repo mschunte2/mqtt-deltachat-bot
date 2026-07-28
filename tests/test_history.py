@@ -435,3 +435,80 @@ class TestExportQueryBounds(unittest.TestCase):
     def test_rows_stay_in_ascending_order_when_limited(self):
         rows = self.h.query_samples_raw("k", 0, 99999, limit=7)
         self.assertEqual([r[0] for r in rows], sorted(r[0] for r in rows))
+
+
+class TestCloseOrdering(unittest.TestCase):
+    """`_closed` used to be set AFTER `_db.close()`. Every read/write
+    does an unsynchronised `if self._closed: return` and then takes the
+    lock, so the MQTT thread could pass the check, block on the lock
+    close() held, acquire it after the connection was gone, and raise
+    ProgrammingError. The docstring and CLAUDE.md both claimed this was
+    handled."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.h = history_mod.History(self.tmp / "h.sqlite", retention_days=0)
+
+    def test_writer_racing_close_never_hits_a_closed_database(self):
+        import threading
+        errors = []
+        stop = threading.Event()
+
+        def writer():
+            i = 0
+            while not stop.is_set():
+                i += 1
+                try:
+                    self.h.write_sample("k", 1000 + i, float(i), output=True)
+                    self.h.record_status("k", 1000 + i, {"apower": 1.0})
+                except Exception as ex:      # ProgrammingError et al
+                    errors.append(ex)
+                    return
+
+        threads = [threading.Thread(target=writer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        time.sleep(0.05)
+        self.h.close()
+        stop.set()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual([repr(e) for e in errors], [])
+
+    def test_close_is_idempotent(self):
+        self.h.close()
+        self.h.close()
+
+    def test_close_does_not_hang_when_the_lock_is_held(self):
+        """SIGTERM runs its handler on the main thread, which may be
+        interrupted mid-query while holding this lock. Blocking forever
+        meant os._exit was never reached and systemd SIGKILLed us ~90s
+        later — the exact hang os._exit was added to prevent."""
+        import threading
+        holder_in = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with self.h._lock:
+                holder_in.set()
+                release.wait(timeout=10)
+
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        self.assertTrue(holder_in.wait(timeout=5))
+
+        started = time.monotonic()
+        self.h.close(lock_timeout=0.3)
+        elapsed = time.monotonic() - started
+
+        release.set()
+        t.join(timeout=5)
+        self.assertLess(elapsed, 3.0,
+                        "close() blocked on a held lock instead of giving up")
+
+    def test_reads_after_close_return_empty_not_raise(self):
+        self.h.write_sample("k", 1000, 5.0, output=True)
+        self.h.close()
+        self.assertEqual(self.h.query_samples_raw("k", 0, 99999), [])
+        self.assertEqual(self.h.query_power_raw("k", 0, 99999), [])

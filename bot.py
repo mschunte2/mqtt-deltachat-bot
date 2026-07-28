@@ -314,6 +314,10 @@ def _on_shutdown(*_a) -> None:
     except Exception:
         pass
     try:
+        mqtt.stop()
+    except Exception:
+        pass
+    try:
         history.close()
     except Exception:
         log.exception("history close failed")
