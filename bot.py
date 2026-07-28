@@ -24,10 +24,22 @@ from pathlib import Path
 # attaches a handler to its own logger, so without basicConfig our
 # log calls would be silently dropped.
 _LOG_LEVEL = (os.environ.get("LOG_LEVEL") or "info").upper()
+# Explicit map rather than getattr(logging, name): getattr resolves ANY
+# module attribute, so LOG_LEVEL=NOTSET silently meant level 0 ("log
+# absolutely everything") and LOG_LEVEL=raiseExceptions meant level True
+# (== 1). A plain typo also fell back to INFO with no warning, so a user
+# who thought they had enabled debug got no hint otherwise.
+_LEVELS = {"CRITICAL": logging.CRITICAL, "ERROR": logging.ERROR,
+           "WARNING": logging.WARNING, "WARN": logging.WARNING,
+           "INFO": logging.INFO, "DEBUG": logging.DEBUG}
 logging.basicConfig(
-    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    level=_LEVELS.get(_LOG_LEVEL, logging.INFO),
     format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
 )
+if _LOG_LEVEL not in _LEVELS:
+    logging.getLogger("mqtt_bot").warning(
+        "LOG_LEVEL=%r is not a known level (%s); defaulting to info",
+        _LOG_LEVEL, ", ".join(sorted(_LEVELS)))
 
 
 class _SwallowBrokenPipe(logging.Filter):
@@ -233,6 +245,16 @@ def _reseed_stale_chat(chat_id: int, msgid: int) -> None:
     try:
         visible = registry.visible_classes_for(chat_id, ALLOWED_CHATS)
         if not visible:
+            # This used to be a bare `return` with the log line below
+            # it, so "the container is gone AND I can't re-seed"
+            # produced only a repeating push-failed WARNING with no
+            # hint that a heal had been attempted and abandoned. With
+            # DC_DELETE_DEVICE_AFTER_DAYS=14 containers age out on a
+            # schedule, so this path is hit in normal operation.
+            log.warning("msgid=%d gone in chat=%d but no devices are "
+                        "visible there any more; cannot re-seed. Check "
+                        "allowed_chats, or remove the stale app.",
+                        msgid, chat_id)
             return
         log.info("msgid=%d gone in chat=%d; re-seeding apps", msgid, chat_id)
         sent, _ = webxdc.send_apps(state.bot, state.accid, chat_id, visible)
@@ -527,7 +549,11 @@ def handle_webxdc_request(chat_id: int, msgid: int,
               "cancel-auto-off", "cancel-auto-on", "cancel-schedule",
               "reset-counter")
     if action not in _KNOWN:
-        log.debug("ignoring webxdc action %r (chat=%d msgid=%d)",
+        # INFO, not DEBUG: an unknown action from a *registered* app
+        # means the deployed .xdc and the bot have diverged. At DEBUG it
+        # was invisible in the default deployment, so "the app's buttons
+        # stopped working after the upgrade" produced an empty journal.
+        log.info("ignoring webxdc action %r (chat=%d msgid=%d)",
                   action, chat_id, msgid)
         return
 

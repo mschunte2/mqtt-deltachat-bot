@@ -342,6 +342,9 @@ class PlugTwin:
                 # app before it acts (avoids the rehydrate-insta-fire
                 # footgun).
                 if job.in_grace(now):
+                    _skip(self.name, job,
+                          "post-restart grace: %ds of %ds elapsed",
+                          now - job._loaded_at, rules_mod.GRACE_PERIOD_S)
                     survivors.append(job)
                     continue
                 # Time-based rule has reached its deadline.
@@ -649,6 +652,8 @@ class PlugTwin:
                 # State-aware dormancy: reset transient counters and skip
                 # while the device is already in the rule's target state.
                 if rules_mod._job_dormant(job, output):
+                    _skip(self.name, job,
+                          "dormant — device output is already %r", output)
                     job._below_since = None
                     job._consumed_started_at = now
                     job._avg_started_at = now
@@ -658,6 +663,9 @@ class PlugTwin:
                 # don't fire on the first tick after restart even if
                 # history already satisfies the condition.
                 if job.in_grace(now):
+                    _skip(self.name, job,
+                          "post-restart grace: %ds of %ds elapsed",
+                          now - job._loaded_at, rules_mod.GRACE_PERIOD_S)
                     survivors.append(job)
                     continue
                 fired = False
@@ -761,14 +769,20 @@ class PlugTwin:
         if self.deps.history is None:
             return False
         if now - job._avg_started_at < job.avg_window_s:
+            _skip(self.name, job, "avg warm-up: %ds of %ds observed",
+                  now - job._avg_started_at, job.avg_window_s)
             return False
         since = now - job.avg_window_s
         rows = self.deps.history.query_power_raw(self.name, since, now)
         vals = [r[1] for r in rows if r[1] is not None]
         if not vals:
+            _skip(self.name, job, "avg: no power_minute rows in the window")
             return False
         expected = max(1, job.avg_window_s // 60)
         if len(vals) < expected * 0.9:
+            _skip(self.name, job,
+                  "avg coverage: only %d of ~%d expected minutes have data "
+                  "(device offline for part of the window)", len(vals), expected)
             return False  # too many offline minutes
         max_min_avg = max(vals)
         if max_min_avg < job.avg_threshold_w:
@@ -803,12 +817,17 @@ class PlugTwin:
         if self.deps.history is None:
             return False
         if now - job._consumed_started_at < job.consumed_window_s:
+            _skip(self.name, job, "consumed warm-up: %ds of %ds observed",
+                  now - job._consumed_started_at, job.consumed_window_s)
             return False
         since = now - job.consumed_window_s
         wh, earliest = self.deps.history.energy_consumed_in(
             self.name, since, now,
         )
         if earliest is None or earliest > since:
+            _skip(self.name, job,
+                  "consumed coverage: history starts at %s, window needs %d",
+                  earliest, since)
             return False  # insufficient history coverage
         if wh < job.consumed_threshold_wh:
             fires.append((job, "consumed", {
@@ -922,6 +941,26 @@ class PlugTwin:
 
 
 # --- pure helpers (module-level) -----------------------------------------
+
+def _skip(device: str, job, reason: str, *args) -> None:
+    """Log why a rule did NOT fire.
+
+    Every negative decision point used to be a bare `continue` or
+    `return False`, so "my rule didn't fire" was unanswerable from the
+    journal at any level — including debug. Only the positive path
+    logged. Dormancy is the most common real cause and the user had no
+    way to learn it; the avg-coverage gate is the hardest to guess,
+    since a rule silently refuses to fire because the plug was offline
+    for more than 10% of the window.
+
+    DEBUG because a busy device evaluates rules on every status update;
+    the point is that `LOG_LEVEL=debug` now *answers the question*
+    rather than being equally silent.
+    """
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug("rule skip %s/%s [%s]: " + reason,
+                  device, job.target_action, job.rule_id, *args)
+
 
 def _publish_ok(publish, topic: str, payload: str) -> bool:
     """Publish and normalise the result to a bool.
