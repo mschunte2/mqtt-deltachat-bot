@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
+
+from . import atomic
 
 log = logging.getLogger("mqtt_bot.webxdc")
 
@@ -56,14 +57,11 @@ class WebxdcIO:
         return out
 
     def _save(self) -> None:
-        self._state_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
         serialised = {
             str(chat): {str(c): int(m) for c, m in apps.items()}
             for chat, apps in self._map.items()
         }
-        tmp.write_text(json.dumps(serialised))
-        os.replace(tmp, self._path)
+        atomic.write_text(self._path, json.dumps(serialised))
 
     # --- discovery --------------------------------------------------------
 

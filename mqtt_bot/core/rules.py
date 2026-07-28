@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -29,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..io import atomic
 from ..util import durations
 
 log = logging.getLogger("mqtt_bot.rules")
@@ -499,16 +499,20 @@ def _value_unit_split(s: str) -> tuple[float, str]:
 
 def save_all(registry, path: Path | str) -> None:
     """Write every twin's rules to a single rules.json. Atomic.
-    `registry` is a TwinRegistry."""
+    `registry` is a TwinRegistry.
+
+    Reachable from three threads (DC handler via schedule/cancel, the
+    rules sweeper via tick_time, and the MQTT callback via state rules
+    firing on a status update), so the write goes through `atomic` —
+    which serialises per path. A torn rules.json reads back as a
+    JSONDecodeError, which `load_into` turns into "no rules at all".
+    """
     p = Path(path)
     jobs: list[dict] = []
     for twin in registry.all():
         jobs.extend(j.to_dict() for j in twin.jobs_snapshot())
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"jobs": jobs}, indent=2))
-        os.replace(tmp, p)
+        atomic.write_text(p, json.dumps({"jobs": jobs}, indent=2))
     except Exception:
         log.exception("persist rules to %s failed", p)
 
