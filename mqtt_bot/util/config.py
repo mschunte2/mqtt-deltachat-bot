@@ -359,6 +359,7 @@ def _parse_device(raw: Any, classes: dict[str, DeviceClass]) -> Device:
         raise ConfigError(f"device {name!r}: allowed_chats must be list of int")
     params = {k: v for k, v in raw.items()
               if k not in _RESERVED_DEVICE_KEYS and not k.startswith("_")}
+    _validate_params(name, params)
     return Device(
         name=name,
         class_name=cls,
@@ -367,6 +368,41 @@ def _parse_device(raw: Any, classes: dict[str, DeviceClass]) -> Device:
         allowed_chats=tuple(int(c) for c in chats_raw),
         params=params,
     )
+
+
+#: Device `params` whose values are consumed as numbers by the twin —
+#: threshold limits and their durations, read straight out of
+#: `devices.json` by the chat-event threshold evaluator.
+_NUMERIC_PARAM_SUFFIXES = ("_watts", "_duration_s", "_seconds", "_wh", "_w")
+
+
+def _validate_params(name: str, params: dict) -> None:
+    """Reject a `params` value that will blow up at runtime.
+
+    `params` used to be copied verbatim with no type checking, and the
+    threshold evaluator does a bare `value >= limit` against them. So
+    `"power_threshold_watts": "1500"` — a plausible typo, since every
+    neighbouring value in devices.json *is* a string — raised TypeError
+    on EVERY status update. That propagates out of
+    `_evaluate_chat_events` into `on_mqtt`, so `_tick_state_rules`,
+    `_write_history` and `broadcast` never ran: history silently stopped
+    recording and every rule silently stopped evaluating, with only a
+    repeating stacktrace to show for it.
+
+    Failing at load means `--check-config` catches it instead, before
+    the bot ever starts.
+    """
+    for key, value in sorted(params.items()):
+        if not key.endswith(_NUMERIC_PARAM_SUFFIXES):
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(
+                f"device {name!r}: {key} must be a number, got "
+                f"{type(value).__name__} ({value!r}). Remove the quotes "
+                f"if this is a JSON string.")
+        if value < 0:
+            raise ConfigError(
+                f"device {name!r}: {key} must not be negative, got {value!r}")
 
 
 # --- Env helpers ----------------------------------------------------------

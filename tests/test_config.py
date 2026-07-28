@@ -146,3 +146,69 @@ class TestParseAllowedChats(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeviceParamValidation(unittest.TestCase):
+    """`params` was copied verbatim with no type check, and the
+    threshold evaluator does a bare `value >= limit` against it. A
+    quoted number — plausible, since every neighbouring value in
+    devices.json IS a string — raised TypeError on every status update,
+    which escaped on_mqtt and silently stopped history recording AND
+    all rule evaluation."""
+
+    def _load(self, params):
+        import json
+        import tempfile
+        from pathlib import Path
+        from tests._fixtures import CLASS_JSON_OK
+
+        tmp = Path(tempfile.mkdtemp())
+        cls_dir = tmp / "devices" / "tplug"
+        cls_dir.mkdir(parents=True)
+        (cls_dir / "class.json").write_text(json.dumps(CLASS_JSON_OK))
+        inst = tmp / "devices.json"
+        inst.write_text(json.dumps({"devices": [{
+            "name": "kitchen", "class": "tplug",
+            "topic_prefix": "p/kitchen", **params,
+        }]}))
+        return cfg_mod.load(devices_dir=tmp / "devices", instances_file=inst)
+
+    def test_quoted_number_is_rejected(self):
+        with self.assertRaises(cfg_mod.ConfigError) as ctx:
+            self._load({"power_threshold_watts": "1500"})
+        self.assertIn("power_threshold_watts", str(ctx.exception))
+
+    def test_error_suggests_the_fix(self):
+        with self.assertRaises(cfg_mod.ConfigError) as ctx:
+            self._load({"power_threshold_watts": "1500"})
+        self.assertIn("quotes", str(ctx.exception))
+
+    def test_negative_threshold_is_rejected(self):
+        with self.assertRaises(cfg_mod.ConfigError):
+            self._load({"power_threshold_watts": -5})
+
+    def test_bool_is_rejected(self):
+        with self.assertRaises(cfg_mod.ConfigError):
+            self._load({"power_threshold_watts": True})
+
+    def test_duration_params_are_checked_too(self):
+        with self.assertRaises(cfg_mod.ConfigError):
+            self._load({"power_threshold_duration_s": "30"})
+
+    def test_valid_numbers_load(self):
+        cfg = self._load({"power_threshold_watts": 1500,
+                          "power_threshold_duration_s": 30})
+        dev = cfg.devices["kitchen"]
+        self.assertEqual(dev.params["power_threshold_watts"], 1500)
+
+    def test_float_is_accepted(self):
+        cfg = self._load({"power_threshold_watts": 1500.5})
+        self.assertEqual(cfg.devices["kitchen"].params["power_threshold_watts"],
+                         1500.5)
+
+    def test_non_numeric_named_params_are_left_alone(self):
+        """Only params whose names imply a number are checked; a device
+        class is free to carry arbitrary string settings."""
+        cfg = self._load({"nickname": "the espresso machine"})
+        self.assertEqual(cfg.devices["kitchen"].params["nickname"],
+                         "the espresso machine")

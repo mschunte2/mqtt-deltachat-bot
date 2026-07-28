@@ -95,6 +95,7 @@ from appdirs import user_config_dir  # noqa: E402
 from deltachat2 import EventType, MsgData, events  # noqa: E402
 from deltabot_cli import BotCli  # noqa: E402
 
+from mqtt_bot import app_policy  # noqa: E402
 from mqtt_bot import commands as commands_mod  # noqa: E402
 from mqtt_bot import csv_export  # noqa: E402
 from mqtt_bot import formatters  # noqa: E402
@@ -634,54 +635,12 @@ def _schedule_from_app(chat_id: int, device_name: str, action: str,
 def _policy_from_app(raw: dict, section) -> rules_mod.ScheduledPolicy:
     """Build a ScheduledPolicy from a webxdc app payload subobject.
 
-    The app speaks **minutes** at this boundary; we convert to seconds
-    once here and feed the engine its native unit downstream.
+    Validation and coercion live in mqtt_bot.app_policy so this
+    untrusted-input boundary is testable — it used to raise TypeError
+    on type-confused payloads (callers catch only ValueError) and
+    accepted negative durations.
     """
-    defaults = _defaults_from_section(section)
-    policy = rules_mod.ScheduledPolicy()
-    timer_m = raw.get("timer_minutes")
-    if isinstance(timer_m, (int, float)) and timer_m > 0:
-        policy.timer_seconds = int(round(float(timer_m) * 60))
-    tod = raw.get("time_of_day")
-    if isinstance(tod, list) and len(tod) == 2:
-        h, m = int(tod[0]), int(tod[1])
-        if 0 <= h <= 23 and 0 <= m <= 59:
-            policy.time_of_day = (h, m)
-            policy.recurring_tod = bool(raw.get("recurring_tod", False))
-    idle = raw.get("idle")
-    if isinstance(idle, dict):
-        policy.idle_field = str(idle.get("field", defaults.idle_field))
-        policy.idle_threshold = float(idle.get("threshold", defaults.idle_threshold))
-        idle_m = idle.get("duration_minutes")
-        if isinstance(idle_m, (int, float)):
-            policy.idle_duration_s = int(round(float(idle_m) * 60))
-        else:
-            policy.idle_duration_s = defaults.idle_duration_s
-    consumed = raw.get("consumed")
-    if isinstance(consumed, dict):
-        policy.consumed_field = str(consumed.get("field", defaults.consumed_field))
-        policy.consumed_threshold_wh = float(consumed.get(
-            "threshold_wh", defaults.consumed_threshold_wh))
-        cons_m = consumed.get("window_minutes")
-        if isinstance(cons_m, (int, float)):
-            policy.consumed_window_s = int(round(float(cons_m) * 60))
-        else:
-            policy.consumed_window_s = defaults.consumed_window_s
-    avg = raw.get("avg")
-    if isinstance(avg, dict):
-        policy.avg_field = str(avg.get("field", defaults.avg_field))
-        policy.avg_threshold_w = float(avg.get(
-            "threshold_w", defaults.avg_threshold_w))
-        avg_m = avg.get("window_minutes")
-        if isinstance(avg_m, (int, float)):
-            policy.avg_window_s = int(round(float(avg_m) * 60))
-        else:
-            policy.avg_window_s = defaults.avg_window_s
-    if raw.get("once") is True:
-        policy.once = True
-    if policy.is_empty():
-        raise ValueError("no policies supplied")
-    return policy
+    return app_policy.build(raw, _defaults_from_section(section))
 
 
 def _defaults_from_section(section) -> rules_mod.PolicyDefaults:
