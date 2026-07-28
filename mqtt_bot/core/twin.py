@@ -350,16 +350,10 @@ class PlugTwin:
                     ctx["hh"] = f"{h:02d}"
                     ctx["mm"] = f"{m:02d}"
 
-                if job.once:
-                    pass  # drop, do not re-arm
-                elif job.time_of_day:
-                    h, m = job.time_of_day
-                    job.deadline_ts = rules_mod.next_tod_deadline(h, m, now)
+                # Shared with rules.load_into, so a rule that survives a
+                # fire also survives a restart (and vice versa).
+                if job.rearm(now):
                     survivors.append(job)
-                elif job.timer_seconds:
-                    job.deadline_ts = now + job.timer_seconds
-                    survivors.append(job)
-                # else: drop defensively
 
                 if not dormant:
                     fires.append((job, mode, ctx))

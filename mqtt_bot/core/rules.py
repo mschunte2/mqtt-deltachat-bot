@@ -202,6 +202,43 @@ class ScheduledJob:
     def has_time(self) -> bool:
         return self.deadline_ts is not None
 
+    def is_recurring(self) -> bool:
+        """Whether this rule re-arms after firing.
+
+        Since v0.1.5 recurrence is `once`, full stop. `recurring_tod`
+        survives only as the flag that decides whether the user asked
+        for "daily" explicitly — it does NOT decide behaviour, because
+        a TOD rule with once=False re-arms to the next occurrence
+        either way. Three call sites used to answer this question
+        differently (tick_time on `once`, load_into on `recurring_tod`,
+        the formatter on `recurring_tod`), which is how restart came to
+        silently drop rules the running bot kept firing.
+        """
+        return not self.once
+
+    def rearm(self, now: int) -> bool:
+        """Move `deadline_ts` to this rule's next occurrence.
+
+        Returns True if the rule should be kept, False if it is spent
+        and the caller should drop it. The single source of truth for
+        re-arming, shared by `twin.tick_time` (a rule that just fired)
+        and `rules.load_into` (a deadline that elapsed during
+        downtime), so the two can never diverge again.
+        """
+        if not self.is_recurring():
+            return False
+        if self.time_of_day:
+            h, m = self.time_of_day
+            self.deadline_ts = next_tod_deadline(h, m, now)
+            return True
+        if self.timer_seconds:
+            self.deadline_ts = now + self.timer_seconds
+            return True
+        # A time-based rule with neither a TOD nor a stored duration
+        # can't be re-armed (pre-v0.1.5 rules.json entries lack
+        # timer_seconds). Drop it rather than leave it stuck in the past.
+        return False
+
     def in_grace(self, now: int, grace_s: int = GRACE_PERIOD_S) -> bool:
         """True for rules just loaded from rules.json that haven't
         served their grace period yet. Runtime-added rules return
@@ -560,12 +597,12 @@ def load_into(registry, path: Path | str) -> int:
             dropped_malformed += 1
             continue
         if job.deadline_ts and job.deadline_ts < now:
-            if job.recurring_tod and job.time_of_day:
-                h, m = job.time_of_day
-                job.deadline_ts = next_tod_deadline(h, m, now)
+            # Same verdict tick_time would reach for a rule that fired:
+            # recurring rules re-arm (TOD to the next occurrence, timer
+            # to now + its duration), one-shots are spent.
+            if job.rearm(now):
                 rearmed = True
             else:
-                # one-shot timer/tod expired during downtime — drop
                 dropped_expired += 1
                 continue
         # Stamp loaded-at so PlugTwin's tick honours the grace period

@@ -79,7 +79,11 @@ def rule_clauses(job) -> list[str]:
         remaining = max(0, job.deadline_ts - int(time.time()))
         if job._time_mode == "tod" and job.time_of_day:
             h, m = job.time_of_day
-            suffix = " daily" if job.recurring_tod else ""
+            # Recurrence is `once`, not `recurring_tod` — a TOD rule
+            # with once=False re-arms to the next occurrence whether or
+            # not the user typed "daily", so calling it anything else
+            # misdescribes what the bot will actually do.
+            suffix = " daily" if job.is_recurring() else ""
             out.append(f"at {h:02d}:{m:02d}{suffix} "
                        f"(in {durations.format(remaining)})")
         else:
