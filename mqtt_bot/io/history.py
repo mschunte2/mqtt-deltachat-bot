@@ -152,6 +152,16 @@ class History:
 
         db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(db_path), check_same_thread=False)
+        # A per-minute power series is a high-resolution occupancy
+        # signal for the household. sqlite3.connect creates the file
+        # with the ambient umask (0664 on the live host), so restrict it
+        # explicitly. Best-effort: the -wal/-shm siblings are recreated
+        # by SQLite and picked up on the next open.
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                Path(str(db_path) + suffix).chmod(0o600)
+            except OSError:
+                pass
         self._db.execute("PRAGMA journal_mode=WAL")
         with self._lock:
             self._db.executescript(_SCHEMA)
@@ -668,7 +678,10 @@ class History:
         cutoff = now - self.retention_days * 86400
         counts: dict[str, int] = {}
         with self._lock:
-            for table in ("samples_raw", "power_minute"):
+            # app_telemetry used to be exempt: one row per app boot,
+            # forever, in the very database the bot is trying to keep
+            # small. It is diagnostic data, not a source of truth.
+            for table in ("samples_raw", "power_minute", "app_telemetry"):
                 counts[table] = self._db.execute(
                     f"DELETE FROM {table} WHERE ts < ?", (cutoff,)
                 ).rowcount

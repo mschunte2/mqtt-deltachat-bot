@@ -97,3 +97,12 @@ def write_text(path: Path | str, data: str, *, mode: int | None = None) -> None:
                 os.close(dir_fd)
         except OSError:
             pass
+
+
+#: Mode for the bot's persisted state. These files are not world
+#: business: `app_msgids.json` holds chat ids, `rules.json` holds what
+#: the household has automated, and `history.sqlite` alongside them is a
+#: per-minute power series — a high-resolution occupancy signal. They
+#: previously inherited the umask (0664 in a 0775 directory on the live
+#: host), so any second account on the Pi could read them.
+STATE_FILE_MODE = 0o600

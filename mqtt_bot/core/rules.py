@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from ..io import atomic
+from ..io.atomic import STATE_FILE_MODE
 from ..util import durations
 
 log = logging.getLogger("mqtt_bot.rules")
@@ -604,7 +605,8 @@ def save_all(registry, path: Path | str) -> None:
     for twin in registry.all():
         jobs.extend(j.to_dict() for j in twin.jobs_snapshot())
     try:
-        atomic.write_text(p, json.dumps({"jobs": jobs}, indent=2))
+        atomic.write_text(p, json.dumps({"jobs": jobs}, indent=2),
+                          mode=STATE_FILE_MODE)
     except Exception:
         log.exception("persist rules to %s failed", p)
 

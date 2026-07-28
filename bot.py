@@ -120,8 +120,27 @@ RULES_PATH = STATE_DIR / "rules.json"
 BASELINES_PATH = STATE_DIR / "baselines.json"
 
 CLIENT_ID = os.environ.get("MQTT_CLIENT_ID", BOT_NAME)
-PUBLISH_INTERVAL_S = int(os.environ.get("PUBLISH_INTERVAL_S", "10800"))
-DC_DELETE_DEVICE_AFTER_DAYS = int(os.environ.get("DC_DELETE_DEVICE_AFTER_DAYS", "14"))
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer env var without taking the process down.
+
+    A bare int() here raised an unhandled ValueError before the
+    deltabot logger existed, which fed the crash loop the unit's
+    restart limit could not stop. RETENTION_DAYS was the only one
+    written defensively; this is that pattern, shared."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+
+
+PUBLISH_INTERVAL_S = _env_int("PUBLISH_INTERVAL_S", 10800)
+DC_DELETE_DEVICE_AFTER_DAYS = _env_int("DC_DELETE_DEVICE_AFTER_DAYS", 14)
 
 
 # --- Late-bound bot reference --------------------------------------------
@@ -143,7 +162,9 @@ def _post_to_visible_chats(device, text: str) -> None:
     if state.bot is None:
         log.warning("no bot ref yet; would post to %s: %s", device.name, text)
         return
-    chats = device.allowed_chats or tuple(sorted(ALLOWED_CHATS))
+    # Via the shared predicate, not a second inline copy of the
+    # fallback rule — see permissions.chats_for_device.
+    chats = permissions.chats_for_device(device, ALLOWED_CHATS)
     for chat_id in chats:
         try:
             state.bot.rpc.send_msg(state.accid, chat_id, MsgData(text=text))
@@ -205,9 +226,7 @@ def _publisher_broadcast(device_name: str | None = None) -> None:
 webxdc = WebxdcIO(state_dir=STATE_DIR, devices_dir=DEVICES_DIR)
 history = History(
     db_path=STATE_DIR / "history.sqlite",
-    retention_days=int(
-        (os.environ.get("RETENTION_DAYS") or "0").strip() or "0"
-    ),
+    retention_days=_env_int("RETENTION_DAYS", 0),
 )
 
 # Build one twin per device. TwinDeps wires up the side effects.
@@ -512,8 +531,26 @@ def help_text(chat_id: int) -> str:
         "  /help                — this message\n"
         f"Devices in this chat: {names}\n"
     )
+    # HELP_MESSAGE is operator-supplied free text and may name the
+    # household, the room, or the appliances. /help is permission-free
+    # (needed for setup), so unauthorised chats get the generic command
+    # reference only. The device list is already filtered above by
+    # registry.visible_to, which returns empty for a stranger.
+    if not permissions.is_allowed(chat_id, ALLOWED_CHATS):
+        return base
     prefix = (os.environ.get("HELP_MESSAGE") or "").strip()
     return f"{prefix}\n\n{base}" if prefix else base
+
+
+#: Every webxdc action the bot will act on. `refresh` and `telemetry`
+#: are in here rather than short-circuiting above the check, so no
+#: action reaches real work without passing the whitelist.
+_KNOWN_ACTIONS = frozenset({
+    "on", "off", "toggle", "status",
+    "auto-off", "auto-on",
+    "cancel-auto-off", "cancel-auto-on", "cancel-schedule",
+    "reset-counter", "refresh", "telemetry",
+})
 
 
 def handle_webxdc_request(chat_id: int, msgid: int,
@@ -523,39 +560,33 @@ def handle_webxdc_request(chat_id: int, msgid: int,
         log.warning("webxdc update from unregistered msgid=%d in chat=%d "
                     "(run /apps to register)", msgid, chat_id)
         return
-    device_name = str(request.get("device", "")).strip().lower()
-    action = str(request.get("action", "")).strip().lower()
+    device_name = _sanitize(request.get("device", ""), fallback="").lower()
+    action = _sanitize(request.get("action", ""), fallback="").lower()
 
-    # Refresh button: device may be unset; respond with a unicast push
-    # for the (chat, class) of the requesting msgid.
-    if action == "refresh":
-        publisher.push_unicast(chat_id, msgid, cls_for_msg)
-        return
-
-    # Telemetry: device may be unset; record + return. Class resolves
-    # from msgid (same as refresh). Never let a bad payload escape into
-    # the rest of the handler.
-    if action == "telemetry":
-        _record_telemetry(chat_id, msgid, cls_for_msg, request)
-        return
-
-    if not device_name or not action:
-        return
-
-    # Whitelist of actions we know about. Anything else (including the
-    # pre-v0.2 history/events/set_param) silently drops — old app
-    # instances in the chat will keep retrying until /apps replaces them.
-    _KNOWN = ("on", "off", "toggle", "status",
-              "auto-off", "auto-on",
-              "cancel-auto-off", "cancel-auto-on", "cancel-schedule",
-              "reset-counter")
-    if action not in _KNOWN:
+    # Whitelist FIRST. `refresh` and `telemetry` used to be handled
+    # above this check, so they were reachable with only the global chat
+    # gate — and both do real work (a full snapshot build + push, or a
+    # SQLite insert plus a 15-field INFO line), with no throttle.
+    if action not in _KNOWN_ACTIONS:
         # INFO, not DEBUG: an unknown action from a *registered* app
         # means the deployed .xdc and the bot have diverged. At DEBUG it
         # was invisible in the default deployment, so "the app's buttons
         # stopped working after the upgrade" produced an empty journal.
         log.info("ignoring webxdc action %r (chat=%d msgid=%d)",
-                  action, chat_id, msgid)
+                 action, chat_id, msgid)
+        return
+
+    # These two carry no device: the class comes from the msgid.
+    if action == "refresh":
+        publisher.push_unicast(chat_id, msgid, cls_for_msg)
+        return
+    if action == "telemetry":
+        _record_telemetry(chat_id, msgid, cls_for_msg, request)
+        return
+
+    if not device_name:
+        log.info("webxdc action %r without a device (chat=%d msgid=%d)",
+                 action, chat_id, msgid)
         return
 
     if action == "reset-counter":

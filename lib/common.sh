@@ -12,6 +12,16 @@ load_env() {
         echo "Missing $env_file. Copy ./env.example to .env/env and edit." >&2
         exit 1
     fi
+    # .env/env holds MQTT_PASS, and .env/ may also hold a Delta Chat
+    # profile backup — the bot's entire identity. Both were
+    # group/world-readable on the live host (0664 / 0644), so any other
+    # local account could read them. Tighten on every load rather than
+    # only at setup time, so a fresh `git clone` + editor round-trip
+    # can't quietly widen them again.
+    chmod 0700 .env 2>/dev/null || true
+    chmod 0600 "$env_file" 2>/dev/null || true
+    find .env -maxdepth 1 -type f -name '*.tar' -exec chmod 0600 {} + 2>/dev/null || true
+
     set -a
     # shellcheck disable=SC1090
     source "$env_file"

@@ -33,7 +33,8 @@ def save(registry, path: Path | str) -> None:
         for t in registry.all()
     }
     try:
-        atomic.write_text(p, json.dumps(data, indent=2))
+        atomic.write_text(p, json.dumps(data, indent=2),
+                          mode=atomic.STATE_FILE_MODE)
     except Exception:
         log.exception("persist baselines to %s failed", p)
 

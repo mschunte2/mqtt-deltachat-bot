@@ -81,7 +81,8 @@ class WebxdcIO:
                 str(chat): {str(c): int(m) for c, m in apps.items()}
                 for chat, apps in self._map.items()
             }
-        atomic.write_text(self._path, json.dumps(serialised))
+        atomic.write_text(self._path, json.dumps(serialised),
+                          mode=atomic.STATE_FILE_MODE)
 
     # --- discovery --------------------------------------------------------
 

@@ -130,5 +130,69 @@ class TestAtomicWrite(unittest.TestCase):
         self.assertEqual([f.name for f in self.dir.iterdir()], ["rules.json"])
 
 
+
+class TestStateFileModes(unittest.TestCase):
+    """State files inherited the umask (0664 in a 0775 directory on the
+    live host). app_msgids.json holds chat ids, rules.json holds what
+    the household has automated, and history.sqlite next to them is a
+    per-minute power series — a high-resolution occupancy signal."""
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.dir = Path(self._dir.name)
+        self.addCleanup(self._dir.cleanup)
+
+    def test_state_file_mode_is_owner_only(self):
+        self.assertEqual(atomic.STATE_FILE_MODE, 0o600)
+
+    def test_rules_json_is_written_owner_only(self):
+        from mqtt_bot.core import rules as sched
+        from mqtt_bot.core.twins import TwinRegistry
+        from tests._fixtures import _build_twin
+
+        twin, _, _ = _build_twin()
+        twin.schedule("off", sched.ScheduledPolicy(timer_seconds=600), 12)
+        p = self.dir / "rules.json"
+        sched.save_all(TwinRegistry([twin]), p)
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_baselines_json_is_written_owner_only(self):
+        from mqtt_bot.core.twins import TwinRegistry
+        from mqtt_bot.io import baselines
+        from tests._fixtures import _build_twin
+
+        twin, _, _ = _build_twin()
+        p = self.dir / "baselines.json"
+        baselines.save(TwinRegistry([twin]), p)
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o600)
+
+    def test_app_msgids_is_written_owner_only(self):
+        from mqtt_bot.io.webxdc_io import WebxdcIO
+        state = self.dir / "state"
+        devices = self.dir / "devices"
+        state.mkdir()
+        (devices / "shelly_plug").mkdir(parents=True)
+        (devices / "shelly_plug" / "shelly_plug.xdc").write_bytes(b"PK\x03\x04")
+
+        class _Rpc:
+            def send_msg(self, *a, **kw):
+                return 4242
+
+            def delete_messages_for_all(self, *a, **kw):
+                pass
+
+        io = WebxdcIO(state, devices)
+        io.send_apps(type("B", (), {"rpc": _Rpc()})(), accid=1, chat_id=12,
+                     classes_visible={"shelly_plug"})
+        self.assertEqual(os.stat(state / "app_msgids.json").st_mode & 0o777,
+                         0o600)
+
+    def test_history_db_is_owner_only(self):
+        from mqtt_bot.io import history as history_mod
+        h = history_mod.History(self.dir / "h.sqlite", retention_days=0)
+        self.addCleanup(h.close)
+        self.assertEqual(os.stat(self.dir / "h.sqlite").st_mode & 0o777, 0o600)
+
+
 if __name__ == "__main__":
     unittest.main()
