@@ -19,6 +19,7 @@ rules (timer / tod).
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import re
@@ -424,13 +425,33 @@ def _sec_to_min(seconds: int | None) -> float | None:
 
 def next_tod_deadline(h: int, m: int, now: int) -> int:
     """Unix seconds for the next occurrence of HH:MM in local time.
-    Uses mktime with isdst=-1 for DST safety."""
+
+    Day arithmetic is done on the CALENDAR, not by adding 86400.
+    `now + 86400` lands on the same calendar date whenever the local day
+    is 25 hours long and `now` is in its first hour — so on the autumn
+    fall-back day this used to return a timestamp in the *past*. A rule
+    that then re-armed to that timestamp fired again immediately, giving
+    a 2 Hz fire/re-arm loop for up to half an hour: thousands of
+    rules.json rewrites, and for a `toggle` rule (never dormant) the
+    plug switched and the chat was spammed at the same rate.
+
+    mktime with isdst=-1 is still what resolves the wall-clock time to
+    an instant, which is why the spring-forward gap (a 02:30 that does
+    not exist) lands harmlessly on 03:30 rather than raising.
+    """
     lt = time.localtime(now)
     target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, m, 0, 0, 0, -1))
     if target <= now:
-        tom = time.localtime(now + 86400)
-        target = time.mktime((tom.tm_year, tom.tm_mon, tom.tm_mday, h, m, 0, 0, 0, -1))
+        tom = _next_calendar_day(lt)
+        target = time.mktime((*tom, h, m, 0, 0, 0, -1))
     return int(target)
+
+
+def _next_calendar_day(lt: time.struct_time) -> tuple[int, int, int]:
+    """(year, month, day) of the day after `lt`, by calendar rather than
+    by elapsed seconds — DST changes the length of a day, not its date."""
+    return tuple((datetime.date(lt.tm_year, lt.tm_mon, lt.tm_mday)
+                  + datetime.timedelta(days=1)).timetuple()[:3])
 
 
 # --- Parser --------------------------------------------------------------
