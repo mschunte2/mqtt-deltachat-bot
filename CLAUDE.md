@@ -813,6 +813,53 @@ provenance entries reference work by date and (where helpful) the
 short SHA — no invented version labels. Tags are reserved for
 stable major releases the user creates by hand.
 
+Since 2026-07-28 the detailed log lives in
+`change-history/CHANGELOG.md`, with plans archived under
+`change-history/plans/`. Entries below remain for older work.
+
+- 2026-07-28 **quality, correctness and debuggability sweep**
+  (commits `8a9021e..97c4250`). Preventive, mirroring the sweep the
+  sibling `portfolio-bot` had just been through; findings came from
+  auditing the live `pi@gatekeeper` deployment plus a full read.
+  175 → 305 tests. Full write-up in
+  `change-history/CHANGELOG.md`.
+
+  *The headline finding:* the documented webxdc replay protection did
+  not exist. `bot.py` only applied the freshness window when `ts`
+  happened to be numeric and executed the request otherwise, so a
+  missing, null, string or boolean `ts` switched a mains relay with no
+  age bound and no log line — while both SECURITY.md and CLAUDE.md
+  stated the opposite. Two independent audits found it separately. The
+  check now lives in `commands.check_freshness`, where it is testable;
+  `bot.py` having no test file is the structural reason the gap could
+  persist while both documents described correct behaviour.
+
+  *Tier 1 (data loss).* Three JSON state writers shared one fixed
+  `.tmp` path with no lock or fsync, and `save_all` is reachable from
+  three threads — a collision published a spliced `rules.json` that the
+  loader read as "no rules". `WebxdcIO` had no lock at all after
+  `cd6645f` broke its documented single-thread invariant. One oversized
+  timer killed the sweeper permanently, and the poison rule was
+  persisted so the outage survived restarts. Restart silently dropped
+  recurring timer and non-`daily` TOD rules because three code paths
+  each defined "recurring" differently. The CSV export and rule
+  observation windows were unbounded against a 416 MB host.
+
+  *Tier 2.* TOD deadlines used `+86400`, which lands on the same
+  calendar date on the 25-hour fall-back day → a past deadline and a
+  2 Hz fire/re-arm storm. A failed MQTT publish was acked 🆗 while the
+  appliance stayed on. Crashes exited 0. CSV columns were off by one.
+  MQTT thread death and `History.close` races were silent.
+
+  *Observability.* `/diag`, a git-derived server version, staleness
+  markers on device lines, and a logged reason for every rule that
+  declines to fire — previously unanswerable at any log level.
+
+  *Tier 3.* systemd unit gained a full hardening block (it had none,
+  and ran as the operator's sudo-capable login user);
+  `systemd-analyze verify` caught that `StartLimit*` under `[Service]`
+  is silently ignored, so the crash-loop limit had never worked.
+
 - 2026-05-09 **chart fidelity + rule fidelity + repo cleanup**
   (commits `3938c14..fd414a2`, post-`v0.2.1`).
 
