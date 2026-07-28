@@ -465,18 +465,32 @@ them. (This block previously documented a 3-element
 form is the real one.) `output` is `1|0|null`; `null` means the plug
 had no `power_minute` row for that bucket → app paints grey (offline).
 
-Pushed on (a) state edges, (b) periodic timer
-(`PUBLISH_INTERVAL_S`, default 10800 s = 3 h), (c) refresh button,
-(d) `/apps` onboarding. The app caches the latest snapshot in
+Pushed on (a) state edges — coalesced, compact, (b) periodic timer
+(`PUBLISH_INTERVAL_S`, default 10800 s = 3 h) — full, (c) refresh
+button — full, (d) `/apps` onboarding — full. The app caches the latest snapshot in
 `localStorage` and renders all chart windows from it — no on-demand
 fetches.
 
-**Cost, measured 2026-07-28:** ~139 KB per push (1440 minute + 750
-hour + 365 day buckets plus 365 daily-energy pairs, per device), and
-every push leaves a permanently-retained carrier message in `dc.db`.
-Edge broadcasts are unthrottled, so a cycling load pushes several
-times a minute. This is the dominant driver of `dc.db` growth — see
-*Maintenance: reclaiming dc.db space*.
+**Two payload kinds.** `kind` tells the app what it received:
+
+- `"full"` — everything above. Sent on the periodic heartbeat, the
+  refresh button and `/apps`.
+- `"state"` — live `fields`, `scheduled_jobs`, `energy` and `params`
+  only; no `power_history`, no `daily_energy_wh`. Sent on state edges.
+
+A full payload measured ~139 KB per device (1440 + 750 + 365 chart
+buckets plus 365 daily-energy pairs), and every push leaves a
+permanently-retained carrier message in `dc.db`. Edge broadcasts used
+to be unthrottled full pushes, which is what took `dc.db` to 464 MB —
+see *Maintenance: reclaiming dc.db space*.
+
+Edges are now **coalesced** by `Publisher.COALESCE_S` (2 s) and
+performed on the publisher daemon, not inline on the MQTT callback
+thread. The app merges a `"state"` payload over its cached snapshot so
+the charts survive between heartbeats; a payload with no `kind` is
+treated as full (that is what an older bot sends), and an older *app*
+build renders "(no data yet)" on the chart until the next full push
+rather than breaking.
 
 ### `/apps` onboarding
 

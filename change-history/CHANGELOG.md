@@ -87,15 +87,52 @@ is sound. No SQL injection. No path traversal in the export filename.
 No credential logging. `send_apps` persists before deleting. No
 `TwinDeps` callable is invoked while holding `PlugTwin._lock`.
 
+### Second pass (same day) — remaining tiers
+
+- **Snapshot fan-out reworked** (`d3a161f`). Edge broadcasts are
+  coalesced (2 s) and performed on the publisher daemon rather than
+  inline on paho's callback thread, and carry a compact `"state"`
+  payload instead of ~139 KB of chart series. The heartbeat, refresh
+  and `/apps` still send `"full"`. This is the fix for the `dc.db`
+  growth above. **Requires `/apps` after deploy.**
+- **Input validation at both untrusted boundaries** (`27adc45`). App
+  policy payloads raised TypeError past callers that caught only
+  ValueError, and accepted negative durations that collapsed a
+  30-minute safety window to one sample. `devices.json` params were
+  unvalidated, so a quoted number silently stopped history recording
+  and all rule evaluation.
+- **Security batch** (`484c42f`). Broker topic ACLs and a separate
+  device credential — previously any authenticated client could switch
+  relays directly and forge status that drives rule evaluation.
+  `refresh`/`telemetry` moved behind the action whitelist. One
+  permission predicate. `/help` no longer leaks `HELP_MESSAGE` to
+  strangers. State files 0600. `MQTT_PASS` off argv.
+- **History ordering and calendar arithmetic** (`4435ac0`). History is
+  written before the rules that read it; daily and weekly boundaries
+  walk the calendar instead of adding 86400.
+- **Lock-step guards and cleanups** (`84b1e58`). The app's action
+  vocabulary is now asserted against the bot's whitelist, plus guards
+  on the CSV widths, the duration ceilings, and the sweeper wait vs
+  `threading.TIMEOUT_MAX`.
+
+Tests: 175 → 371.
+
 ### Still queued
 
-Snapshot fan-out rework (T2.1 — the ~139 KB unthrottled push that drives
-`dc.db` growth; needs an app change and a `/apps` round), app-policy type
-and bounds validation, mosquitto topic ACLs and per-role credentials,
-state-file modes, the remaining lock-scope and DST-bucket items, and
-`test_bot.py` (bot.py is still import-hostile, so the auth and replay
-layer has no direct coverage).
+`test_bot.py`. bot.py remains import-hostile, so its routing glue has no
+direct coverage. The security-critical decisions it used to make inline
+have been extracted into pure, tested modules
+(`commands.check_freshness`, `app_policy.build`,
+`permissions.chats_for_device`, `csv_export`, `commands.KNOWN_APP_ACTIONS`),
+which is the more valuable half of that work — but the refactor itself
+is unfinished.
+
+Also unaddressed: TLS to the broker (ACLs landed; transport is still
+cleartext on the LAN), and the live host's `LOG_LEVEL=debug` /
+`RETENTION_DAYS=0` settings.
 
 ### Not deployed
 
-Nothing in this sweep has been applied to `pi@gatekeeper`.
+Nothing in this sweep has been applied to `pi@gatekeeper`. The systemd
+unit changes the service confinement, and the payload change needs a
+`/apps` round, so both want a watched restart rather than a blind one.

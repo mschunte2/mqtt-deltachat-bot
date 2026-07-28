@@ -57,7 +57,7 @@ mqtt-bot/
 ├── init-from-backup.sh            # one-shot: import a Delta Chat profile tar from .env/
 ├── install-systemd-unit.sh        # render+enable+start the systemd unit
 ├── systemd-unit/deltabot.service.template
-└── tests/                         # stdlib unittest, 305 tests
+└── tests/                         # stdlib unittest, 371 tests
 ```
 
 ## Chat commands
@@ -311,7 +311,7 @@ No Python edits needed.
 ## Testing
 
 ```bash
-python3 -m unittest discover tests # 305 unit tests (~14 s)
+python3 -m unittest discover tests # 371 unit tests (~14 s)
 ```
 
 Coverage: `durations`, `templating`, `state` extraction, `permissions`,
