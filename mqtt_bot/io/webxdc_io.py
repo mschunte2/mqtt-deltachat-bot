@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 
 from . import atomic
@@ -32,6 +33,23 @@ def _is_missing_message(ex: Exception) -> bool:
 
 
 class WebxdcIO:
+    """Registry + transport for webxdc app instances.
+
+    Threading: `_map` is reachable from three threads. `send_apps` was
+    originally confined to the Delta Chat handler thread, but the
+    stale-msgid re-seed path added in cd6645f reaches it from the
+    Publisher daemon and the MQTT callback too (broadcast ->
+    push_to_msgid -> on_missing -> _reseed_stale_chat -> send_apps),
+    concurrently with `Publisher.broadcast`'s own `map_snapshot()`.
+    Every access therefore goes through `_lock`.
+
+    The lock is reentrant because `send_apps` calls `_save`, and it is
+    held across the send RPCs rather than only around the mutations:
+    that briefly blocks a concurrent `map_snapshot`, which is cheaper
+    than reasoning about two interleaved re-seeds of the same chat.
+    Nothing else is held while it is taken, so it cannot invert.
+    """
+
     def __init__(self, state_dir: Path, devices_dir: Path) -> None:
         """state_dir: where app_msgids.json lives (per-bot config dir).
         devices_dir: components root (devices/<class>/<class>.xdc).
@@ -39,6 +57,7 @@ class WebxdcIO:
         self._state_dir = state_dir
         self._devices_dir = devices_dir
         self._path = state_dir / "app_msgids.json"
+        self._lock = threading.RLock()
         self._map: dict[int, dict[str, int]] = self._load()
 
     # --- persistence ------------------------------------------------------
@@ -57,10 +76,11 @@ class WebxdcIO:
         return out
 
     def _save(self) -> None:
-        serialised = {
-            str(chat): {str(c): int(m) for c, m in apps.items()}
-            for chat, apps in self._map.items()
-        }
+        with self._lock:
+            serialised = {
+                str(chat): {str(c): int(m) for c, m in apps.items()}
+                for chat, apps in self._map.items()
+            }
         atomic.write_text(self._path, json.dumps(serialised))
 
     # --- discovery --------------------------------------------------------
@@ -81,16 +101,19 @@ class WebxdcIO:
         return out
 
     def known_classes_for(self, chat_id: int) -> list[str]:
-        return list(self._map.get(chat_id, {}).keys())
+        with self._lock:
+            return list(self._map.get(chat_id, {}).keys())
 
     def msgid_belongs_to_chat(self, chat_id: int, msgid: int) -> bool:
-        return msgid in self._map.get(chat_id, {}).values()
+        with self._lock:
+            return msgid in self._map.get(chat_id, {}).values()
 
     def class_for_msgid(self, chat_id: int, msgid: int) -> str | None:
-        for cls, m in self._map.get(chat_id, {}).items():
-            if m == msgid:
-                return cls
-        return None
+        with self._lock:
+            for cls, m in self._map.get(chat_id, {}).items():
+                if m == msgid:
+                    return cls
+            return None
 
     # --- send / retract ---------------------------------------------------
 
@@ -114,7 +137,6 @@ class WebxdcIO:
 
         sent: list[str] = []
         retracted: list[str] = []
-        chat_apps = self._map.setdefault(chat_id, {})
         available = {cls: path for cls, path in self.discover_xdcs()}
 
         # Old msgids whose registry entry has been superseded/dropped and
@@ -124,33 +146,42 @@ class WebxdcIO:
         # lingering duplicate but never a pointer to a deleted message.
         to_delete: list[tuple[str, int]] = []
 
-        # Retract anything tracked but no longer servable to this chat.
-        for cls in list(chat_apps.keys()):
-            if cls in available and cls in classes_visible:
-                continue
-            to_delete.append((cls, chat_apps.pop(cls)))
-            retracted.append(cls)
+        # Everything that touches _map runs under the lock: two chats can
+        # re-seed concurrently once app containers start ageing out under
+        # delete_device_after, and Publisher.broadcast reads the map from
+        # its own thread meanwhile.
+        with self._lock:
+            chat_apps = self._map.setdefault(chat_id, {})
 
-        for cls, path in available.items():
-            if cls not in classes_visible:
-                continue
-            old = chat_apps.get(cls)
-            try:
-                new = int(bot.rpc.send_msg(accid, chat_id, MsgData(file=path)))
-            except Exception as ex:
-                log.error("send app %s to chat %d failed: %s", cls, chat_id, ex)
-                continue
-            chat_apps[cls] = new
-            sent.append(cls)
-            log.info("sent app %s to chat %d msgid=%d", cls, chat_id, new)
-            if old is not None:
-                to_delete.append((cls, old))
+            # Retract anything tracked but no longer servable to this chat.
+            for cls in list(chat_apps.keys()):
+                if cls in available and cls in classes_visible:
+                    continue
+                to_delete.append((cls, chat_apps.pop(cls)))
+                retracted.append(cls)
 
-        # Persist the new pointers BEFORE deleting any old message. If
-        # this raises we return without deleting, keeping the live (if
-        # stale) pointers intact.
-        if sent or retracted:
-            self._save()
+            for cls, path in available.items():
+                if cls not in classes_visible:
+                    continue
+                old = chat_apps.get(cls)
+                try:
+                    new = int(bot.rpc.send_msg(accid, chat_id,
+                                               MsgData(file=path)))
+                except Exception as ex:
+                    log.error("send app %s to chat %d failed: %s",
+                              cls, chat_id, ex)
+                    continue
+                chat_apps[cls] = new
+                sent.append(cls)
+                log.info("sent app %s to chat %d msgid=%d", cls, chat_id, new)
+                if old is not None:
+                    to_delete.append((cls, old))
+
+            # Persist the new pointers BEFORE deleting any old message. If
+            # this raises we return without deleting, keeping the live (if
+            # stale) pointers intact.
+            if sent or retracted:
+                self._save()
 
         for cls, old in to_delete:
             try:
@@ -188,4 +219,5 @@ class WebxdcIO:
         Used by Publisher.broadcast — taking a copy means the broadcast
         loop doesn't hold the registry while we send (which can take
         ~ms per push)."""
-        return {chat: dict(apps) for chat, apps in self._map.items()}
+        with self._lock:
+            return {chat: dict(apps) for chat, apps in self._map.items()}
