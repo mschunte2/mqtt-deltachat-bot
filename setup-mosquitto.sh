@@ -123,12 +123,24 @@ PYEOF
         echo "# unrestricted access for the bot account. Re-run this script"
         echo "# once devices.json is in place to narrow it."
         echo "topic readwrite #"
-    else
+    elif [ -n "$MQTT_DEVICE_USER" ]; then
+        # Roles are separated: the bot writes commands and reads status.
         while read -r prefix; do
             [ -n "$prefix" ] || continue
             echo "topic write ${prefix}/command/#"
             echo "topic read  ${prefix}/status/#"
             echo "topic read  ${prefix}/online"
+        done <<< "$DEVICE_PREFIXES"
+    else
+        # NO separate device account, so this one credential is shared
+        # with the plugs — and the plugs PUBLISH status/# and online.
+        # Granting the bot role only `read` there would deny the plugs
+        # and blind the bot completely. Scope to the known device
+        # prefixes (still an improvement on no acl_file at all) but keep
+        # it readwrite until MQTT_DEVICE_USER exists.
+        while read -r prefix; do
+            [ -n "$prefix" ] || continue
+            echo "topic readwrite ${prefix}/#"
         done <<< "$DEVICE_PREFIXES"
     fi
     if [ -n "$MQTT_DEVICE_USER" ]; then
@@ -148,11 +160,12 @@ echo "Wrote $ACL_FILE" >&2
 
 if [ -z "$MQTT_DEVICE_USER" ]; then
     echo "" >&2
-    echo "WARNING: MQTT_DEVICE_USER is unset, so the plugs must keep using" >&2
-    echo "  the bot's own credential — which the ACL grants publish rights" >&2
-    echo "  on command topics. Set MQTT_DEVICE_USER/MQTT_DEVICE_PASS in" >&2
-    echo "  .env/env, re-run this script, and reconfigure each plug to" >&2
-    echo "  separate the two roles." >&2
+    echo "WARNING: MQTT_DEVICE_USER is unset, so one credential is shared" >&2
+    echo "  between the bot and the plugs. The ACL can therefore only" >&2
+    echo "  scope that account to the known device topics, not separate" >&2
+    echo "  read from write: anything holding it can still switch relays" >&2
+    echo "  and publish forged status. Set MQTT_DEVICE_USER/MQTT_DEVICE_PASS" >&2
+    echo "  in .env/env, re-run this script, then reconfigure each plug." >&2
 fi
 
 # Create the device account too, when configured.
