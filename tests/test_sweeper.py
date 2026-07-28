@@ -207,3 +207,35 @@ class TestPoisonRuleIsNotLoaded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRuleWindowClamp(unittest.TestCase):
+    """Observation windows are re-queried on every snapshot build, and a
+    snapshot is built on every state edge — so an unbounded window is a
+    repeated long scan on the MQTT callback thread, not a one-off."""
+
+    def _job(self, **policy_kw):
+        from tests._fixtures import _build_twin
+        twin, _, _ = _build_twin()
+        twin.schedule("off", sched.ScheduledPolicy(**policy_kw), 12)
+        return twin.jobs_snapshot()[0]
+
+    def test_idle_window_is_clamped(self):
+        job = self._job(idle_field="apower", idle_threshold=5.0,
+                        idle_duration_s=365 * 86400)
+        self.assertEqual(job.idle_duration_s, sched.MAX_RULE_WINDOW_S)
+
+    def test_consumed_window_is_clamped(self):
+        job = self._job(consumed_field="apower", consumed_threshold_wh=5.0,
+                        consumed_window_s=365 * 86400)
+        self.assertEqual(job.consumed_window_s, sched.MAX_RULE_WINDOW_S)
+
+    def test_avg_window_is_clamped(self):
+        job = self._job(avg_field="apower", avg_threshold_w=5.0,
+                        avg_window_s=365 * 86400)
+        self.assertEqual(job.avg_window_s, sched.MAX_RULE_WINDOW_S)
+
+    def test_ordinary_windows_are_untouched(self):
+        job = self._job(idle_field="apower", idle_threshold=5.0,
+                        idle_duration_s=600)
+        self.assertEqual(job.idle_duration_s, 600)

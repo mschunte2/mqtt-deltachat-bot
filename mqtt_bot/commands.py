@@ -35,6 +35,17 @@ MAX_AGE_SECONDS = 200
 MAX_APP_AGE_SECONDS = 45
 MAX_CLOCK_SKEW_SECONDS = 30
 
+# `/<device> export <window>` bounds. The handler fetchall()s both
+# tables into RAM before writing the CSV, and the deployment target is
+# a Pi with 416 MB total / ~275 MB available whose samples_raw table is
+# already past 300k rows — roughly 61k rows per device per month at the
+# recommended 15 s cadence. A year would have materialised ~1.5M tuples
+# at once and taken the bot down with the OOM killer. 31 days is the
+# longest window that stays comfortably inside that budget; the row cap
+# is a second belt for a device polled far faster than recommended.
+EXPORT_MAX_WINDOW_S = 31 * 86400
+EXPORT_MAX_ROWS = 100_000
+
 
 def sanitize(value, fallback: str = "?", max_len: int = 64) -> str:
     """Strip control characters, trim whitespace, cap length. Used

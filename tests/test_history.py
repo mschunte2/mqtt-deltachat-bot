@@ -394,3 +394,44 @@ class TestHistory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExportQueryBounds(unittest.TestCase):
+    """The CSV export fetchall()s whole tables into RAM. The live host
+    has 416 MB total / ~275 MB available and already holds 306k
+    samples_raw rows, so an unbounded window is an OOM, not a
+    hypothetical: `/kaffeete export 365d` would have materialised
+    roughly 1.5M tuples at once.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.h = history_mod.History(self.tmp / "h.sqlite", retention_days=0)
+        self.addCleanup(self.h.close)
+        for i in range(50):
+            self.h.record_status("k", 1000 + i, {"apower": float(i),
+                                                 "output": True})
+
+    def test_samples_raw_respects_limit(self):
+        rows = self.h.query_samples_raw("k", 0, 99999, limit=10)
+        self.assertEqual(len(rows), 10)
+
+    def test_samples_raw_limit_keeps_the_newest_rows(self):
+        """A truncated export should show the most recent data, not the
+        oldest — the user asking for 'the last N days' wants the tail."""
+        rows = self.h.query_samples_raw("k", 0, 99999, limit=5)
+        self.assertEqual([r[0] for r in rows], [1045, 1046, 1047, 1048, 1049])
+
+    def test_samples_raw_unlimited_by_default(self):
+        self.assertEqual(len(self.h.query_samples_raw("k", 0, 99999)), 50)
+
+    def test_power_raw_respects_limit(self):
+        for i in range(10):
+            self.h.write_sample("p", 60 * i, float(i), output=True)
+        self.h.flush_pending_minutes()
+        rows = self.h.query_power_raw("p", 0, 99999, limit=3)
+        self.assertLessEqual(len(rows), 3)
+
+    def test_rows_stay_in_ascending_order_when_limited(self):
+        rows = self.h.query_samples_raw("k", 0, 99999, limit=7)
+        self.assertEqual([r[0] for r in rows], sorted(r[0] for r in rows))

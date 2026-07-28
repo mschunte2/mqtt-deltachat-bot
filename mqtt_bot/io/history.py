@@ -395,17 +395,31 @@ class History:
             for t, mn, mx, avg, o in rows if avg is not None
         ])
 
-    def query_power_raw(self, device: str, since_ts: int, until_ts: int
+    def query_power_raw(self, device: str, since_ts: int, until_ts: int,
+                        limit: int | None = None
                         ) -> list[tuple[int, float, int | None, int]]:
-        """Un-bucketed minute rows for the window. Used for CSV export."""
+        """Un-bucketed minute rows for the window. Used for CSV export.
+        `limit` keeps the newest rows; see query_samples_raw."""
         if self._closed:
             return []
         with self._lock:
-            cur = self._db.execute(
-                "SELECT ts, avg_apower_w, output, sample_count FROM power_minute "
-                "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
-                (device, int(since_ts), int(until_ts)),
-            )
+            if limit is None:
+                cur = self._db.execute(
+                    "SELECT ts, avg_apower_w, output, sample_count "
+                    "FROM power_minute "
+                    "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
+                    (device, int(since_ts), int(until_ts)),
+                )
+            else:
+                cur = self._db.execute(
+                    "SELECT ts, avg_apower_w, output, sample_count FROM ("
+                    "  SELECT ts, avg_apower_w, output, sample_count "
+                    "  FROM power_minute "
+                    "  WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts DESC "
+                    "  LIMIT ?"
+                    ") ORDER BY ts ASC",
+                    (device, int(since_ts), int(until_ts), int(limit)),
+                )
             rows = cur.fetchall()
         return [(int(t), float(w), int(o) if o is not None else None, int(c))
                 for t, w, o, c in rows]
@@ -535,20 +549,56 @@ class History:
                 prev_wh = end_wh
         return out
 
-    def query_samples_raw(self, device: str, since_ts: int, until_ts: int
-                           ) -> list[tuple]:
-        """Lossless dump of every status update in the window."""
+    def query_samples_raw(self, device: str, since_ts: int, until_ts: int,
+                          limit: int | None = None) -> list[tuple]:
+        """Lossless dump of every status update in the window.
+
+        `limit` caps how many rows are materialised. The result is
+        always ascending, but a limited query returns the *newest*
+        `limit` rows — a truncated export should show the recent tail,
+        which is what "the last N days" means to the caller. The cap
+        matters: this fetchall()s into RAM, and the deployment host has
+        ~275 MB available against a samples_raw table already past
+        300k rows.
+        """
         if self._closed:
             return []
         with self._lock:
+            if limit is None:
+                cur = self._db.execute(
+                    "SELECT ts, apower_w, voltage_v, current_a, freq_hz, "
+                    "       aenergy_total_wh, output, temperature_c "
+                    "FROM samples_raw "
+                    "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
+                    (device, int(since_ts), int(until_ts)),
+                )
+                return cur.fetchall()
             cur = self._db.execute(
                 "SELECT ts, apower_w, voltage_v, current_a, freq_hz, "
-                "       aenergy_total_wh, output, temperature_c "
-                "FROM samples_raw "
-                "WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
-                (device, int(since_ts), int(until_ts)),
+                "       aenergy_total_wh, output, temperature_c FROM ("
+                "  SELECT ts, apower_w, voltage_v, current_a, freq_hz, "
+                "         aenergy_total_wh, output, temperature_c "
+                "  FROM samples_raw "
+                "  WHERE device=? AND ts >= ? AND ts < ? ORDER BY ts DESC "
+                "  LIMIT ?"
+                ") ORDER BY ts ASC",
+                (device, int(since_ts), int(until_ts), int(limit)),
             )
             return cur.fetchall()
+
+    def count_samples_raw(self, device: str, since_ts: int,
+                          until_ts: int) -> int:
+        """How many rows `query_samples_raw` would return unlimited.
+        Lets the export tell the user it truncated."""
+        if self._closed:
+            return 0
+        with self._lock:
+            cur = self._db.execute(
+                "SELECT COUNT(*) FROM samples_raw "
+                "WHERE device=? AND ts >= ? AND ts < ?",
+                (device, int(since_ts), int(until_ts)),
+            )
+            return int(cur.fetchone()[0])
 
     # --- internals -------------------------------------------------------
 

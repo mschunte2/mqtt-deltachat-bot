@@ -706,6 +706,8 @@ _parse_text_command = commands_mod.parse_text_command
 MAX_AGE_SECONDS = commands_mod.MAX_AGE_SECONDS
 MAX_APP_AGE_SECONDS = commands_mod.MAX_APP_AGE_SECONDS
 MAX_CLOCK_SKEW_SECONDS = commands_mod.MAX_CLOCK_SKEW_SECONDS
+EXPORT_MAX_WINDOW_S = commands_mod.EXPORT_MAX_WINDOW_S
+EXPORT_MAX_ROWS = commands_mod.EXPORT_MAX_ROWS
 
 
 def _is_allowed(chatid: int) -> bool:
@@ -1004,10 +1006,19 @@ def _handle_export(bot, accid, chatid, device_name, rest):
     except ValueError as ex:
         bot.rpc.send_msg(accid, chatid, MsgData(text=f"bad duration: {ex}"))
         return
+    if window_seconds > EXPORT_MAX_WINDOW_S:
+        bot.rpc.send_msg(accid, chatid, MsgData(
+            text=f"export window too long ({window_str}); "
+                 f"max is {EXPORT_MAX_WINDOW_S // 86400}d"))
+        return
     until_ts = int(time.time())
     since_ts = until_ts - window_seconds
-    power_rows = history.query_power_raw(device_name, since_ts, until_ts)
-    samples_rows = history.query_samples_raw(device_name, since_ts, until_ts)
+    power_rows = history.query_power_raw(device_name, since_ts, until_ts,
+                                         limit=EXPORT_MAX_ROWS)
+    samples_rows = history.query_samples_raw(device_name, since_ts, until_ts,
+                                             limit=EXPORT_MAX_ROWS)
+    total_samples = history.count_samples_raw(device_name, since_ts, until_ts)
+    truncated = total_samples > len(samples_rows)
 
     if not (power_rows or samples_rows):
         bot.rpc.send_msg(accid, chatid,
@@ -1043,12 +1054,14 @@ def _handle_export(bot, accid, chatid, device_name, rest):
                             "" if ae is None else f"{ae:.3f}",
                             "" if out is None else out,
                             "" if tc is None else f"{tc:.1f}"])
+        note = (f" · TRUNCATED to the newest {EXPORT_MAX_ROWS} of "
+                f"{total_samples} status updates" if truncated else "")
         bot.rpc.send_msg(
             accid, chatid,
             MsgData(file=path,
                     text=f"{device_name} export · {window_str} · "
                          f"{len(samples_rows)} status updates · "
-                         f"{len(power_rows)} per-min"),
+                         f"{len(power_rows)} per-min{note}"),
         )
     finally:
         try:

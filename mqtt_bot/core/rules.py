@@ -44,6 +44,26 @@ log = logging.getLogger("mqtt_bot.rules")
 # the app) leave `_loaded_at = 0` and are NOT subject to it.
 GRACE_PERIOD_S = 60
 
+# Longest observation window an idle/consumed/avg rule may use. These
+# windows are re-queried against SQLite on every snapshot build (see
+# ScheduledJob.from_policy), and a snapshot is built on every state
+# edge, so an unbounded window is a repeated full-table scan on the
+# MQTT callback thread rather than a one-off cost. A week is far longer
+# than any "has this appliance gone idle" question needs.
+MAX_RULE_WINDOW_S = 7 * 86400
+
+
+def _clamp_window(seconds: int | None, kind: str, device: str) -> int | None:
+    """Bound one observation window, logging when it bites."""
+    if seconds is None:
+        return None
+    seconds = int(seconds)
+    if seconds > MAX_RULE_WINDOW_S:
+        log.warning("%s: %s window %ds exceeds the %dd maximum; clamping",
+                    device, kind, seconds, MAX_RULE_WINDOW_S // 86400)
+        return MAX_RULE_WINDOW_S
+    return seconds
+
 
 # --- Defaults & data shapes ----------------------------------------------
 
@@ -171,6 +191,20 @@ class ScheduledJob:
             h, m = policy.time_of_day
             deadline_ts = next_tod_deadline(h, m, now)
             time_mode = "tod"
+
+        # Every path that turns a policy into a rule funnels through
+        # here, so this is the one place to bound observation windows.
+        # They aren't just a rule-evaluation cost: `to_dict` re-runs the
+        # idle window's samples_raw query on EVERY snapshot build, and a
+        # snapshot is built on every state edge. A rule written as
+        # "off if idle 5W in 365d" would put a year-long scan on the
+        # MQTT callback thread several times a minute.
+        idle_duration_s = _clamp_window(policy.idle_duration_s, "idle",
+                                        device_name)
+        consumed_window_s = _clamp_window(policy.consumed_window_s, "consumed",
+                                          device_name)
+        avg_window_s = _clamp_window(policy.avg_window_s, "avg", device_name)
+
         return cls(
             device_name=device_name,
             chat_id_origin=chat_id_origin,
@@ -184,14 +218,14 @@ class ScheduledJob:
             once=policy.once,
             idle_field=policy.idle_field,
             idle_threshold=policy.idle_threshold,
-            idle_duration_s=policy.idle_duration_s,
+            idle_duration_s=idle_duration_s,
             consumed_field=policy.consumed_field,
             consumed_threshold_wh=policy.consumed_threshold_wh,
-            consumed_window_s=policy.consumed_window_s,
+            consumed_window_s=consumed_window_s,
             _consumed_started_at=now if policy.consumed_field else 0,
             avg_field=policy.avg_field,
             avg_threshold_w=policy.avg_threshold_w,
-            avg_window_s=policy.avg_window_s,
+            avg_window_s=avg_window_s,
             _avg_started_at=now if policy.avg_field else 0,
             _observation_started_at=(
                 now if (policy.idle_field or policy.consumed_field
