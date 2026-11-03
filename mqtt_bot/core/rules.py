@@ -94,6 +94,9 @@ class ScheduledPolicy:
     timer_seconds: int | None = None
     time_of_day: tuple[int, int] | None = None     # (hour, minute)
     recurring_tod: bool = False
+    # TOD only: days the rule may fire, date.weekday() numbering
+    # (0 = Mon … 6 = Sun), sorted. None = every day.
+    weekdays: tuple[int, ...] | None = None
 
     idle_field: str | None = None
     idle_threshold: float | None = None
@@ -139,6 +142,7 @@ class ScheduledJob:
     deadline_ts: int | None = None
     time_of_day: tuple[int, int] | None = None
     recurring_tod: bool = False
+    weekdays: tuple[int, ...] | None = None   # TOD day filter; None = all
     _time_mode: str | None = None       # "timer" | "tod"
     timer_seconds: int | None = None    # original duration for re-arm
 
@@ -200,7 +204,7 @@ class ScheduledJob:
             time_mode = "timer"
         elif policy.time_of_day is not None:
             h, m = policy.time_of_day
-            deadline_ts = next_tod_deadline(h, m, now)
+            deadline_ts = next_tod_deadline(h, m, now, policy.weekdays)
             time_mode = "tod"
 
         # Every path that turns a policy into a rule funnels through
@@ -224,6 +228,7 @@ class ScheduledJob:
             deadline_ts=deadline_ts,
             time_of_day=policy.time_of_day,
             recurring_tod=policy.recurring_tod,
+            weekdays=policy.weekdays,
             _time_mode=time_mode,
             timer_seconds=policy.timer_seconds,
             once=policy.once,
@@ -274,7 +279,7 @@ class ScheduledJob:
             return False
         if self.time_of_day:
             h, m = self.time_of_day
-            self.deadline_ts = next_tod_deadline(h, m, now)
+            self.deadline_ts = next_tod_deadline(h, m, now, self.weekdays)
             return True
         if self.timer_seconds:
             self.deadline_ts = now + self.timer_seconds
@@ -312,6 +317,7 @@ class ScheduledJob:
             "deadline_ts": self.deadline_ts,
             "time_of_day": list(self.time_of_day) if self.time_of_day else None,
             "recurring_tod": self.recurring_tod,
+            "weekdays": list(self.weekdays) if self.weekdays else None,
             "_time_mode": self._time_mode,
             "timer_seconds": self.timer_seconds,
             "once": self.once,
@@ -342,6 +348,8 @@ class ScheduledJob:
             deadline_ts=d.get("deadline_ts"),
             time_of_day=(int(tod[0]), int(tod[1])) if tod else None,
             recurring_tod=bool(d.get("recurring_tod", False)),
+            weekdays=(tuple(int(w) for w in wd)
+                      if (wd := d.get("weekdays")) else None),
             _time_mode=d.get("_time_mode"),
             timer_seconds=d.get("timer_seconds"),
             once=once,
@@ -370,6 +378,7 @@ class ScheduledJob:
             "deadline_ts": self.deadline_ts,
             "time_of_day": list(self.time_of_day) if self.time_of_day else None,
             "recurring_tod": self.recurring_tod,
+            "weekdays": list(self.weekdays) if self.weekdays else None,
             "timer_minutes": _sec_to_min(self.timer_seconds),
             "once": self.once,
             "idle": ({"field": self.idle_field, "threshold": self.idle_threshold,
@@ -409,6 +418,8 @@ def derive_rule_id(policy: ScheduledPolicy) -> str:
     if policy.time_of_day is not None:
         h, m = policy.time_of_day
         suffix = "d" if policy.recurring_tod else ""
+        if policy.weekdays is not None:
+            suffix += "@" + "".join(str(w) for w in policy.weekdays)
         parts.append(f"tod:{h:02d}{m:02d}{suffix}")
     if policy.idle_field is not None:
         parts.append(f"idle:{policy.idle_threshold:g}W:"
@@ -433,8 +444,10 @@ def _sec_to_min(seconds: int | None) -> float | None:
 
 # --- Time + integration helpers ------------------------------------------
 
-def next_tod_deadline(h: int, m: int, now: int) -> int:
-    """Unix seconds for the next occurrence of HH:MM in local time.
+def next_tod_deadline(h: int, m: int, now: int,
+                      weekdays: tuple[int, ...] | None = None) -> int:
+    """Unix seconds for the next occurrence of HH:MM in local time,
+    on one of `weekdays` (date.weekday() numbering) if given.
 
     Day arithmetic is done on the CALENDAR, not by adding 86400.
     `now + 86400` lands on the same calendar date whenever the local day
@@ -450,11 +463,76 @@ def next_tod_deadline(h: int, m: int, now: int) -> int:
     not exist) lands harmlessly on 03:30 rather than raising.
     """
     lt = time.localtime(now)
-    target = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, m, 0, 0, 0, -1))
-    if target <= now:
-        tom = _next_calendar_day(lt)
-        target = time.mktime((*tom, h, m, 0, 0, 0, -1))
-    return int(target)
+    day = (lt.tm_year, lt.tm_mon, lt.tm_mday)
+    # Today plus a full week covers every non-empty weekday set.
+    for _ in range(8):
+        target = time.mktime((*day, h, m, 0, 0, 0, -1))
+        if target > now and (weekdays is None
+                             or datetime.date(*day).weekday() in weekdays):
+            return int(target)
+        day = _next_calendar_day(time.localtime(target))
+    raise ValueError(f"no matching weekday in {weekdays!r}")
+
+
+_DAY_ABBR = ("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")
+_DAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday",
+              "saturday", "sunday")
+
+
+def _day_index(name: str) -> int:
+    n = name.lower()
+    if len(n) >= 2:
+        for i, full in enumerate(_DAY_NAMES):
+            if n in (full, full[:2], full[:3]):
+                return i
+    raise ValueError(f"unknown weekday: {name!r}")
+
+
+def parse_weekdays(spec: str) -> tuple[int, ...] | None:
+    """`mon-fri`, `Mo-Fr`, `sa,su`, `weekdays`, `weekend`, full or
+    2/3-letter English names. `daily` → None (no filter). Ranges may
+    wrap (`fri-mon`). Returns sorted unique date.weekday() indices."""
+    s = re.sub(r"\s+", "", spec).lower()
+    if s == "daily":
+        return None
+    if s == "weekdays":
+        return (0, 1, 2, 3, 4)
+    if s in ("weekend", "weekends"):
+        return (5, 6)
+    days: set[int] = set()
+    for item in s.split(","):
+        a, sep, b = item.partition("-")
+        start = _day_index(a)
+        if not sep:
+            days.add(start)
+            continue
+        end = _day_index(b)
+        while True:
+            days.add(start)
+            if start == end:
+                break
+            start = (start + 1) % 7
+    return tuple(sorted(days))
+
+
+def format_weekdays(weekdays: tuple[int, ...] | None) -> str:
+    """`Mo–Fr`, `Sa,Su`, `Mo–We,Fr`; runs of 3+ days collapse to a
+    range. Empty string for None (every day)."""
+    if not weekdays:
+        return ""
+    runs: list[list[int]] = []
+    for w in sorted(weekdays):
+        if runs and runs[-1][-1] == w - 1:
+            runs[-1].append(w)
+        else:
+            runs.append([w])
+    out: list[str] = []
+    for r in runs:
+        if len(r) >= 3:
+            out.append(f"{_DAY_ABBR[r[0]]}–{_DAY_ABBR[r[-1]]}")
+        else:
+            out.extend(_DAY_ABBR[w] for w in r)
+    return ",".join(out)
 
 
 def _next_calendar_day(lt: time.struct_time) -> tuple[int, int, int]:
@@ -469,7 +547,8 @@ def _next_calendar_day(lt: time.struct_time) -> tuple[int, int, int]:
 ALL_POLICY_KINDS = frozenset({"timer", "tod", "idle", "consumed", "avg"})
 
 _TOD_RE = re.compile(
-    r"^at\s+(\d{1,2})(?:h(\d{2})?|:(\d{2}))?\s*(daily)?$", re.IGNORECASE
+    r"^at\s+(\d{1,2})(?:h(\d{2})?|:(\d{2}))?\s*(daily)?\s*(.*?)$",
+    re.IGNORECASE
 )
 _TIMER_RE = re.compile(r"^(?:for|in)\s+(.+?)\s*$", re.IGNORECASE)
 _IDLE_RE = re.compile(
@@ -542,6 +621,8 @@ def _apply(part: str, policy: ScheduledPolicy,
             raise ValueError(f"invalid HH:MM: {part!r}")
         policy.time_of_day = (h, mm)
         policy.recurring_tod = daily
+        if m.group(5):
+            policy.weekdays = parse_weekdays(m.group(5))
         return
     if (m := _IDLE_RE.match(part)):
         if m.group(1) is None:

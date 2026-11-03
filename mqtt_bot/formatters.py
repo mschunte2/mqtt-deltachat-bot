@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 
+from mqtt_bot.core import rules as sched
 from mqtt_bot.core.twin import PlugTwin
 from mqtt_bot.util import durations
 
@@ -163,6 +164,8 @@ def rule_clauses(job) -> list[str]:
             # not the user typed "daily", so calling it anything else
             # misdescribes what the bot will actually do.
             suffix = " daily" if job.is_recurring() else ""
+            if job.weekdays:
+                suffix = " " + sched.format_weekdays(job.weekdays)
             out.append(f"at {h:02d}:{m:02d}{suffix} "
                        f"(in {durations.format(remaining)})")
         else:

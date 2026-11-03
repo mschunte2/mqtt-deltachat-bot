@@ -141,6 +141,16 @@ class TestBoundsAreEnforced(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     build({"time_of_day": tod})
 
+    def test_bad_weekdays_rejected(self):
+        for wd in ([], [7], [-1], ["mo"], [True], [1.5], "01234", {}):
+            with self.subTest(weekdays=wd):
+                with self.assertRaises(ValueError):
+                    build({"time_of_day": [7, 0], "weekdays": wd})
+
+    def test_weekdays_without_time_of_day_rejected(self):
+        with self.assertRaises(ValueError):
+            build({"timer_minutes": 5, "weekdays": [0]})
+
     def test_empty_policy_rejected(self):
         with self.assertRaises(ValueError):
             build({})
@@ -157,6 +167,13 @@ class TestValidPayloadsStillWork(unittest.TestCase):
         p = build({"time_of_day": [18, 30], "recurring_tod": True})
         self.assertEqual(p.time_of_day, (18, 30))
         self.assertTrue(p.recurring_tod)
+
+    def test_time_of_day_with_weekdays(self):
+        p = build({"time_of_day": [7, 0], "weekdays": [4, 0, 1, 1]})
+        self.assertEqual(p.weekdays, (0, 1, 4))
+        self.assertIsNone(build({"time_of_day": [7, 0]}).weekdays)
+        self.assertIsNone(
+            build({"time_of_day": [7, 0], "weekdays": None}).weekdays)
 
     def test_idle_uses_class_defaults_when_omitted(self):
         p = build({"idle": {}})
