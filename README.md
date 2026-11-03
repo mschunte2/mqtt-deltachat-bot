@@ -75,6 +75,7 @@ mqtt-bot/
 /<device> auto-off at 18:30 daily # recurring daily
 /<device> auto-on at 7h           # next 07:00 local
 /<device> auto-on at 7h daily     # recurring
+/<device> auto-on at 7:00 mon-fri # only Mon–Fri (also sa,su | weekdays | weekend | mo,we,fr)
 /<device> cancel-auto-off | cancel-auto-on | cancel-schedule
 /<device> export 7d               # CSV (samples_raw + power_minute), max 31d
 /<device> rules                   # list this device's pending auto-off / auto-on rules

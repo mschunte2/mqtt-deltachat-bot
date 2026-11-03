@@ -305,7 +305,11 @@ counter starts fresh.
   recurring (default).
 - **time_of_day (`tod`):** next HH:MM in local time. Uses
   `time.mktime` with `tm_isdst=-1` so DST transitions resolve via
-  calendar dates rather than `+86400` arithmetic.
+  calendar dates rather than `+86400` arithmetic. Optional
+  `weekdays` filter (`date.weekday()` numbering, 0 = Mon; None = every
+  day): `next_tod_deadline` walks calendar days to the first allowed
+  one. Chat: `at 7:00 mon-fri`; app: `"weekdays": [0,1,2,3,4]`.
+  Unfiltered rule ids are unchanged; filtered ones end `@01234`.
 - **idle:** `state[idle_field] < idle_threshold` for ≥
   `idle_duration_s`. Evaluated inline by `twin.on_mqtt` after every
   state update.
@@ -417,7 +421,8 @@ verbs) or treats it as a schedule keyword (`auto-off`/`auto-on`/
 inline policy object that gets assembled into a `ScheduledPolicy`
 after the direct action runs. Keys recognised inside `auto_off`/
 `auto_on`: `timer_seconds` (int), `time_of_day` ([h,m] list),
-`recurring_tod` (bool), `idle` (object with `field`/`threshold`/
+`recurring_tod` (bool), `weekdays` (list of 0..6, only with
+`time_of_day`), `idle` (object with `field`/`threshold`/
 `duration_s`), `consumed` (object with `field`/`threshold_wh`/
 `window_s`), `once` (bool). Any subset → OR-combined.
 

@@ -6,6 +6,29 @@ archived under `change-history/plans/`.
 Only `v0.1.5` and `v0.2.1` are real git tags. Entries are dated and
 reference short SHAs — no invented version labels.
 
+## 2026-11-03 — weekday filter for time-of-day rules; counter jitter
+
+- **Weekday filter** (`4277aae`, app `63bdcba`). TOD rules can be
+  limited to days: `/kaffeete auto-on at 7:00 mon-fri`, or the Mo…Su
+  chips in the app. `weekdays` rides on ScheduledPolicy/ScheduledJob,
+  persists in rules.json and the snapshot; absent = every day, so
+  existing rules and their ids are unchanged. A filtered rule has a
+  different id, so it does not replace an existing unfiltered one —
+  cancel the old rule by hand. **Requires `/apps` after deploy.**
+- **aenergy jitter is not a reset** (`7ac8d00`). Any backward step of
+  `aenergy.total` was recorded as a hardware reset. Live on 2026-10-30
+  kaffeete went 102832.0 → 102831.3 Wh, leaving a +0.6 Wh offset event
+  that inflates later totals by that amount (left in place;
+  negligible). Drops ≤ `AENERGY_RESET_TOLERANCE_WH` (10 Wh) are now
+  ignored.
+
+Health check of `pi@gatekeeper` the same day found nothing else
+actionable: the restarts at 03:04 are apt-daily-upgrade re-executing
+systemd, and the one shutdown in that window hit the 5 s history-lock
+timeout and skipped the final minute flush.
+
+Tests: 377 → 400.
+
 ## 2026-07-28 — quality, correctness and debuggability sweep
 
 Plan: [2026-07-28-quality-and-debuggability-sweep.md](plans/2026-07-28-quality-and-debuggability-sweep.md)
@@ -148,8 +171,8 @@ Also unaddressed: TLS to the broker (ACLs landed; transport is still
 cleartext on the LAN), and the live host's `LOG_LEVEL=debug` /
 `RETENTION_DAYS=0` settings.
 
-### Not deployed
+### Deployment
 
-Nothing in this sweep has been applied to `pi@gatekeeper`. The systemd
-unit changes the service confinement, and the payload change needs a
-`/apps` round, so both want a watched restart rather than a blind one.
+Deployed to `pi@gatekeeper` on 2026-07-28 (pull 16:21, xdc rebuilt,
+hardened unit installed 16:23). Verified 2026-11-03: dc.db down from
+464 MB to 51 MB.
