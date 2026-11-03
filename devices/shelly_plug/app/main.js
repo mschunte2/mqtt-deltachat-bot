@@ -168,6 +168,33 @@ function sendRefresh() {
   }, '');
 }
 
+// Weekday filter for time-of-day rules. Index = date.weekday() on the
+// bot side (0 = Mon … 6 = Sun); all checked means "every day".
+const DAY_ABBR = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
+
+document.querySelectorAll('.wd-row').forEach(row => {
+  DAY_ABBR.forEach((name, i) => {
+    const label = document.createElement('label');
+    label.className = 'wd';
+    label.innerHTML = `<input type="checkbox" value="${i}" checked>${name}`;
+    row.appendChild(label);
+  });
+});
+
+// Same rendering as rules.format_weekdays: runs of 3+ days collapse.
+function fmtWeekdays(days) {
+  if (!days || !days.length) return '';
+  const runs = [];
+  [...days].sort((a, b) => a - b).forEach(d => {
+    const last = runs[runs.length - 1];
+    if (last && last[last.length - 1] === d - 1) last.push(d);
+    else runs.push([d]);
+  });
+  return runs.map(r => r.length >= 3
+    ? `${DAY_ABBR[r[0]]}–${DAY_ABBR[r[r.length - 1]]}`
+    : r.map(d => DAY_ABBR[d]).join(',')).join(',');
+}
+
 // Add-rule buttons.
 function readRuleForm(direction) {
   const root = document.querySelector(`.rule-form[data-action="${direction}"]`);
@@ -184,6 +211,10 @@ function readRuleForm(direction) {
     const [h, m] = v.split(':').map(n => parseInt(n, 10));
     policy.time_of_day = [h, m];
     policy.recurring_tod = root.querySelector(`.${direction}-tod-daily`).checked;
+    const days = Array.from(root.querySelectorAll(`.${direction}-tod-wd input:checked`))
+      .map(b => parseInt(b.value, 10));
+    if (days.length === 0) { alert('Select at least one day.'); return null; }
+    if (days.length < 7) policy.weekdays = days;
   } else if (mode === 'idle') {
     policy.idle = {
       threshold: parseFloat(root.querySelector(`.${direction}-idle-w`).value),
@@ -573,7 +604,8 @@ function describeRule(j) {
     const remaining = Math.max(0, j.deadline_ts - Math.floor(Date.now() / 1000));
     if (j.time_of_day) {
       const [h, m] = j.time_of_day;
-      const suffix = j.recurring_tod ? ' daily' : '';
+      const suffix = j.weekdays ? ` ${fmtWeekdays(j.weekdays)}`
+                   : (j.recurring_tod ? ' daily' : '');
       const hh = String(h).padStart(2, '0');
       const mm = String(m).padStart(2, '0');
       parts.push(`at ${hh}:${mm}${suffix} (in ${fmtSecs(remaining)})`);

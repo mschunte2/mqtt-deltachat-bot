@@ -101,6 +101,7 @@
       <label class="opt"><input type="radio" name="off-mode" value="tod">
         at <input type="time" class="off-tod" value="22:00">
         <label class="sub"><input type="checkbox" class="off-tod-daily"> daily</label></label>
+      <div class="wd-row off-tod-wd" title="days this time applies"></div>
       <label class="opt"><input type="radio" name="off-mode" value="idle">
         when below <input type="number" class="off-idle-w" value="5" min="0" step="0.1"> W
         for <input type="number" class="off-idle-min" value="1" min="1"> min</label>
@@ -128,6 +129,7 @@
       <label class="opt"><input type="radio" name="on-mode" value="tod">
         at <input type="time" class="on-tod" value="07:00">
         <label class="sub"><input type="checkbox" class="on-tod-daily"> daily</label></label>
+      <div class="wd-row on-tod-wd" title="days this time applies"></div>
       <label class="once"><input type="checkbox" class="on-once">
         only once (delete after first fire; default is recurring)</label>
       <button type="button" class="add-rule-btn" data-action="on">Add auto-on rule</button>
