@@ -38,6 +38,11 @@ from ..util.config import (AutoOffConfig, ChatEventRule, Device, DeviceClass)
 
 log = logging.getLogger("mqtt_bot.plug")
 
+# A real hardware counter reset drops aenergy.total to ~0; the plug also
+# reports sub-Wh backward jitter (live: 102832.0 → 102831.3). Recording
+# the jitter as an offset would inflate every later energy figure by it.
+AENERGY_RESET_TOLERANCE_WH = 10.0
+
 
 # --- per-(device, field) threshold latch ---------------------------------
 
@@ -294,8 +299,16 @@ class PlugTwin:
         alert: str | None = None
         with self._lock:
             prev_raw = self.last_seen_aenergy_wh
-            self.last_seen_aenergy_wh = raw
-        if prev_raw is not None and raw < prev_raw:
+            jitter = (prev_raw is not None and raw < prev_raw
+                      and prev_raw - raw <= AENERGY_RESET_TOLERANCE_WH)
+            # Keep the higher reading as the baseline across a wobble,
+            # so a later real reset still measures the full drop.
+            if not jitter:
+                self.last_seen_aenergy_wh = raw
+        if jitter:
+            log.debug("plug %s: aenergy.total jitter %.1f → %.1f Wh ignored",
+                      self.name, prev_raw, raw)
+        elif prev_raw is not None and raw < prev_raw:
             drop = prev_raw - raw
             log.warning(
                 "plug %s: aenergy.total reset detected "

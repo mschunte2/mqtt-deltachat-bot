@@ -737,6 +737,36 @@ class TestPlugTwinCounterResetDetection(unittest.TestCase):
                              for _, t in calls["posted"]),
                         msg=f"posted={calls['posted']}")
 
+    def _offset_rows(self, h):
+        with h._lock:
+            return h._db.execute(
+                "SELECT delta_wh FROM aenergy_offset_events").fetchall()
+
+    def test_small_backward_jitter_is_not_a_reset(self):
+        # Seen live on 2026-10-30: 102832.0 → 102831.3. Recording that
+        # as a reset inflates every later energy figure by the jitter.
+        twin, calls, h = self._build_twin_with_history()
+        for total in (102832.0, 102831.3):
+            twin.on_mqtt("status/switch:0",
+                         json.dumps({"aenergy": {"total": total}}).encode())
+        self.assertEqual(self._offset_rows(h), [])
+        self.assertFalse(any("hardware counter reset" in t
+                             for _, t in calls["posted"]))
+        # The higher reading stays the comparison baseline, so a real
+        # reset after the wobble still measures the full drop.
+        self.assertEqual(twin.last_seen_aenergy_wh, 102832.0)
+        twin.on_mqtt("status/switch:0",
+                     json.dumps({"aenergy": {"total": 2.0}}).encode())
+        self.assertEqual(self._offset_rows(h), [(102830.0,)])
+
+    def test_drop_just_above_tolerance_is_a_reset(self):
+        twin, _, h = self._build_twin_with_history()
+        tol = plug_mod.AENERGY_RESET_TOLERANCE_WH
+        for total in (500.0, 500.0 - tol - 1):
+            twin.on_mqtt("status/switch:0",
+                         json.dumps({"aenergy": {"total": total}}).encode())
+        self.assertEqual(self._offset_rows(h), [(tol + 1,)])
+
     def test_multiple_resets_accumulate_in_offset_events(self):
         twin, _, h = self._build_twin_with_history()
         twin.on_mqtt("status/switch:0",
