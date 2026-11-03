@@ -190,5 +190,23 @@ class TestDiag(unittest.TestCase):
         self.assertIn("no data yet", self._diag(twins=[twin]))
 
 
+
+class TestRuleClausesShowWeekdays(unittest.TestCase):
+    def test_tod_with_weekdays(self):
+        policy = sched.ScheduledPolicy(time_of_day=(7, 0), recurring_tod=True,
+                                       weekdays=(0, 1, 2, 3, 4))
+        job = sched.ScheduledJob.from_policy(policy, "kaffeete", 1, "on",
+                                             int(time.time()))
+        clause = formatters.rule_clauses(job)[0]
+        self.assertTrue(clause.startswith("at 07:00 Mo–Fr (in "), clause)
+
+    def test_tod_without_weekdays_unchanged(self):
+        policy = sched.ScheduledPolicy(time_of_day=(7, 0), recurring_tod=True)
+        job = sched.ScheduledJob.from_policy(policy, "kaffeete", 1, "on",
+                                             int(time.time()))
+        clause = formatters.rule_clauses(job)[0]
+        self.assertTrue(clause.startswith("at 07:00 daily (in "), clause)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -523,6 +523,7 @@ def help_text(chat_id: int) -> str:
         "  /<device> on for 30m               # on now + auto-off in 30 min\n"
         "  /<device> on for 1h or if idle     # on now + auto-off (timer or idle)\n"
         "  /<device> auto-on at 7h | at 7h daily\n"
+        "  /<device> auto-on at 7:00 mon-fri  # only on those days (also sa,su | weekdays | weekend)\n"
         "  /<device> cancel-auto-off | cancel-auto-on | cancel-schedule\n"
         "  /<device> reset-counter            — zero the resettable kWh counter\n"
         "  /<device> export 7d                — CSV of power + energy history\n"

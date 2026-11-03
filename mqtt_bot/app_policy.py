@@ -79,6 +79,20 @@ def _threshold(raw, field: str, default: float) -> float:
     return value
 
 
+def _weekdays(raw) -> tuple[int, ...] | None:
+    """Optional TOD day filter: a non-empty list of ints 0 (Mon) … 6
+    (Sun). Empty is rejected rather than read as "never" — a rule that
+    can't fire is a client bug."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("weekdays must be a non-empty list")
+    for w in raw:
+        if isinstance(w, bool) or not isinstance(w, int) or not 0 <= w <= 6:
+            raise ValueError(f"weekdays entries must be 0..6, got {w!r}")
+    return tuple(sorted(set(raw)))
+
+
 def _field_name(raw, default: str) -> str:
     """State-field name. Must be a plain string — accepting anything
     and calling str() on it turned a dict into a nonsense field name
@@ -121,6 +135,9 @@ def build(raw: dict, defaults: rules_mod.PolicyDefaults
                 f"time_of_day out of range: {h:02d}:{m:02d}")
         policy.time_of_day = (h, m)
         policy.recurring_tod = bool(raw.get("recurring_tod", False))
+        policy.weekdays = _weekdays(raw.get("weekdays"))
+    elif raw.get("weekdays") is not None:
+        raise ValueError("weekdays requires time_of_day")
 
     idle = raw.get("idle")
     if idle is not None:

@@ -1060,6 +1060,8 @@ def _rule_clauses(job: rules_mod.ScheduledJob) -> list[str]:
         if job._time_mode == "tod" and job.time_of_day:
             h, m = job.time_of_day
             suffix = " daily" if job.recurring_tod else ""
+            if job.weekdays:
+                suffix = " " + rules_mod.format_weekdays(job.weekdays)
             out.append(f"at {h:02d}:{m:02d}{suffix} "
                        f"(in {durations.format(remaining)})")
         else:
